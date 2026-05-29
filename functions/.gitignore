@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Environment files with secrets
+.env
+
+# Logs
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

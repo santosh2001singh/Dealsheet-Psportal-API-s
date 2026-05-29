@@ -1,0 +1,21 @@
+-- Global additional-cost line-item audit log (one row per Nexus additional-cost per sync snapshot).
+-- Run in BigQuery BEFORE deploying updated Firebase functions.
+
+CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.ch_additional_cost_logs` (
+  ID STRING NOT NULL,
+  DATE_AND_TIME TIMESTAMP NOT NULL,
+  DEAL_SHEET_ID INT64,
+  PLACEMENT_ID INT64,
+  CANDIDATE_NAME STRING,
+  CANDIDATE_EMAIL STRING,
+  ASSIGNMENT_RECRUITER_EMAIL STRING,
+  START_DATE DATE,
+  TENTATIVE_DATE DATE,
+  ADDITIONAL_COST_ID INT64,
+  ADDITIONAL_COST_NAME STRING,
+  CATEGORY STRING,
+  DURATION STRING,
+  VALUE FLOAT64,
+  NOTES STRING
+)
+PARTITION BY DATE(DATE_AND_TIME);
