@@ -28,12 +28,13 @@ const {
   fetchActiveDealSheetUpdateTargets,
   fetchLatestRowsByDealSheetPlacementPairs,
   fetchLatestRowsByDealSheetIds,
+  fetchContractRateChangePairsFromActive,
   hasBusinessColumnChanges,
   normalizeForCompare,
   resolveFirstInsertPlacementAllowlist,
   placementStatusAllowsFirstInsert,
 } = require("./bigQueryClient");
-const { startDateOnOrAfterUtcMin, API_OWNED_COLUMNS } = require("./columnMappings");
+const { startDateOnOrAfterUtcMin, effectiveMinFilterDate, API_OWNED_COLUMNS } = require("./columnMappings");
 const { buildEnrichedRowsFromDealSheetCandidates } = require("./api/dealSheetEnricher");
 const {
   resolveActiveDealSheetTableId,
@@ -44,10 +45,6 @@ const {
 
 function isPositiveInt(value) {
   return value != null && Number.isFinite(Number(value)) && Number(value) > 0;
-}
-
-function isRateChangeYes(value) {
-  return String(value || "").trim().toUpperCase() === "YES";
 }
 
 function resolveAdditionalCostLogTarget(params = {}) {
@@ -88,23 +85,117 @@ function toInt64OrNull(value) {
   return Math.trunc(n);
 }
 
-function buildRateChangeLogRow(row) {
-  const dealSheetInt = toInt64OrNull(row?.DEAL_SHEET_ID);
-  const placementInt = toInt64OrNull(row?.PLACEMENT_ID);
-  const dealSheetKey = dealSheetInt != null ? String(dealSheetInt) : "";
-  const placementKey = placementInt != null ? String(placementInt) : "";
-  const candidateEmail = row?.CANDIDATE_EMAIL == null ? "" : String(row.CANDIDATE_EMAIL).trim();
+/** BigQuery FLOAT64: finite number or null */
+function toFloatOrNull(value) {
+  if (value == null || value === "") return null;
+  const n = Number(typeof value === "string" ? value.trim() : value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function toRateChangeEffectiveDate(row) {
+  const dt = row?.DATE_AND_TIME;
+  if (dt == null) return null;
+  if (dt instanceof Date) {
+    const y = dt.getUTCFullYear();
+    const m = String(dt.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(dt.getUTCDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+  if (typeof dt === "object" && dt.value != null) {
+    const s = String(dt.value);
+    return s.length >= 10 ? s.slice(0, 10) : null;
+  }
+  const s = String(dt);
+  return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : null;
+}
+
+function numDiff(newVal, oldVal) {
+  const n = toFloatOrNull(newVal);
+  const o = toFloatOrNull(oldVal);
+  if (n == null || o == null) return null;
+  return n - o;
+}
+
+/**
+ * Map deal-sheet row columns into OLD_* or NEW_* rate snapshot fields on the log row.
+ * @param {object|null} row
+ * @param {"OLD_"|"NEW_"} prefix
+ */
+function extractRateSnapshotFields(row, prefix) {
+  if (!row) {
+    return {
+      [`${prefix}GUARANTEED_HOURS`]: null,
+      [`${prefix}INITIAL_PROJECT_DURATION_IN_WEEKS`]: null,
+      [`${prefix}ORIENTATION_HOURS`]: null,
+      [`${prefix}ADDITIONAL_BONUS`]: null,
+      [`${prefix}PAY_RATE`]: null,
+      [`${prefix}WEEKLY_PER_DIEM`]: null,
+      [`${prefix}W2_PAY_RATE`]: null,
+      [`${prefix}FINAL_PAY_RATE`]: null,
+      [`${prefix}FINAL_COST`]: null,
+      [`${prefix}BILL_RATE`]: null,
+      [`${prefix}FINAL_BILL_RATE`]: null,
+      [`${prefix}NET_MARGIN`]: null,
+      [`${prefix}GROSS_MARGIN`]: null,
+      [`${prefix}CLIENT_MSP_FEE`]: null,
+      [`${prefix}GM_BASED_ON_NEW_LOADING_COST`]: null,
+    };
+  }
   return {
-    // One log row per deal sheet: streaming insertId + dedupe use this field (see insertRateChangeLogBatch).
-    RATE_CHANGE_LOG_ID:
-      dealSheetKey || `na-ds|${placementKey || "na-p"}|${candidateEmail || "na-e"}`,
-    CANDIDATE_NAME: row?.CANDIDATE_NAME ?? null,
-    EMAIL: row?.CANDIDATE_EMAIL ?? null,
-    PLACEMENT_ID: placementInt,
-    PLACEMENT_STATUS: row?.PLACEMENT_STATUS ?? null,
-    CANDIDATE_STATUS: row?.CANDIDATE_STATUS ?? null,
-    DEAL_SHEET_ID: dealSheetInt,
+    [`${prefix}GUARANTEED_HOURS`]: toFloatOrNull(row.GUARANTEED_HOURS),
+    [`${prefix}INITIAL_PROJECT_DURATION_IN_WEEKS`]: toFloatOrNull(row.INITIAL_PROJECT_DURATION_IN_WEEKS),
+    [`${prefix}ORIENTATION_HOURS`]: toFloatOrNull(row.ORIENTATION_HOURS),
+    [`${prefix}ADDITIONAL_BONUS`]: toFloatOrNull(row.ADDITIONAL_BONUS),
+    [`${prefix}PAY_RATE`]: toFloatOrNull(row.PAY_RATE),
+    [`${prefix}WEEKLY_PER_DIEM`]: toFloatOrNull(row.WEEKLY_PER_DIEM_NON_TAXED),
+    [`${prefix}W2_PAY_RATE`]: toFloatOrNull(row.W2_PAY_RATE),
+    [`${prefix}FINAL_PAY_RATE`]: toFloatOrNull(row.FINAL_PAY_RATE),
+    [`${prefix}FINAL_COST`]: toFloatOrNull(row.FINAL_COST),
+    [`${prefix}BILL_RATE`]: toFloatOrNull(row.BILL_RATE),
+    [`${prefix}FINAL_BILL_RATE`]: toFloatOrNull(row.FINAL_BILL_RATE),
+    [`${prefix}NET_MARGIN`]: toFloatOrNull(row.NET_MARGIN),
+    [`${prefix}GROSS_MARGIN`]: toFloatOrNull(row.GROSS_MARGIN),
+    [`${prefix}CLIENT_MSP_FEE`]: toFloatOrNull(row.CLIENT_MSP_FEE),
+    [`${prefix}GM_BASED_ON_NEW_LOADING_COST`]: toFloatOrNull(row.NEW_MARGIN),
+  };
+}
+
+/**
+ * Build wide rate-change log row from BigQuery latest (and optional previous) deal-sheet snapshots.
+ * @param {object} latestRow
+ * @param {object|null} previousRow
+ */
+function buildRateChangeLogRow(latestRow, previousRow = null) {
+  const oldSnap = extractRateSnapshotFields(previousRow, "OLD_");
+  const newSnap = extractRateSnapshotFields(latestRow, "NEW_");
+
+  return {
     RATE_CHANGE: "YES",
+    SKU_NUMBER: latestRow?.SKU_NUMBER ?? null,
+    CONTRACT_ID: toInt64OrNull(latestRow?.CONTRACT_ID),
+    CANDIDATE_NAME: latestRow?.CANDIDATE_NAME ?? null,
+    RATE_CHANGE_EFFECTIVE_DATE: toRateChangeEffectiveDate(latestRow),
+    PLACEMENT_STATUS: latestRow?.PLACEMENT_STATUS ?? null,
+    START_DATE: latestRow?.START_DATE ?? null,
+    END_DATE: latestRow?.END_DATE ?? null,
+    RECRUITER: latestRow?.ASSIGNMENT_RECRUITER ?? null,
+    RECRUITER_EMAIL_ID: latestRow?.ASSIGNMENT_RECRUITER_EMAIL ?? null,
+    ACCOUNT_MANAGER: latestRow?.ACCOUNT_MANAGER ?? null,
+    SECONDARY_AM: latestRow?.SECONDARY_AM ?? null,
+    ASSOCIATE_AM: latestRow?.ASSOCIATE_AM ?? null,
+    RM: latestRow?.RM ?? null,
+    TEAM_LEAD: latestRow?.TEAM_LEAD ?? null,
+    ATL: latestRow?.ATL ?? null,
+    MSP: latestRow?.MSP_NAME ?? null,
+    END_CLIENT_DEPT_FACILITY: latestRow?.END_CLIENT_DEPT_FACILITY ?? null,
+    ...oldSnap,
+    ...newSnap,
+    GM_DIFFERENCE: numDiff(newSnap.NEW_GROSS_MARGIN, oldSnap.OLD_GROSS_MARGIN),
+    BR_DIFFERENCE: numDiff(newSnap.NEW_BILL_RATE, oldSnap.OLD_BILL_RATE),
+    PROFIT_DIFFERENCE: numDiff(newSnap.NEW_NET_MARGIN, oldSnap.OLD_NET_MARGIN),
+    DELIVERY_POC: latestRow?.DELIVERY_POC ?? null,
+    ONSITE_MANAGER: latestRow?.ONSITE_AM ?? null,
+    CLIENT_STATE: latestRow?.CLIENT_STATE ?? null,
   };
 }
 
@@ -346,7 +437,7 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     params.min_start_date_ms != null && Number.isFinite(Number(params.min_start_date_ms))
       ? Number(params.min_start_date_ms)
       : null;
-  if (minStartDateMs != null && !startDateOnOrAfterUtcMin(row?.START_DATE, minStartDateMs)) {
+  if (minStartDateMs != null && !startDateOnOrAfterUtcMin(effectiveMinFilterDate(row), minStartDateMs)) {
     return {
       action: "SKIPPED_DATE",
       inserted: 0,
@@ -776,7 +867,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
         persistDealSheetStatusFromCandidate: includeVerbalDealSheets,
       }
     );
-    const rowsForInsert = transformRowsFn ? transformRowsFn(combined) : combined;
+    const rowsForInsert = transformRowsFn ? await transformRowsFn(combined) : combined;
     totalRowsAfterTransform += rowsForInsert.length;
     logLine(
       `[enriched sync] STEP 5/5 BIGQUERY: insertAll ${label} rows=${rowsForInsert.length} (beforeTransform=${combined.length})`
@@ -1196,51 +1287,51 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
   };
 }
 
-async function syncRateChangeLogsToBigQuery(params = {}) {
-  const rateChangeSubmittalCodes = "PERM_STARTS,ACTIVE,BOOKED";
-  const effectiveDatasetId =
+async function syncRateChangeLogsFromBigQuery(params = {}) {
+  const logDatasetId =
     typeof params.bq_dataset === "string" && params.bq_dataset.trim() !== ""
       ? params.bq_dataset.trim()
       : config.rateChangeLogDatasetId;
-  const effectiveTableId =
+  const logTableId =
     typeof params.bq_table === "string" && params.bq_table.trim() !== ""
       ? params.bq_table.trim()
       : config.rateChangeLogTableId;
+  const dealSheetDatasetId =
+    typeof params.deal_sheet_bq_dataset === "string" && params.deal_sheet_bq_dataset.trim() !== ""
+      ? params.deal_sheet_bq_dataset.trim()
+      : config.datasetId;
 
-  // Same DEAL_SHEET_ID can appear on multiple deal-sheet-candidate rows (different candidates/jobs);
-  // rate change is deal-sheet scoped — keep at most one log row per deal sheet per sync run.
-  const rateChangeDealSheetSeenThisRun = new Set();
+  const startMs = Date.now();
+  logLine(
+    `[rate-change logs BQ scan] === syncRateChangeLogsFromBigQuery START === dealSheetDataset=${dealSheetDatasetId} logTable=${config.projectId}.${logDatasetId}.${logTableId}`
+  );
 
-  const result = await syncEnrichedDealSheetCandidatesToBigQuery({
-    ...params,
-    organization_submittal_status_code: rateChangeSubmittalCodes,
-    bq_dataset: effectiveDatasetId,
-    bq_table: effectiveTableId,
-    transform_rows_fn: (rows) => {
-      const out = [];
-      for (const row of rows) {
-        if (!isRateChangeYes(row?.RATE_CHANGE)) continue;
-        const mapped = buildRateChangeLogRow(row);
-        const dsKey =
-          mapped.DEAL_SHEET_ID == null || String(mapped.DEAL_SHEET_ID).trim() === ""
-            ? ""
-            : String(mapped.DEAL_SHEET_ID).trim();
-        if (dsKey !== "") {
-          if (rateChangeDealSheetSeenThisRun.has(dsKey)) continue;
-          rateChangeDealSheetSeenThisRun.add(dsKey);
-        }
-        out.push(mapped);
-      }
-      return out;
-    },
-    insert_batch_fn: insertRateChangeLogBatch,
+  const pairs = await fetchContractRateChangePairsFromActive({ datasetId: dealSheetDatasetId });
+  logLine(`[rate-change logs BQ scan] contract pairs with RATE_CHANGE=YES and previous row=${pairs.size}`);
+
+  const rows = [];
+  for (const [, { latest, previous }] of pairs) {
+    if (!latest || !previous) continue;
+    rows.push(buildRateChangeLogRow(latest, previous));
+  }
+
+  const result = await insertRateChangeLogBatch(rows, 0, {
+    skipExistingRateChangeLogs: true,
+    datasetId: logDatasetId,
+    tableId: logTableId,
   });
 
+  const elapsedStr = formatDuration(Date.now() - startMs);
+  logLine(
+    `[rate-change logs BQ scan] DONE inserted=${result.inserted} candidates=${pairs.size} built=${rows.length} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
+  );
+
   return {
-    ...result,
-    total: result.candidatesProcessed,
-    rateChangeYes: result.rowsAfterTransform,
     inserted: result.inserted,
+    total: pairs.size,
+    rateChangeYes: rows.length,
+    errorBatches: result.errorBatches,
+    elapsed: elapsedStr,
   };
 }
 
@@ -1448,9 +1539,10 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
 module.exports = {
   syncEnrichedDealSheetCandidatesToBigQuery,
   syncExistingActiveDealSheetUpdatesFromBigQuery,
-  syncRateChangeLogsToBigQuery,
+  syncRateChangeLogsFromBigQuery,
   refreshPlacementRecordToBigQuery,
   buildActiveUpdateRefreshParams,
+  buildRateChangeLogRow,
   parseBooleanLike,
   computeChangedFields,
   resolvePreferredCandidateRow,

@@ -82,6 +82,21 @@ test("dealSheetSyncTrigger is insert-only and skips existing deal sheet or place
   assert.equal(block.includes("max_pages"), false);
 });
 
+test("rateChangeLogSyncTrigger uses BigQuery CONTRACT_ID scan (no Nexus pipeline)", () => {
+  const filePath = path.join(__dirname, "index.js");
+  const source = fs.readFileSync(filePath, "utf8");
+  const marker = "exports.rateChangeLogSyncTrigger = onSchedule(";
+  const start = source.indexOf(marker);
+  assert.ok(start >= 0, "rateChangeLogSyncTrigger block should exist");
+  const block = source.slice(start, start + 2500);
+
+  assert.equal(block.includes("syncRateChangeLogsFromBigQuery"), true);
+  assert.equal(block.includes("syncRateChangeLogsToBigQuery"), false);
+  assert.equal(block.includes("only_new_deal_sheets"), false);
+  assert.equal(block.includes("PERM_STARTS,ACTIVE,BOOKED"), false);
+  assert.equal(block.includes('bq_table: "ch_rate_change_logs"'), true);
+});
+
 test("dealSheetSyncUpdateTrigger uses deal-sheet targets and deal_sheet_id baseline", () => {
   const filePath = path.join(__dirname, "index.js");
   const source = fs.readFileSync(filePath, "utf8");

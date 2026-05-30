@@ -2,6 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  mapJobToBq,
   mapJobSubmittalToBq,
   mapDealSheetHoursDetailsToBq,
   mapDealSheetAdditionalCostsToBq,
@@ -13,6 +14,7 @@ const {
   computeDerivedPlacementFields,
   mapMspFromClientOfferingRow,
   startDateOnOrAfterUtcMin,
+  effectiveMinFilterDate,
   coerceApiFloatNullsToZero,
   mapDealSheetRatesListToBq,
   mapDealSheetUsersToBq,
@@ -50,7 +52,6 @@ const API_FLOAT_COLUMNS_DEFAULT_ZERO = [
   "GP_PERCENTAGE",
   "GROSS_MARGIN",
   "PO_HOURS",
-  "CA_GM",
 ];
 
 const MAY_1_2026_MS = Date.UTC(2026, 4, 1);
@@ -75,7 +76,7 @@ test("mapJobSubmittalToBq prefers start/end dates from submittal", () => {
   assert.equal(mapped.END_DATE, "2025-06-21");
 });
 
-test("mapJobSubmittalToBq falls back to job dates when submittal dates are blank", () => {
+test("mapJobSubmittalToBq does not fall back to job start_date when submittal start is blank", () => {
   const submittal = {
     id: 555,
     submitted_date: "2025-02-20T15:13:18Z",
@@ -90,8 +91,25 @@ test("mapJobSubmittalToBq falls back to job dates when submittal dates are blank
 
   const mapped = mapJobSubmittalToBq(submittal, job);
 
-  assert.equal(mapped.START_DATE, "2025-07-01");
+  assert.equal(mapped.START_DATE, null);
   assert.equal(mapped.TENTATIVE_DATE, "2025-10-14");
+});
+
+test("mapJobToBq maps job start_date to OFFER_TIME_START_DATE only", () => {
+  const mapped = mapJobToBq({ start_date: "2025-07-01", ref_code: "VMS-1" });
+
+  assert.equal(mapped.OFFER_TIME_START_DATE, "2025-07-01");
+  assert.equal(Object.prototype.hasOwnProperty.call(mapped, "START_DATE"), false);
+});
+
+test("effectiveMinFilterDate uses OFFER_TIME_START_DATE when START_DATE is empty", () => {
+  const row = { START_DATE: null, OFFER_TIME_START_DATE: "2026-05-10" };
+  assert.equal(startDateOnOrAfterUtcMin(effectiveMinFilterDate(row), MAY_1_2026_MS), true);
+});
+
+test("effectiveMinFilterDate prefers START_DATE over OFFER_TIME_START_DATE", () => {
+  const row = { START_DATE: "2026-04-30", OFFER_TIME_START_DATE: "2026-05-10" };
+  assert.equal(startDateOnOrAfterUtcMin(effectiveMinFilterDate(row), MAY_1_2026_MS), false);
 });
 
 test("mapJobSubmittalToBq formats tentative date from mm/dd/yyyy", () => {
@@ -339,7 +357,7 @@ test("mapDealSheetHoursDetailsToBq defaults to zeros when scheduled hours are bl
   assert.equal(mapped.GREATER_THAN_EIGHT_HOURS_2, 0);
 });
 
-test("computeDerivedPlacementFields calculates BOOKED/STARTED style metrics", () => {
+test("computeDerivedPlacementFields calculates ENDED placement metrics including DAYS_WORKED", () => {
   const row = {
     PAY_RATE: 50,
     TYPE: "SomeType",
@@ -356,6 +374,7 @@ test("computeDerivedPlacementFields calculates BOOKED/STARTED style metrics", ()
     POSITION: "RN",
     OT_RATE: 75,
     CLIENT_OT_RATE: 130,
+    PLACEMENT_STATUS: "ENDED",
     START_DATE: "2025-01-01",
     END_DATE: "2025-01-11",
   };
@@ -425,6 +444,39 @@ test("computeDerivedPlacementFields handles FT and null/zero guardrails", () => 
   assert.equal(Object.hasOwn(out, "GROSS_MARGIN"), false);
   assert.equal(out.GM_OT, null);
   assert.equal(out.DAYS_WORKED, 0);
+});
+
+test("computeDerivedPlacementFields DAYS_WORKED status gate", () => {
+  const baseDates = { START_DATE: "2025-01-01", END_DATE: "2025-01-11" };
+
+  assert.equal(
+    computeDerivedPlacementFields({ ...baseDates, PLACEMENT_STATUS: "STARTED" }).DAYS_WORKED,
+    0
+  );
+  assert.equal(
+    computeDerivedPlacementFields({ ...baseDates, PLACEMENT_STATUS: "BOOKED" }).DAYS_WORKED,
+    0
+  );
+  assert.equal(
+    computeDerivedPlacementFields({ ...baseDates, PLACEMENT_STATUS: "ENDED<30" }).DAYS_WORKED,
+    10
+  );
+  assert.equal(
+    computeDerivedPlacementFields({
+      START_DATE: "2025-01-01",
+      END_DATE: "2025-01-01",
+      PLACEMENT_STATUS: "DID NOT ACCEPT",
+    }).DAYS_WORKED,
+    0
+  );
+  assert.equal(
+    computeDerivedPlacementFields({ ...baseDates, PLACEMENT_STATUS: null }).DAYS_WORKED,
+    0
+  );
+  assert.equal(
+    computeDerivedPlacementFields({ ...baseDates }).DAYS_WORKED,
+    0
+  );
 });
 
 test("mapDealSheetAdditionalCostsToBq sums only BONUS category rows", () => {

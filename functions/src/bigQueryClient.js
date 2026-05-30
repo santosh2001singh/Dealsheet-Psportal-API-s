@@ -220,6 +220,220 @@ async function fetchLatestRowsByDealSheetIds(dealSheetIds, options = {}) {
   return out;
 }
 
+/** Format DATE / wrapper for rate-change log dedupe key segment. */
+function formatRateChangeEffectiveDateKey(value) {
+  if (value == null || value === "") return "";
+  if (value instanceof Date) {
+    const y = value.getUTCFullYear();
+    const m = String(value.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(value.getUTCDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+  if (typeof value === "object" && value.value != null) {
+    const s = String(value.value);
+    return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : "";
+  }
+  const s = String(value).trim();
+  return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : "";
+}
+
+/** Dedupe key: CONTRACT_ID|YYYY-MM-DD (effective date of latest rate-change row). */
+function buildRateChangeLogDedupeKey(row) {
+  const cid = row?.CONTRACT_ID == null ? "" : String(row.CONTRACT_ID).trim();
+  const eff = formatRateChangeEffectiveDateKey(row?.RATE_CHANGE_EFFECTIVE_DATE);
+  if (!cid || !eff) return "";
+  return `${cid}|${eff}`;
+}
+
+/**
+ * Returns Set of "<CONTRACT_ID>|<YYYY-MM-DD>" keys already present in the log table.
+ */
+async function fetchExistingRateChangeLogContractKeysSet(contractIds, options = {}) {
+  const out = new Set();
+  if (!contractIds || contractIds.length === 0) return out;
+
+  const { datasetId, tableId } = resolveBqDatasetTable(options);
+  const uniq = [];
+  const seen = new Set();
+  for (const id of contractIds) {
+    if (id == null || String(id).trim() === "") continue;
+    const s = String(id).trim();
+    if (seen.has(s)) continue;
+    seen.add(s);
+    uniq.push(s);
+  }
+  if (uniq.length === 0) return out;
+
+  const chunkSize = 500;
+  for (let i = 0; i < uniq.length; i += chunkSize) {
+    const chunk = uniq.slice(i, i + chunkSize);
+    const inList = chunk.map((v) => `'${escapeSqlString(v)}'`).join(", ");
+    const sql = `SELECT CONTRACT_ID, RATE_CHANGE_EFFECTIVE_DATE
+                 FROM \`${config.projectId}.${datasetId}.${tableId}\`
+                 WHERE CAST(CONTRACT_ID AS STRING) IN (${inList})`;
+    const rows = await queryObjects(sql, chunk.length * 5);
+    for (const row of rows) {
+      const key = buildRateChangeLogDedupeKey(row);
+      if (key) out.add(key);
+    }
+  }
+  return out;
+}
+
+function stripRateChangeHistoryMetaFields(row) {
+  if (!row || typeof row !== "object") return row;
+  const out = { ...row };
+  delete out._global_rn;
+  delete out._table_rn;
+  delete out._src_table;
+  delete out._src;
+  delete out.rn;
+  return out;
+}
+
+/**
+ * Returns Map<contractIdStr, { latest, previous }> for CONTRACT_IDs whose latest row
+ * has RATE_CHANGE='YES' and at least one prior row exists (rate-change event).
+ */
+async function fetchContractRateChangePairsFromActive(options = {}) {
+  const out = new Map();
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+
+  const unionParts = ACTIVE_DEAL_SHEET_TABLE_IDS.map((tableId) => {
+    const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
+    const src = escapeSqlString(tableId);
+    return `SELECT *, '${src}' AS _src FROM ${fqn} WHERE CONTRACT_ID IS NOT NULL`;
+  });
+
+  const sql = `WITH all_rows AS (
+                 ${unionParts.join("\n                 UNION ALL\n                 ")}
+               ),
+               ranked AS (
+                 SELECT
+                   *,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY CONTRACT_ID
+                     ORDER BY DATE_AND_TIME DESC NULLS LAST
+                   ) AS rn
+                 FROM all_rows
+               ),
+               yes_contracts AS (
+                 SELECT DISTINCT CONTRACT_ID
+                 FROM ranked
+                 WHERE rn = 1 AND UPPER(TRIM(CAST(RATE_CHANGE AS STRING))) = 'YES'
+               )
+               SELECT * FROM ranked
+               WHERE rn <= 2
+                 AND CONTRACT_ID IN (SELECT CONTRACT_ID FROM yes_contracts)`;
+
+  const rows = await queryObjects(sql, 100000);
+  for (const raw of rows) {
+    const key = raw?.CONTRACT_ID == null ? "" : String(raw.CONTRACT_ID).trim();
+    if (!key) continue;
+    const rn = Number(raw.rn);
+    const cleaned = stripRateChangeHistoryMetaFields(raw);
+    if (!out.has(key)) {
+      out.set(key, { latest: null, previous: null });
+    }
+    const slot = out.get(key);
+    if (rn === 1) slot.latest = cleaned;
+    else if (rn === 2) slot.previous = cleaned;
+  }
+
+  for (const [key, pair] of [...out.entries()]) {
+    if (!pair.latest || !pair.previous) out.delete(key);
+  }
+
+  logLine(
+    `[rate-change logs BQ scan] fetchContractRateChangePairsFromActive dataset=${datasetId} pairs=${out.size}`
+  );
+  return out;
+}
+
+/**
+ * Returns Map<dealSheetIdString, { latest, previous }> across all active domain tables.
+ * latest = most recent row by DATE_AND_TIME; previous = second most recent (or null).
+ */
+async function fetchLatestTwoRowsByDealSheetIdsAcrossActive(dealSheetIds, options = {}) {
+  const out = new Map();
+  if (!dealSheetIds || dealSheetIds.length === 0) return out;
+
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+
+  const uniq = [];
+  const seen = new Set();
+  for (const id of dealSheetIds) {
+    if (id == null || String(id).trim() === "") continue;
+    const s = String(id).trim();
+    if (seen.has(s)) continue;
+    seen.add(s);
+    uniq.push(s);
+  }
+  if (uniq.length === 0) return out;
+
+  const unionParts = ACTIVE_DEAL_SHEET_TABLE_IDS.map((tableId) => {
+    const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
+    const src = escapeSqlString(tableId);
+    return `SELECT * EXCEPT(_table_rn)
+            FROM (
+              SELECT
+                *,
+                '${src}' AS _src_table,
+                ROW_NUMBER() OVER (
+                  PARTITION BY CAST(DEAL_SHEET_ID AS STRING)
+                  ORDER BY DATE_AND_TIME DESC NULLS LAST
+                ) AS _table_rn
+              FROM ${fqn}
+              WHERE CAST(DEAL_SHEET_ID AS STRING) IN UNNEST(@ids)
+            )
+            WHERE _table_rn <= 2`;
+  });
+
+  const chunkSize = 500;
+  for (let i = 0; i < uniq.length; i += chunkSize) {
+    const chunk = uniq.slice(i, i + chunkSize);
+    const sql = `SELECT * EXCEPT(_global_rn)
+                 FROM (
+                   SELECT
+                     *,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY CAST(DEAL_SHEET_ID AS STRING)
+                       ORDER BY DATE_AND_TIME DESC NULLS LAST
+                     ) AS _global_rn
+                   FROM (
+                     ${unionParts.join("\n                     UNION ALL\n                     ")}
+                   )
+                 )
+                 WHERE _global_rn <= 2`;
+
+    const [rows] = await bigquery.query({
+      query: sql,
+      params: { ids: chunk },
+    });
+
+    for (const raw of rows) {
+      const key = raw?.DEAL_SHEET_ID == null ? "" : String(raw.DEAL_SHEET_ID).trim();
+      if (!key) continue;
+      const rn = Number(raw._global_rn);
+      const cleaned = stripRateChangeHistoryMetaFields(raw);
+      if (!out.has(key)) {
+        out.set(key, { latest: null, previous: null });
+      }
+      const slot = out.get(key);
+      if (rn === 1) slot.latest = cleaned;
+      else if (rn === 2) slot.previous = cleaned;
+    }
+  }
+
+  return out;
+}
+
 function buildDealSheetPlacementCompositeKey(dealSheetId, placementId) {
   const dsid = dealSheetId == null ? "" : String(dealSheetId).trim();
   const pid = placementId == null ? "" : String(placementId).trim();
@@ -458,7 +672,7 @@ function sanitizeRowForBigQueryStreamingInsert(row) {
   if (!row || typeof row !== "object") return row;
   const out = {};
   for (const [k, v] of Object.entries(row)) {
-    if (k === "_rn") continue;
+    if (k === "_rn" || k === "_INSERT_ID" || k === "rn" || k === "_src" || k === "_src_table") continue;
     const inner = sanitizeValueForStreamingInsert(v);
     if (inner !== undefined) out[k] = inner;
   }
@@ -876,6 +1090,20 @@ async function insertRateChangeLogBatch(logRows, insertIdBase, options = {}) {
     return { inserted: 0, attempted: 0, errorBatches: 0 };
   }
 
+  const generatedUuidField =
+    typeof options.generatedUuidField === "string" && options.generatedUuidField.trim() !== ""
+      ? options.generatedUuidField.trim()
+      : "ID";
+  if (generatedUuidField) {
+    logRows = logRows.map((row) => {
+      const next = { ...row };
+      const raw = next[generatedUuidField];
+      const existing = raw == null ? "" : String(raw).trim();
+      if (!existing) next[generatedUuidField] = randomUUID();
+      return next;
+    });
+  }
+
   const beforeYesFilter = logRows.length;
   logRows = logRows.filter((r) => String(r?.RATE_CHANGE ?? "").trim().toUpperCase() === "YES");
   const droppedNonYes = beforeYesFilter - logRows.length;
@@ -887,47 +1115,48 @@ async function insertRateChangeLogBatch(logRows, insertIdBase, options = {}) {
     return { inserted: 0, attempted: 0, errorBatches: 0 };
   }
 
-  const seenDs = new Set();
+  const seenKeys = new Set();
   let deduped = [];
   let droppedDupBatch = 0;
   for (const row of logRows) {
-    const ds =
-      row?.DEAL_SHEET_ID == null || String(row.DEAL_SHEET_ID).trim() === ""
-        ? null
-        : String(row.DEAL_SHEET_ID).trim();
-    if (ds != null) {
-      if (seenDs.has(ds)) {
+    const dedupeKey = buildRateChangeLogDedupeKey(row);
+    if (dedupeKey !== "") {
+      if (seenKeys.has(dedupeKey)) {
         droppedDupBatch++;
         continue;
       }
-      seenDs.add(ds);
+      seenKeys.add(dedupeKey);
     }
     deduped.push(row);
   }
   if (droppedDupBatch > 0) {
-    logLine(`[rate-change logs] dedupe(same batch DEAL_SHEET_ID): dropped=${droppedDupBatch} remaining=${deduped.length}`);
+    logLine(
+      `[rate-change logs] dedupe(same batch CONTRACT_ID+EFFECTIVE_DATE): dropped=${droppedDupBatch} remaining=${deduped.length}`
+    );
   }
 
-  const skipExistingDealSheets = options.skipExistingDealSheets === true;
-  if (skipExistingDealSheets && deduped.length > 0) {
-    const ids = [];
+  const skipExisting = options.skipExistingDealSheets === true || options.skipExistingRateChangeLogs === true;
+  if (skipExisting && deduped.length > 0) {
+    const contractIds = [];
+    const seenCids = new Set();
     for (const row of deduped) {
-      const id = row?.DEAL_SHEET_ID;
-      if (id != null && String(id).trim() !== "") {
-        ids.push(String(id).trim());
-      }
+      const cid = row?.CONTRACT_ID;
+      if (cid == null || String(cid).trim() === "") continue;
+      const key = String(cid).trim();
+      if (seenCids.has(key)) continue;
+      seenCids.add(key);
+      contractIds.push(key);
     }
-    const existingIds = await fetchExistingDealSheetIdsSet(ids, {
+    const existingKeys = await fetchExistingRateChangeLogContractKeysSet(contractIds, {
       datasetId: options.datasetId,
       tableId: options.tableId,
     });
-    if (existingIds.size > 0) {
+    if (existingKeys.size > 0) {
       const filtered = [];
       let skipped = 0;
       for (const row of deduped) {
-        const dsid = row?.DEAL_SHEET_ID;
-        const key = dsid == null ? "" : String(dsid).trim();
-        if (key !== "" && existingIds.has(key)) {
+        const key = buildRateChangeLogDedupeKey(row);
+        if (key !== "" && existingKeys.has(key)) {
           skipped++;
           continue;
         }
@@ -935,7 +1164,7 @@ async function insertRateChangeLogBatch(logRows, insertIdBase, options = {}) {
       }
       deduped = filtered;
       logLine(
-        `[rate-change logs] [BigQuery insertAll] dedupe(existing DEAL_SHEET_ID in log table): skipped=${skipped} remaining=${deduped.length}`
+        `[rate-change logs] [BigQuery insertAll] dedupe(existing CONTRACT_ID+EFFECTIVE_DATE in log table): skipped=${skipped} remaining=${deduped.length}`
       );
     }
   }
@@ -954,11 +1183,16 @@ async function insertRateChangeLogBatch(logRows, insertIdBase, options = {}) {
     return { inserted: 0, attempted: 0, errorBatches: 0 };
   }
 
-  const result = await insertAll(deduped, {
+  const rowsForInsert = deduped.map((row) => {
+    const dedupeKey = buildRateChangeLogDedupeKey(row);
+    return dedupeKey ? { ...row, _INSERT_ID: dedupeKey } : row;
+  });
+
+  const result = await insertAll(rowsForInsert, {
     insertIdBase,
     datasetId: options.datasetId,
     tableId: options.tableId,
-    insertIdField: "RATE_CHANGE_LOG_ID",
+    insertIdField: "_INSERT_ID",
   });
   const hasErrors = result.errors && result.errors.length > 0;
 
@@ -1528,10 +1762,14 @@ module.exports = {
   queryObjects,
   fetchExistingDealSheetIdsSet,
   fetchExistingPlacementIdsSet,
+  fetchExistingRateChangeLogContractKeysSet,
+  fetchContractRateChangePairsFromActive,
+  buildRateChangeLogDedupeKey,
   fetchExistingDealSheetIdsSetAnyActiveTable,
   fetchExistingPlacementIdsSetAnyActiveTable,
   fetchPlacementStatusesByPlacementIds,
   fetchLatestRowsByDealSheetIds,
+  fetchLatestTwoRowsByDealSheetIdsAcrossActive,
   fetchLatestRowsByDealSheetPlacementPairs,
   insertAll,
   insertEnrichedDealSheetBatch,

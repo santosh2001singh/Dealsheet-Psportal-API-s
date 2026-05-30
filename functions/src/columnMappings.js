@@ -327,6 +327,15 @@ function startDateOnOrAfterUtcMin(value, minUtcMs) {
 }
 
 /**
+ * Date used for min-start-date filters: submittal START_DATE, else job OFFER_TIME_START_DATE.
+ */
+function effectiveMinFilterDate(row) {
+  const s = row?.START_DATE;
+  if (s != null && String(s).trim() !== "") return s;
+  return row?.OFFER_TIME_START_DATE ?? null;
+}
+
+/**
  * Pad number to 2 digits
  */
 function pad2(n) {
@@ -418,7 +427,7 @@ function mapJobToBq(job) {
   return {
     VMS_JOB_ID: job?.ref_code ?? null,
     BILL_RATE: toNumberOrNull(job?.bill_rate),
-    START_DATE: job?.start_date ?? null,
+    OFFER_TIME_START_DATE: formatDateStringForBq(job?.start_date) ?? null,
     TENTATIVE_DATE: job ? tentativeDateFromJob(job) : null,
     END_DATE: computeBqEndDateFromJob(job),
     OFFERING: job?.offering ?? null,
@@ -876,6 +885,14 @@ function sumOrNull(values) {
   return total;
 }
 
+/** Placement statuses for which DAYS_WORKED = END_DATE - START_DATE is computed. */
+const DAYS_WORKED_ELIGIBLE_STATUSES = new Set([
+  "ENDED",
+  "ENDED<30",
+  "DID NOT START",
+  "DID NOT ACCEPT",
+]);
+
 /**
  * Compute derived placement metrics for active sync rows
  */
@@ -961,11 +978,16 @@ function computeDerivedPlacementFields(row) {
   }
 
   let daysWorked = 0;
-  const endDateRaw = row?.END_DATE == null ? "" : String(row.END_DATE).trim();
-  const startDateRaw = row?.START_DATE == null ? "" : String(row.START_DATE).trim();
-  if (endDateRaw && startDateRaw) {
-    const diff = dateDiffDaysEndMinusStart(startDateRaw, endDateRaw);
-    daysWorked = diff == null ? 0 : diff;
+  const statusRaw = row?.PLACEMENT_STATUS == null
+    ? ""
+    : String(row.PLACEMENT_STATUS).trim().toUpperCase();
+  if (DAYS_WORKED_ELIGIBLE_STATUSES.has(statusRaw)) {
+    const endDateRaw = row?.END_DATE == null ? "" : String(row.END_DATE).trim();
+    const startDateRaw = row?.START_DATE == null ? "" : String(row.START_DATE).trim();
+    if (endDateRaw && startDateRaw) {
+      const diff = dateDiffDaysEndMinusStart(startDateRaw, endDateRaw);
+      daysWorked = diff == null ? 0 : diff;
+    }
   }
 
   return {
@@ -1075,8 +1097,11 @@ function mapJobSubmittalToBq(submittalRow, jobObj) {
   const submitted = submittalRow.submitted_date;
   const submittedStr = submitted == null || String(submitted).trim() === ""
     ? null : String(submitted).trim();
-  const startRaw = firstNonEmptyDate(submittalRow?.start_date, jobObj?.start_date);
-  const startDate = startRaw == null ? null : String(startRaw).trim();
+  const startRaw =
+    submittalRow?.start_date == null || String(submittalRow.start_date).trim() === ""
+      ? null
+      : String(submittalRow.start_date).trim();
+  const startDate = startRaw;
   const tentativeRaw = firstNonEmptyDate(submittalRow?.end_date, jobObj?.end_date);
   const tentativeDate = formatDateStringForBq(tentativeRaw) ?? (
     tentativeRaw == null || String(tentativeRaw).trim() === ""
@@ -1156,7 +1181,6 @@ const API_FLOAT_COLUMNS_DEFAULT_ZERO = [
   "GP_PERCENTAGE",
   "GROSS_MARGIN",
   "PO_HOURS",
-  "CA_GM",
   "TOTAL_BONUS_TAXABLE",
   "TOTAL_BONUS_NON_TAXABLE",
   "FIRST_WEEK_HOURS",
@@ -1211,6 +1235,7 @@ const API_OWNED_COLUMNS = new Set([
   "ONSITE_AM",
   "VMS_JOB_ID",
   "START_DATE",
+  "OFFER_TIME_START_DATE",
   "TENTATIVE_DATE",
   "END_DATE",
   "OFFERING",
@@ -1261,7 +1286,6 @@ const API_OWNED_COLUMNS = new Set([
   "TOTAL_BONUS_NON_TAXABLE",
   "FIRST_WEEK_HOURS",
   "SECOND_WEEK_HOURS",
-  "CA_GM",
   "CONTRACT_ID",
 ]);
 Object.freeze(API_OWNED_COLUMNS);
@@ -1312,6 +1336,7 @@ module.exports = {
   mapSubmittalCodeToPlacementStatus,
   computeDerivedPlacementFields,
   startDateOnOrAfterUtcMin,
+  effectiveMinFilterDate,
   coerceApiFloatNullsToZero,
   API_OWNED_COLUMNS,
   SYSTEM_CONTROLLED_COLUMNS,

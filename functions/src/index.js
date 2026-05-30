@@ -2,11 +2,11 @@
  * Firebase Functions for Deal Sheet BigQuery Sync (Gen2 — longer timeouts)
  *
  * 1. dealSheetSync — HTTP (v2 onRequest, up to 3600s)
- * 2. rateChangeLogSync — HTTP rate-change log (v2 onRequest)
+ * 2. rateChangeLogSync — HTTP rate-change log (BigQuery CONTRACT_ID scan)
  * 3. dealSheetSyncTrigger — scheduled insert (new deal sheets only)
  * 4. dealSheetSyncUpdateTrigger — scheduled update (existing BQ composites)
  * 5. dealSheetSyncOfferRejected — HTTP ended / offer-rejected stream (manual)
- * 6. rateChangeLogSyncTrigger — scheduled rate-change logs
+ * 6. rateChangeLogSyncTrigger — scheduled rate-change logs (BigQuery CONTRACT_ID scan)
  */
 
 const { onRequest } = require("firebase-functions/v2/https");
@@ -15,17 +15,16 @@ const admin = require("firebase-admin");
 const {
   syncEnrichedDealSheetCandidatesToBigQuery,
   syncExistingActiveDealSheetUpdatesFromBigQuery,
-  syncRateChangeLogsToBigQuery,
+  syncRateChangeLogsFromBigQuery,
   refreshPlacementRecordToBigQuery,
 } = require("./syncService");
 const { syncPeopleStrongEmployeeDetailsToBigQuery } = require("./peoplestrongEmployeeDetailsService");
 const { logLine, logError, withTimingAsync } = require("./logger");
-const { startDateOnOrAfterUtcMin } = require("./columnMappings");
+const { startDateOnOrAfterUtcMin, effectiveMinFilterDate } = require("./columnMappings");
 
 admin.initializeApp();
 
 const REGION = "us-central1";
-const RATE_CHANGE_LOG_SUBMITTAL_CODES = "PERM_STARTS,ACTIVE,BOOKED";
 const ENDED_BACKFILL_SUBMITTAL_CODES = "EARLY_TERM,COMPLETED,CANCELLED,CANCELED";
 /** Firestore pagination cursor for HTTP ended (domain-routed) offer-rejected sync */
 const OFFER_REJECTED_SYNC_CHECKPOINT_KEY = "offer-rejected-ended-records";
@@ -45,11 +44,15 @@ const OFFER_REJECTED_MIN_START_DATE_MS = Date.UTC(2026, 3, 1); // 2026-04-01 UTC
 const ACTIVE_BOOTSTRAP_SUBMITTAL_CODES = "PERM_STARTS,ACTIVE,BOOKED";
 
 function filterEnrichedRowsByDealSheetMinStartDate(rows) {
-  return rows.filter((row) => startDateOnOrAfterUtcMin(row?.START_DATE, DEAL_SHEET_MIN_START_DATE_MS));
+  return rows.filter((row) =>
+    startDateOnOrAfterUtcMin(effectiveMinFilterDate(row), DEAL_SHEET_MIN_START_DATE_MS)
+  );
 }
 
 function filterOfferRejectedRowsByMinStartDate(rows) {
-  return rows.filter((row) => startDateOnOrAfterUtcMin(row?.START_DATE, OFFER_REJECTED_MIN_START_DATE_MS));
+  return rows.filter((row) =>
+    startDateOnOrAfterUtcMin(effectiveMinFilterDate(row), OFFER_REJECTED_MIN_START_DATE_MS)
+  );
 }
 
 /** Placement statuses allowed into BigQuery for `dealSheetSyncOfferRejected` (before START_DATE filter). */
@@ -189,7 +192,7 @@ exports.dealSheetSync = onRequest(
 );
 
 /**
- * HTTP: rate-change log sync (inserts only RATE_CHANGE=YES records)
+ * HTTP: rate-change log sync (BigQuery CONTRACT_ID scan; no Nexus)
  */
 exports.rateChangeLogSync = onRequest(
   {
@@ -202,50 +205,22 @@ exports.rateChangeLogSync = onRequest(
     try {
       const result = await withTimingAsync("rateChangeLogSync", async () => {
         const q = req.query || {};
-        const submittalCodesRaw =
-          typeof q.submittal_codes === "string"
-            ? q.submittal_codes.trim()
-            : typeof q.organization_submittal_status_code === "string"
-              ? q.organization_submittal_status_code.trim()
-              : "";
         const bqTableRaw = typeof q.bq_table === "string" ? q.bq_table.trim() : "";
         const bqDatasetRaw = typeof q.bq_dataset === "string" ? q.bq_dataset.trim() : "";
+        const dealSheetDatasetRaw =
+          typeof q.deal_sheet_bq_dataset === "string" ? q.deal_sheet_bq_dataset.trim() : "";
         logLine(
-          `[rateChangeLogSync] HTTP Gen2 region=${REGION} timeoutSeconds=${HTTP_TIMEOUT_SEC} method=${req.method} only_new=${q.only_new || "false"} max_candidates=${q.max_candidates || "none"} test_limit=${q.test_limit || "none"} max_pages=${q.max_pages || "none"} resume=${q.resume || "false"} reset_checkpoint=${q.reset_checkpoint || "false"} checkpoint_key=${q.checkpoint_key || "default"} submittal_codes=${submittalCodesRaw || "default"} bq_table=${bqTableRaw || "default"} bq_dataset=${bqDatasetRaw || "default"}`
+          `[rateChangeLogSync] HTTP Gen2 region=${REGION} timeoutSeconds=${HTTP_TIMEOUT_SEC} method=${req.method} bq_table=${bqTableRaw || "default"} bq_dataset=${bqDatasetRaw || "default"} deal_sheet_bq_dataset=${dealSheetDatasetRaw || "default"}`
         );
 
-        const onlyNew = q.only_new === "true";
-        const maxCandidates = parseInt(q.max_candidates || "0", 10);
-        const testLimit = parseInt(q.test_limit || "0", 10);
-        const maxPages = parseInt(q.max_pages || "0", 10);
-        const maxPagesProvided = Object.prototype.hasOwnProperty.call(q, "max_pages");
-        const resume = q.resume === "true";
-        const resetCheckpoint = q.reset_checkpoint === "true";
-        const checkpointKey = typeof q.checkpoint_key === "string" ? q.checkpoint_key.trim() : "";
-
         const params = {};
-        if (onlyNew) params.only_new_deal_sheets = true;
-        if (maxCandidates > 0) params.max_candidates = maxCandidates;
-        if (testLimit > 0) params.test_submittal_limit = testLimit;
-        if (maxPagesProvided) {
-          params.max_pages_provided = true;
-          if (maxPages > 0) params.max_pages = maxPages;
-        }
-        if (resume) params.resume_from_checkpoint = true;
-        if (resetCheckpoint) params.reset_checkpoint = true;
-        if (checkpointKey) params.checkpoint_key = checkpointKey;
-        if (submittalCodesRaw && submittalCodesRaw !== RATE_CHANGE_LOG_SUBMITTAL_CODES) {
-          logLine(
-            `[rateChangeLogSync] Ignoring request submittal filter (${submittalCodesRaw}) and enforcing ${RATE_CHANGE_LOG_SUBMITTAL_CODES}`
-          );
-        }
-        params.organization_submittal_status_code = RATE_CHANGE_LOG_SUBMITTAL_CODES;
         if (bqTableRaw) params.bq_table = bqTableRaw;
         if (bqDatasetRaw) params.bq_dataset = bqDatasetRaw;
+        if (dealSheetDatasetRaw) params.deal_sheet_bq_dataset = dealSheetDatasetRaw;
 
         logLine(`[rateChangeLogSync] Params object: ${JSON.stringify(params)}`);
-        logLine(`[rateChangeLogSync] Invoking syncRateChangeLogsToBigQuery`);
-        return syncRateChangeLogsToBigQuery(params);
+        logLine(`[rateChangeLogSync] Invoking syncRateChangeLogsFromBigQuery`);
+        return syncRateChangeLogsFromBigQuery(params);
       });
 
       const executionTimeMs = Date.now() - wallStartMs;
@@ -635,9 +610,9 @@ exports.dealSheetSyncOfferRejected = onRequest(
 );
 
 /**
- * Scheduled: rate-change log stream (same cadence as dealSheetSyncTrigger).
- * PERM_STARTS,ACTIVE,BOOKED -> ch_rate_change_logs; RATE_CHANGE=YES only;
- * only_new_deal_sheets skips DEAL_SHEET_ID already present in log table.
+ * Scheduled: rate-change log stream (BigQuery CONTRACT_ID scan).
+ * Scans active deal-sheet tables; when latest row per CONTRACT_ID has RATE_CHANGE=YES
+ * and a previous row exists, writes OLD/NEW snapshot to ch_rate_change_logs.
  */
 exports.rateChangeLogSyncTrigger = onSchedule(
   {
@@ -654,12 +629,11 @@ exports.rateChangeLogSyncTrigger = onSchedule(
 
     return withTimingAsync("rateChangeLogSyncTrigger", async () => {
       logLine(
-        "[rateChangeLogSyncTrigger] Scheduled (every 4h Eastern): PERM_STARTS,ACTIVE,BOOKED -> ch_rate_change_logs (RATE_CHANGE=YES only); skip DEAL_SHEET_ID already in log table"
+        "[rateChangeLogSyncTrigger] Scheduled (every 4h Eastern): BQ CONTRACT_ID scan -> ch_rate_change_logs (RATE_CHANGE=YES on latest row); skip existing CONTRACT_ID+EFFECTIVE_DATE"
       );
-      logLine("[rateChangeLogSyncTrigger] Invoking syncRateChangeLogsToBigQuery");
+      logLine("[rateChangeLogSyncTrigger] Invoking syncRateChangeLogsFromBigQuery");
 
-      const result = await syncRateChangeLogsToBigQuery({
-        only_new_deal_sheets: true,
+      const result = await syncRateChangeLogsFromBigQuery({
         bq_dataset: "rr_project_data",
         bq_table: "ch_rate_change_logs",
       });

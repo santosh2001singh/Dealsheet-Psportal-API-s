@@ -198,6 +198,87 @@ function parentClientNameFromEmbedded(clientObj) {
   return n || null;
 }
 
+const DEAL_SHEET_WAVE1_API_KINDS = ["ds", "hrs", "rev", "rates", "addcost", "travel", "clientcost", "ratechg"];
+
+/** Track Nexus API failures per resource kind (used for per-candidate fail-fast). */
+function createFailedIdsByKind() {
+  return {
+    ds: new Set(),
+    hrs: new Set(),
+    rev: new Set(),
+    rates: new Set(),
+    addcost: new Set(),
+    travel: new Set(),
+    clientcost: new Set(),
+    ratechg: new Set(),
+    job: new Set(),
+    cand: new Set(),
+    candtype: new Set(),
+    client: new Set(),
+    clioff: new Set(),
+    user: new Set(),
+    par: new Set(),
+  };
+}
+
+/**
+ * Returns list of failed API keys for a candidate (empty = safe to enrich).
+ * @returns {string[]}
+ */
+function collectCandidateApiFailureKinds({
+  dealSheetId,
+  jobId,
+  candId,
+  clientId,
+  skipClientFetchIds,
+  failedIdsByKind,
+  failedSubmittalKeys,
+  dealSheetById,
+  clientById,
+  hasPreloadedSubmittals,
+}) {
+  const dsKey = String(dealSheetId);
+  const jobKey = jobId == null ? "" : String(jobId);
+  const candKey = candId == null ? "" : String(candId);
+  const clientKey = clientId == null ? "" : String(clientId);
+
+  const failedKinds = [];
+  for (const k of DEAL_SHEET_WAVE1_API_KINDS) {
+    if (failedIdsByKind[k].has(dsKey)) failedKinds.push(`${k}:${dsKey}`);
+  }
+  if (jobKey && failedIdsByKind.job.has(jobKey)) failedKinds.push(`job:${jobKey}`);
+  if (candKey) {
+    if (failedIdsByKind.cand.has(candKey)) failedKinds.push(`cand:${candKey}`);
+    if (failedIdsByKind.candtype.has(candKey)) failedKinds.push(`candtype:${candKey}`);
+  }
+  if (clientKey && !skipClientFetchIds.has(clientKey)) {
+    if (failedIdsByKind.client.has(clientKey)) failedKinds.push(`client:${clientKey}`);
+    if (failedIdsByKind.clioff.has(clientKey)) failedKinds.push(`clioff:${clientKey}`);
+    const clientObjEarly = clientById.get(clientKey);
+    if (clientObjEarly) {
+      const parentKeyEarly = normalizeParentClientIdRef(clientObjEarly?.parent_client);
+      if (parentKeyEarly && failedIdsByKind.par.has(parentKeyEarly)) {
+        failedKinds.push(`par:${parentKeyEarly}`);
+      }
+    }
+  }
+  const detailEarly = dealSheetById.get(dsKey);
+  if (detailEarly) {
+    const rid = detailEarly.recruiter == null ? "" : String(detailEarly.recruiter);
+    const sid = detailEarly.sales_rep == null ? "" : String(detailEarly.sales_rep);
+    if (rid && failedIdsByKind.user.has(rid)) failedKinds.push(`user:${rid}`);
+    if (sid && sid !== rid && failedIdsByKind.user.has(sid)) failedKinds.push(`user:${sid}`);
+  }
+  if (!hasPreloadedSubmittals && jobKey && candKey && detailEarly) {
+    const rid = detailEarly.recruiter == null ? "" : String(detailEarly.recruiter);
+    if (rid) {
+      const subKey = `${jobKey}:${rid}:${candKey}`;
+      if (failedSubmittalKeys.has(subKey)) failedKinds.push(`sub:${subKey}`);
+    }
+  }
+  return failedKinds;
+}
+
 /**
  * Build enriched rows from deal sheet candidates
  * Fetches all related data in parallel waves and merges into BigQuery rows
@@ -260,6 +341,10 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     `[enriched sync] STEP 3/4 ENRICH APIS: unique ids deal_sheets=${dsIds.length} jobs=${jobIds.length} candidates=${candIds.length} clients=${clientIds.length}`
   );
 
+  const failedIdsByKind = createFailedIdsByKind();
+  const failedSubmittalKeys = new Set();
+  let skippedDueToApiFailure = 0;
+
   const wave1Urls = [];
   const wave1Ops = [];
 
@@ -320,6 +405,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
         wave1Responses.push(resp);
       } catch (e) {
         const op = wave1Ops[i];
+        if (failedIdsByKind[op.k]) failedIdsByKind[op.k].add(String(op.id));
         logLine(`[enriched sync] SKIP wave1 ${op.k} id=${op.id} due to error: ${String(e.message || e).slice(0, 100)}`);
         wave1Responses.push({});
         wave1Failed++;
@@ -492,6 +578,11 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
         wave2Responses.push(resp);
       } catch (e) {
         const op = wave2Ops[i];
+        if (op.k === "sub") {
+          failedSubmittalKeys.add(`${op.jobId}:${op.recruiterId}:${op.candId}`);
+        } else if (failedIdsByKind[op.k]) {
+          failedIdsByKind[op.k].add(String(op.id));
+        }
         logLine(`[enriched sync] SKIP wave2 ${op.k} id=${op.id || op.jobId} due to error: ${String(e.message || e).slice(0, 100)}`);
         wave2Responses.push({});
         wave2Failed++;
@@ -523,12 +614,42 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
 
     const jobId = normalizeNexusResourceId(c?.job);
     const candId = normalizeNexusResourceId(c?.candidate);
+    const clientId = normalizeNexusResourceId(c?.client);
     let submittalRow = hasPreloadedSubmittals
       ? getPreloadedSubmittalRow(preloadedSubmittals, jobId, candId)
       : null;
 
+    const failedKinds = collectCandidateApiFailureKinds({
+      dealSheetId,
+      jobId,
+      candId,
+      clientId,
+      skipClientFetchIds,
+      failedIdsByKind,
+      failedSubmittalKeys,
+      dealSheetById,
+      clientById,
+      hasPreloadedSubmittals,
+    });
+    if (submittalRow?.client && isEmbeddedClientSufficient(submittalRow.client)) {
+      const parentKeyEmbedded = normalizeParentClientIdRef(submittalRow.client?.parent_client);
+      if (parentKeyEmbedded && failedIdsByKind.par.has(parentKeyEmbedded)) {
+        failedKinds.push(`par:${parentKeyEmbedded}`);
+      }
+    }
+    if (failedKinds.length > 0) {
+      const placementId = normalizeNexusResourceId(c?.placement) || "";
+      const dsKey = String(dealSheetId);
+      const jobKey = jobId == null ? "" : String(jobId);
+      const candKey = candId == null ? "" : String(candId);
+      logLine(
+        `[enriched sync] SKIP candidate ds=${dsKey} placement=${placementId} job=${jobKey} cand=${candKey} due to failed APIs: ${failedKinds.slice(0, 6).join(",")}${failedKinds.length > 6 ? ` +${failedKinds.length - 6}` : ""} (will retry next run)`
+      );
+      skippedDueToApiFailure++;
+      continue;
+    }
+
     const candidatePart = mapDealSheetCandidateToBq(c, { persistDealSheetStatusFromCandidate });
-    const clientId = normalizeNexusResourceId(c?.client);
     const embeddedClient = submittalRow?.client;
     const useEmbeddedClient =
       isEmbeddedClientSufficient(embeddedClient) &&
@@ -632,8 +753,6 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
           ? "FT Hire"
           : mspNameNorm;
 
-    const caGm = clientStateNorm === "CA" ? (revenuePart?.GROSS_MARGIN ?? null) : null;
-
     const row = {
       ...candidatePart,
       ...clientPart,
@@ -654,8 +773,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       ...providerTypePart,
       CLIENT_TYPE: mspPart?.CLIENT_TYPE ?? null,
       LINE_OF_BUSINESS: lineOfBusiness,
-      CA_GM: caGm,
-      START_DATE: submittalPart?.START_DATE ?? jobPart?.START_DATE ?? null,
+      START_DATE: submittalPart?.START_DATE ?? null,
       TENTATIVE_DATE: submittalPart?.TENTATIVE_DATE ?? jobPart?.TENTATIVE_DATE ?? null,
     };
     const newRateFamilyPart = computeNewRateFamily(row);
@@ -685,6 +803,12 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     );
   }
 
+  if (skippedDueToApiFailure > 0) {
+    logLine(
+      `[enriched sync] STEP 3/4 ENRICH: skipped ${skippedDueToApiFailure} candidate(s) due to API failures (no BigQuery insert; will retry next scheduled run)`
+    );
+  }
+
   await resolveContractIdsForRows(combined, {
     skipAllocation: true,
     allocateContractIdsFn: allocateContractIds,
@@ -699,4 +823,6 @@ module.exports = {
   buildEnrichedRowsFromDealSheetCandidates,
   extractSubmittalStatusRaw,
   isAllowedSubmittalStatus,
+  createFailedIdsByKind,
+  collectCandidateApiFailureKinds,
 };
