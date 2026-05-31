@@ -97,6 +97,27 @@ test("rateChangeLogSyncTrigger uses BigQuery CONTRACT_ID scan (no Nexus pipeline
   assert.equal(block.includes('bq_table: "ch_rate_change_logs"'), true);
 });
 
+function extractRefreshDealSheetByPlacementIdBlock(source) {
+  const marker = "exports.refreshDealSheetByPlacementId = onRequest(";
+  const start = source.indexOf(marker);
+  if (start < 0) return "";
+  const tail = source.slice(start);
+  const nextExport = tail.indexOf("exports.peoplestrongEmployeeDetailsSyncTrigger");
+  return nextExport >= 0 ? tail.slice(0, nextExport) : tail;
+}
+
+test("refreshDealSheetByPlacementId uses expanded first-insert placement allowlist only on this HTTP handler", () => {
+  const filePath = path.join(__dirname, "index.js");
+  const source = fs.readFileSync(filePath, "utf8");
+  const block = extractRefreshDealSheetByPlacementIdBlock(source);
+
+  assert.notEqual(block, "", "refreshDealSheetByPlacementId block should exist");
+  assert.equal(block.includes("params.first_insert_placement_status_allowlist"), true);
+  assert.equal(block.includes("ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES"), true);
+  assert.equal(block.includes("refreshPlacementRecordToBigQuery(params)"), true);
+  assert.equal(block.includes("ACTIVE_BOOTSTRAP_FIRST_INSERT_PLACEMENT_STATUSES"), false);
+});
+
 test("dealSheetSyncUpdateTrigger uses deal-sheet targets and deal_sheet_id baseline", () => {
   const filePath = path.join(__dirname, "index.js");
   const source = fs.readFileSync(filePath, "utf8");

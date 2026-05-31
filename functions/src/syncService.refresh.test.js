@@ -6,7 +6,16 @@ const {
   computeChangedFields,
   resolvePreferredCandidateRow,
   buildActiveUpdateRefreshParams,
+  buildRefreshAdditionalCostLogsSummary,
 } = require("./syncService");
+const {
+  resolveFirstInsertPlacementAllowlist,
+  placementStatusAllowsFirstInsert,
+} = require("./bigQueryClient");
+
+/** Matches ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES in index.js */
+const REFRESH_EXPANDED_FIRST_INSERT_STATUSES =
+  "STARTED,BOOKED,ENDED,ENDED<30,DID NOT START,DID NOT ACCEPT";
 
 test("parseBooleanLike parses true-ish values", () => {
   assert.equal(parseBooleanLike(true), true);
@@ -122,6 +131,39 @@ test("computeChangedFields ignores IS_REJECTED when configured", () => {
   };
   const diff = computeChangedFields(incoming, existing, ["ID", "DATE_AND_TIME", "IS_REJECTED"]);
   assert.deepEqual(diff, []);
+});
+
+test("refresh expanded allowlist allows ENDED for first insert", () => {
+  const allowSet = resolveFirstInsertPlacementAllowlist({
+    first_insert_placement_status_allowlist: REFRESH_EXPANDED_FIRST_INSERT_STATUSES,
+  });
+  assert.equal(placementStatusAllowsFirstInsert("ENDED", allowSet), true);
+  assert.equal(placementStatusAllowsFirstInsert("ENDED<30", allowSet), true);
+  assert.equal(placementStatusAllowsFirstInsert("DID NOT START", allowSet), true);
+  assert.equal(placementStatusAllowsFirstInsert("DID NOT ACCEPT", allowSet), true);
+});
+
+test("buildRefreshAdditionalCostLogsSummary: INSERTED with log write result", () => {
+  const summary = buildRefreshAdditionalCostLogsSummary(
+    "INSERTED",
+    [{ DEAL_SHEET_ID: 1 }],
+    { inserted: 1, errorBatches: 0 }
+  );
+  assert.deepEqual(summary, { attempted: 1, inserted: 1, errorBatches: 0 });
+});
+
+test("buildRefreshAdditionalCostLogsSummary: non-INSERTED with pending log rows", () => {
+  const summary = buildRefreshAdditionalCostLogsSummary("NO_CHANGE", [{}, {}], null);
+  assert.deepEqual(summary, {
+    attempted: 2,
+    inserted: 0,
+    skipped_reason: "not inserted",
+  });
+});
+
+test("buildRefreshAdditionalCostLogsSummary: empty when no log rows", () => {
+  const summary = buildRefreshAdditionalCostLogsSummary("NOT_FOUND", [], null);
+  assert.deepEqual(summary, { attempted: 0, inserted: 0, errorBatches: 0 });
 });
 
 test("computeChangedFields ignores manual columns like SKU_NUMBER", () => {

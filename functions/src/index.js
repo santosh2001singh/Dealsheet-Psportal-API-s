@@ -334,9 +334,11 @@ exports.refreshDealSheetByPlacementId = onRequest(
         if (bqTableRaw) params.bq_table = bqTableRaw;
         params.generated_uuid_field = "ID";
         params.compare_ignore_fields = ["ID", "DATE_AND_TIME", "IS_REJECTED"];
+        params.first_insert_placement_status_allowlist =
+          ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES;
 
         logLine(
-          `[refreshDealSheetByPlacementId] method=${req.method} placement_id=${placementId || "none"} deal_sheet_id=${dealSheetId || "none"} job_id=${jobId || "none"} candidate_id=${candidateId || "none"} apply_update=${applyUpdate || "default:true"} bq_dataset=${bqDatasetRaw || "rr_project_data"} bq_table=${bqTableRaw || "domain-routed (from ASSIGNMENT_RECRUITER_EMAIL)"}`
+          `[refreshDealSheetByPlacementId] method=${req.method} placement_id=${placementId || "none"} deal_sheet_id=${dealSheetId || "none"} job_id=${jobId || "none"} candidate_id=${candidateId || "none"} apply_update=${applyUpdate || "default:true"} bq_dataset=${bqDatasetRaw || "rr_project_data"} bq_table=${bqTableRaw || "domain-routed (from ASSIGNMENT_RECRUITER_EMAIL)"} first_insert_placement_status_allowlist=${ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES}`
         );
 
         return refreshPlacementRecordToBigQuery(params);

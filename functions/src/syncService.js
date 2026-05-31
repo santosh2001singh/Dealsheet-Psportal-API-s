@@ -494,6 +494,28 @@ async function resolveRefreshSeed(accessToken, params = {}) {
   };
 }
 
+/**
+ * Summary of ch_additional_cost_logs writes for refreshPlacementRecordToBigQuery responses.
+ * @param {string} action
+ * @param {object[]} additionalCostLogRows
+ * @param {{ inserted?: number, errorBatches?: number }|null|undefined} logResult
+ * @returns {{ attempted: number, inserted: number, errorBatches?: number, skipped_reason?: string }}
+ */
+function buildRefreshAdditionalCostLogsSummary(action, additionalCostLogRows, logResult) {
+  const attempted = additionalCostLogRows?.length ?? 0;
+  if (action === "INSERTED" && logResult) {
+    return {
+      attempted,
+      inserted: logResult.inserted ?? 0,
+      errorBatches: logResult.errorBatches ?? 0,
+    };
+  }
+  if (attempted > 0 && action !== "INSERTED") {
+    return { attempted, inserted: 0, skipped_reason: "not inserted" };
+  }
+  return { attempted, inserted: 0, errorBatches: 0 };
+}
+
 async function refreshPlacementRecordToBigQuery(params = {}) {
   const startMs = Date.now();
   const compareIgnoreFields = Array.isArray(params.compare_ignore_fields)
@@ -670,8 +692,9 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     reason = "Changes found (preview only, no write)";
   }
 
+  let additionalCostLogWriteResult = null;
   if (action === "INSERTED" && additionalCostLogRows.length > 0) {
-    await writeAdditionalCostLogRows(additionalCostLogRows, 0, params, {
+    additionalCostLogWriteResult = await writeAdditionalCostLogRows(additionalCostLogRows, 0, params, {
       insertedKeys: insertResult.insertedKeys instanceof Set ? insertResult.insertedKeys : new Set(),
     });
   }
@@ -683,6 +706,11 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     attempted: insertResult.attempted,
     errorBatches: insertResult.errorBatches,
     diff_fields: diffFields,
+    additional_cost_logs: buildRefreshAdditionalCostLogsSummary(
+      action,
+      additionalCostLogRows,
+      additionalCostLogWriteResult
+    ),
     resolved_ids: {
       placement_id: seed.placementId || normalizeNexusResourceId(row?.PLACEMENT_ID) || null,
       job_id: seed.jobId || normalizeNexusResourceId(seed.preferredCandidateRow?.job) || null,
@@ -1674,6 +1702,7 @@ module.exports = {
   syncExistingActiveDealSheetUpdatesFromBigQuery,
   syncRateChangeLogsFromBigQuery,
   refreshPlacementRecordToBigQuery,
+  buildRefreshAdditionalCostLogsSummary,
   buildActiveUpdateRefreshParams,
   buildRateChangeLogRow,
   parseBooleanLike,
