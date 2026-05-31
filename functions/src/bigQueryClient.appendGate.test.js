@@ -10,6 +10,7 @@ const {
   resolveFirstInsertPlacementAllowlist,
   placementStatusAllowsFirstInsert,
   buildDealSheetPlacementCompositeKey,
+  buildAdditionalCostLogCompositeKey,
   normalizeMoveRunrate,
   applyMoveRunrateAppendOverride,
   applyIsRejectedResetForChangedUpdate,
@@ -65,6 +66,21 @@ test("placementStatusAllowsFirstInsert: empty or missing status blocked", () => 
 test("composite key: same deal sheet different placement IDs do not share baseline", () => {
   const k1 = buildDealSheetPlacementCompositeKey("5184482", "1451770");
   const k2 = buildDealSheetPlacementCompositeKey("5184482", "1450934");
+  assert.notEqual(k1, k2);
+});
+
+test("additional-cost log triple key: requires all three parts", () => {
+  assert.equal(buildAdditionalCostLogCompositeKey("1", "2", "3"), "1|2|3");
+  assert.equal(buildAdditionalCostLogCompositeKey("1", "2", null), "");
+  assert.equal(buildAdditionalCostLogCompositeKey("1", null, "3"), "");
+  assert.equal(buildAdditionalCostLogCompositeKey(null, "2", "3"), "");
+  assert.equal(buildAdditionalCostLogCompositeKey("1", "", "3"), "");
+  assert.equal(buildAdditionalCostLogCompositeKey(" 1 ", " 2 ", " 3 "), "1|2|3");
+});
+
+test("additional-cost log triple key: distinguishes by ADDITIONAL_COST_ID", () => {
+  const k1 = buildAdditionalCostLogCompositeKey("1354781", "412941", "521873");
+  const k2 = buildAdditionalCostLogCompositeKey("1354781", "412941", "521874");
   assert.notEqual(k1, k2);
 });
 

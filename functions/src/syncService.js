@@ -28,11 +28,14 @@ const {
   fetchActiveDealSheetUpdateTargets,
   fetchLatestRowsByDealSheetPlacementPairs,
   fetchLatestRowsByDealSheetIds,
+  fetchLatestAdditionalCostLogRowsByKeys,
   fetchContractRateChangePairsFromActive,
   hasBusinessColumnChanges,
   normalizeForCompare,
   resolveFirstInsertPlacementAllowlist,
   placementStatusAllowsFirstInsert,
+  buildDealSheetPlacementCompositeKey,
+  buildAdditionalCostLogCompositeKey,
 } = require("./bigQueryClient");
 const { startDateOnOrAfterUtcMin, effectiveMinFilterDate, API_OWNED_COLUMNS } = require("./columnMappings");
 const { buildEnrichedRowsFromDealSheetCandidates } = require("./api/dealSheetEnricher");
@@ -61,11 +64,138 @@ function resolveAdditionalCostLogTarget(params = {}) {
   return { datasetId, tableId };
 }
 
-async function writeAdditionalCostLogRows(additionalCostLogRows, insertIdBase, params = {}) {
+/** Numeric tolerance for VALUE comparisons when deciding whether a log row changed. */
+const ADDITIONAL_COST_LOG_VALUE_TOLERANCE = 0.01;
+
+function additionalCostLogStringEquals(a, b) {
+  const sa = a == null ? "" : String(a).trim();
+  const sb = b == null ? "" : String(b).trim();
+  return sa === sb;
+}
+
+function additionalCostLogValueEquals(a, b) {
+  const na = toFloatOrNull(a);
+  const nb = toFloatOrNull(b);
+  if (na == null && nb == null) return true;
+  if (na == null || nb == null) return false;
+  // Allow tiny float noise on the boundary itself (e.g. 100.01 - 100 = 0.0100000000005 in IEEE-754).
+  return Math.abs(na - nb) <= ADDITIONAL_COST_LOG_VALUE_TOLERANCE + 1e-9;
+}
+
+/**
+ * Returns true when the incoming log snapshot differs from the latest existing log row
+ * on any line-item field worth recording: name, category, duration, notes, or value
+ * (VALUE compared with ±0.01 tolerance to absorb API float noise).
+ */
+function hasAdditionalCostLogChange(incoming, existing) {
+  if (!existing) return true;
+  if (!additionalCostLogStringEquals(incoming?.ADDITIONAL_COST_NAME, existing?.ADDITIONAL_COST_NAME)) return true;
+  if (!additionalCostLogStringEquals(incoming?.CATEGORY, existing?.CATEGORY)) return true;
+  if (!additionalCostLogStringEquals(incoming?.DURATION, existing?.DURATION)) return true;
+  if (!additionalCostLogStringEquals(incoming?.NOTES, existing?.NOTES)) return true;
+  if (!additionalCostLogValueEquals(incoming?.VALUE, existing?.VALUE)) return true;
+  return false;
+}
+
+/**
+ * Write additional-cost log rows with two gates:
+ *   1. (Optional) `insertedKeys` Set — only keep rows whose DEAL_SHEET_ID|PLACEMENT_ID
+ *      matches a deal sheet that the caller actually inserted/appended in this run.
+ *   2. Compare each remaining row to the latest existing log row in BigQuery (by
+ *      DEAL_SHEET_ID + PLACEMENT_ID + ADDITIONAL_COST_ID) and skip when nothing
+ *      meaningful changed (see `hasAdditionalCostLogChange`).
+ */
+async function writeAdditionalCostLogRows(additionalCostLogRows, insertIdBase, params = {}, options = {}) {
   if (!additionalCostLogRows || additionalCostLogRows.length === 0) return { inserted: 0 };
+
+  let rowsToWrite = additionalCostLogRows;
+
+  const insertedKeys = options.insertedKeys instanceof Set ? options.insertedKeys : null;
+  if (insertedKeys) {
+    const filtered = [];
+    let droppedNotInserted = 0;
+    let keptNoCompositeKey = 0;
+    for (const row of rowsToWrite) {
+      const key = buildDealSheetPlacementCompositeKey(row?.DEAL_SHEET_ID, row?.PLACEMENT_ID);
+      if (!key) {
+        filtered.push(row);
+        keptNoCompositeKey++;
+        continue;
+      }
+      if (insertedKeys.has(key)) {
+        filtered.push(row);
+      } else {
+        droppedNotInserted++;
+      }
+    }
+    rowsToWrite = filtered;
+    if (droppedNotInserted > 0 || keptNoCompositeKey > 0) {
+      logLine(
+        `[additional-cost logs] gate-by-inserted-deal-sheets: droppedNotInserted=${droppedNotInserted} keptNoCompositeKey=${keptNoCompositeKey} remaining=${rowsToWrite.length}`
+      );
+    }
+  }
+
+  if (rowsToWrite.length === 0) {
+    logLine(`[additional-cost logs] SKIP: no rows survive inserted-deal-sheet gate`);
+    return { inserted: 0 };
+  }
+
   try {
     const logTarget = resolveAdditionalCostLogTarget(params);
-    const result = await insertAdditionalCostLogBatch(additionalCostLogRows, insertIdBase, {
+
+    let latestByKey;
+    try {
+      latestByKey = await fetchLatestAdditionalCostLogRowsByKeys(rowsToWrite, {
+        datasetId: logTarget.datasetId,
+        tableId: logTarget.tableId,
+      });
+    } catch (err) {
+      logLine(
+        `[additional-cost logs] latest-fetch failed; falling back to insert-without-compare: ${err?.message || err}`
+      );
+      latestByKey = new Map();
+    }
+
+    const filtered = [];
+    let unchangedSkipped = 0;
+    let newIncluded = 0;
+    let changedIncluded = 0;
+    for (const row of rowsToWrite) {
+      const key = buildAdditionalCostLogCompositeKey(
+        row?.DEAL_SHEET_ID,
+        row?.PLACEMENT_ID,
+        row?.ADDITIONAL_COST_ID
+      );
+      if (!key) {
+        filtered.push(row);
+        newIncluded++;
+        continue;
+      }
+      const existing = latestByKey.get(key);
+      if (!existing) {
+        filtered.push(row);
+        newIncluded++;
+        continue;
+      }
+      if (hasAdditionalCostLogChange(row, existing)) {
+        filtered.push(row);
+        changedIncluded++;
+      } else {
+        unchangedSkipped++;
+      }
+    }
+    rowsToWrite = filtered;
+    logLine(
+      `[additional-cost logs] append-on-change: newIncluded=${newIncluded} changedIncluded=${changedIncluded} unchangedSkipped=${unchangedSkipped} remaining=${rowsToWrite.length}`
+    );
+
+    if (rowsToWrite.length === 0) {
+      logLine(`[additional-cost logs] SKIP: no rows changed vs latest log snapshot`);
+      return { inserted: 0 };
+    }
+
+    const result = await insertAdditionalCostLogBatch(rowsToWrite, insertIdBase, {
       datasetId: logTarget.datasetId,
       tableId: logTarget.tableId,
       generatedUuidField: "ID",
@@ -541,7 +671,9 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   }
 
   if (action === "INSERTED" && additionalCostLogRows.length > 0) {
-    await writeAdditionalCostLogRows(additionalCostLogRows, 0, params);
+    await writeAdditionalCostLogRows(additionalCostLogRows, 0, params, {
+      insertedKeys: insertResult.insertedKeys instanceof Set ? insertResult.insertedKeys : new Set(),
+    });
   }
 
   return {
@@ -893,7 +1025,8 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
       const logResult = await writeAdditionalCostLogRows(
         additionalCostLogRows,
         totalRowsInserted,
-        params
+        params,
+        { insertedKeys: result.insertedKeys instanceof Set ? result.insertedKeys : new Set() }
       );
       errorBatches += logResult.errorBatches || 0;
     }
@@ -1549,4 +1682,8 @@ module.exports = {
   formatDuration,
   parseJobSubmittalsPageQueryFromUrl,
   resolveNextNexusSubmittalsPageForCheckpoint,
+  hasAdditionalCostLogChange,
+  additionalCostLogValueEquals,
+  additionalCostLogStringEquals,
+  ADDITIONAL_COST_LOG_VALUE_TOLERANCE,
 };

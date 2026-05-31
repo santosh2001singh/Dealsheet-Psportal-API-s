@@ -442,6 +442,76 @@ function buildDealSheetPlacementCompositeKey(dealSheetId, placementId) {
 }
 
 /**
+ * Triple-key (DEAL_SHEET_ID|PLACEMENT_ID|ADDITIONAL_COST_ID) used for log dedupe lookup.
+ * All three components must be present for a valid key; missing parts yield "".
+ */
+function buildAdditionalCostLogCompositeKey(dealSheetId, placementId, additionalCostId) {
+  const dsid = dealSheetId == null ? "" : String(dealSheetId).trim();
+  const pid = placementId == null ? "" : String(placementId).trim();
+  const cid = additionalCostId == null ? "" : String(additionalCostId).trim();
+  if (!dsid || !pid || !cid) return "";
+  return `${dsid}|${pid}|${cid}`;
+}
+
+/**
+ * Returns Map<"DEAL_SHEET_ID|PLACEMENT_ID|ADDITIONAL_COST_ID", latest log row> from
+ * the additional-cost log table. Used to skip writing unchanged snapshots.
+ */
+async function fetchLatestAdditionalCostLogRowsByKeys(logRows, options = {}) {
+  const out = new Map();
+  if (!logRows || logRows.length === 0) return out;
+
+  const { datasetId, tableId } = resolveBqDatasetTable(options);
+  const tripleMap = new Map();
+  for (const row of logRows) {
+    const dsid = row?.DEAL_SHEET_ID == null ? "" : String(row.DEAL_SHEET_ID).trim();
+    const pid = row?.PLACEMENT_ID == null ? "" : String(row.PLACEMENT_ID).trim();
+    const cid = row?.ADDITIONAL_COST_ID == null ? "" : String(row.ADDITIONAL_COST_ID).trim();
+    const key = buildAdditionalCostLogCompositeKey(dsid, pid, cid);
+    if (!key || tripleMap.has(key)) continue;
+    tripleMap.set(key, { dsid, pid, cid });
+  }
+  const triples = Array.from(tripleMap.values());
+  if (!triples.length) return out;
+
+  const chunkSize = 200;
+  for (let i = 0; i < triples.length; i += chunkSize) {
+    const chunk = triples.slice(i, i + chunkSize);
+    const wherePairs = chunk
+      .map(
+        ({ dsid, pid, cid }) =>
+          `(CAST(DEAL_SHEET_ID AS STRING) = '${escapeSqlString(dsid)}' AND ` +
+          `CAST(PLACEMENT_ID AS STRING) = '${escapeSqlString(pid)}' AND ` +
+          `CAST(ADDITIONAL_COST_ID AS STRING) = '${escapeSqlString(cid)}')`
+      )
+      .join(" OR ");
+    const sql = `SELECT * EXCEPT(_rn)
+                 FROM (
+                   SELECT
+                     *,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY CAST(DEAL_SHEET_ID AS STRING), CAST(PLACEMENT_ID AS STRING), CAST(ADDITIONAL_COST_ID AS STRING)
+                       ORDER BY DATE_AND_TIME DESC NULLS LAST
+                     ) AS _rn
+                   FROM \`${config.projectId}.${datasetId}.${tableId}\`
+                   WHERE ${wherePairs}
+                 )
+                 WHERE _rn = 1`;
+    const dbRows = await queryObjects(sql, chunk.length * 2);
+    for (const row of dbRows) {
+      const key = buildAdditionalCostLogCompositeKey(
+        row?.DEAL_SHEET_ID,
+        row?.PLACEMENT_ID,
+        row?.ADDITIONAL_COST_ID
+      );
+      if (!key) continue;
+      out.set(key, row);
+    }
+  }
+  return out;
+}
+
+/**
  * Returns Map<"DEAL_SHEET_ID|PLACEMENT_ID", latest row object> from BigQuery
  */
 async function fetchLatestRowsByDealSheetPlacementPairs(rows, options = {}) {
@@ -738,7 +808,7 @@ async function insertAll(rows, options = {}) {
 async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options = {}) {
   if (!combinedRows || combinedRows.length === 0) {
     logLine(`[enriched sync] [BigQuery insertAll] SKIP: no rows to insert`);
-    return { inserted: 0, attempted: 0, errorBatches: 0 };
+    return { inserted: 0, attempted: 0, errorBatches: 0, insertedKeys: new Set() };
   }
 
   let rowsToInsert = combinedRows;
@@ -990,7 +1060,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
 
   if (!rowsToInsert || rowsToInsert.length === 0) {
     logLine(`[enriched sync] [BigQuery insertAll] SKIP: all rows filtered by dedupe rules`);
-    return { inserted: 0, attempted: 0, errorBatches: 0 };
+    return { inserted: 0, attempted: 0, errorBatches: 0, insertedKeys: new Set() };
   }
 
   const beforeTrainingFilter = rowsToInsert.length;
@@ -1004,7 +1074,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
 
   if (!rowsToInsert.length) {
     logLine(`[enriched sync] [BigQuery insertAll] SKIP: all rows filtered by training/dummy rules`);
-    return { inserted: 0, attempted: 0, errorBatches: 0 };
+    return { inserted: 0, attempted: 0, errorBatches: 0, insertedKeys: new Set() };
   }
 
   // Phase B: allocate Firestore-backed CONTRACT_IDs only for rows that will
@@ -1035,10 +1105,21 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
   });
   const hasErrors = result.errors && result.errors.length > 0;
 
+  const insertedKeys = new Set();
+  for (const row of rowsToInsert) {
+    const key = buildDealSheetPlacementCompositeKey(row?.DEAL_SHEET_ID, row?.PLACEMENT_ID);
+    if (key) insertedKeys.add(key);
+  }
+
   logLine(
     `[enriched sync] [BigQuery insertAll] ${hasErrors ? "PARTIAL" : "OK"} attempted=${result.attempted} inserted=${result.inserted}`
   );
-  return { inserted: result.inserted, attempted: result.attempted, errorBatches: hasErrors ? 1 : 0 };
+  return {
+    inserted: result.inserted,
+    attempted: result.attempted,
+    errorBatches: hasErrors ? 1 : 0,
+    insertedKeys,
+  };
 }
 
 /**
@@ -1047,7 +1128,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
 async function insertEnrichedDealSheetBatchRouted(combinedRows, insertIdBase, options = {}) {
   if (!combinedRows || combinedRows.length === 0) {
     logLine(`[enriched sync] [BigQuery insertAll] routed SKIP: no rows to insert`);
-    return { inserted: 0, attempted: 0, errorBatches: 0 };
+    return { inserted: 0, attempted: 0, errorBatches: 0, insertedKeys: new Set() };
   }
 
   const groups = new Map();
@@ -1066,6 +1147,7 @@ async function insertEnrichedDealSheetBatchRouted(combinedRows, insertIdBase, op
   let errorBatches = 0;
   let base = insertIdBase;
   const parts = [];
+  const insertedKeys = new Set();
   for (const [tableId, rows] of groups) {
     parts.push(`${tableId}=${rows.length}`);
     const r = await insertEnrichedDealSheetBatch(rows, base, { ...options, tableId });
@@ -1073,12 +1155,15 @@ async function insertEnrichedDealSheetBatchRouted(combinedRows, insertIdBase, op
     attempted += r.attempted;
     errorBatches += r.errorBatches;
     base += r.attempted;
+    if (r.insertedKeys && typeof r.insertedKeys[Symbol.iterator] === "function") {
+      for (const k of r.insertedKeys) insertedKeys.add(k);
+    }
   }
   if (groups.size > 1) {
     logLine(`[enriched sync] [BigQuery insertAll] routed partitions: ${parts.join(", ")}`);
   }
 
-  return { inserted, attempted, errorBatches };
+  return { inserted, attempted, errorBatches, insertedKeys };
 }
 
 /**
@@ -1771,6 +1856,7 @@ module.exports = {
   fetchLatestRowsByDealSheetIds,
   fetchLatestTwoRowsByDealSheetIdsAcrossActive,
   fetchLatestRowsByDealSheetPlacementPairs,
+  fetchLatestAdditionalCostLogRowsByKeys,
   insertAll,
   insertEnrichedDealSheetBatch,
   insertEnrichedDealSheetBatchRouted,
@@ -1791,6 +1877,7 @@ module.exports = {
   resolveFirstInsertPlacementAllowlist,
   placementStatusAllowsFirstInsert,
   buildDealSheetPlacementCompositeKey,
+  buildAdditionalCostLogCompositeKey,
   normalizeMoveRunrate,
   applyMoveRunrateAppendOverride,
   applyIsRejectedResetForChangedUpdate,
