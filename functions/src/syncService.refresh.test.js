@@ -144,26 +144,34 @@ test("refresh expanded allowlist allows ENDED for first insert", () => {
 });
 
 test("buildRefreshAdditionalCostLogsSummary: INSERTED with log write result", () => {
+  const costRow = { DEAL_SHEET_ID: 1, ADDITIONAL_COST_NAME: "Bonus", VALUE: 500 };
   const summary = buildRefreshAdditionalCostLogsSummary(
     "INSERTED",
-    [{ DEAL_SHEET_ID: 1 }],
+    [costRow],
     { inserted: 1, errorBatches: 0 }
   );
-  assert.deepEqual(summary, { attempted: 1, inserted: 1, errorBatches: 0 });
+  assert.deepEqual(summary, {
+    attempted: 1,
+    inserted: 1,
+    errorBatches: 0,
+    rows: [costRow],
+  });
 });
 
 test("buildRefreshAdditionalCostLogsSummary: non-INSERTED with pending log rows", () => {
-  const summary = buildRefreshAdditionalCostLogsSummary("NO_CHANGE", [{}, {}], null);
+  const rows = [{ ADDITIONAL_COST_NAME: "A" }, { ADDITIONAL_COST_NAME: "B" }];
+  const summary = buildRefreshAdditionalCostLogsSummary("NO_CHANGE", rows, null);
   assert.deepEqual(summary, {
     attempted: 2,
     inserted: 0,
     skipped_reason: "not inserted",
+    rows,
   });
 });
 
 test("buildRefreshAdditionalCostLogsSummary: empty when no log rows", () => {
   const summary = buildRefreshAdditionalCostLogsSummary("NOT_FOUND", [], null);
-  assert.deepEqual(summary, { attempted: 0, inserted: 0, errorBatches: 0 });
+  assert.deepEqual(summary, { attempted: 0, inserted: 0, errorBatches: 0, rows: [] });
 });
 
 test("computeChangedFields ignores manual columns like SKU_NUMBER", () => {

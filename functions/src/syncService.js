@@ -496,24 +496,27 @@ async function resolveRefreshSeed(accessToken, params = {}) {
 
 /**
  * Summary of ch_additional_cost_logs writes for refreshPlacementRecordToBigQuery responses.
+ * Includes the full enriched cost rows so callers can see name/value/category/notes per line item.
  * @param {string} action
  * @param {object[]} additionalCostLogRows
  * @param {{ inserted?: number, errorBatches?: number }|null|undefined} logResult
- * @returns {{ attempted: number, inserted: number, errorBatches?: number, skipped_reason?: string }}
+ * @returns {{ attempted: number, inserted: number, errorBatches?: number, skipped_reason?: string, rows: object[] }}
  */
 function buildRefreshAdditionalCostLogsSummary(action, additionalCostLogRows, logResult) {
-  const attempted = additionalCostLogRows?.length ?? 0;
+  const rows = Array.isArray(additionalCostLogRows) ? additionalCostLogRows : [];
+  const attempted = rows.length;
   if (action === "INSERTED" && logResult) {
     return {
       attempted,
       inserted: logResult.inserted ?? 0,
       errorBatches: logResult.errorBatches ?? 0,
+      rows,
     };
   }
   if (attempted > 0 && action !== "INSERTED") {
-    return { attempted, inserted: 0, skipped_reason: "not inserted" };
+    return { attempted, inserted: 0, skipped_reason: "not inserted", rows };
   }
-  return { attempted, inserted: 0, errorBatches: 0 };
+  return { attempted, inserted: 0, errorBatches: 0, rows };
 }
 
 async function refreshPlacementRecordToBigQuery(params = {}) {
