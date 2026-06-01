@@ -515,8 +515,8 @@ function mapJobProfessionSpecialtyFromJob(job) {
  * Map deal sheet hours details to BigQuery schema.
  * SCHEDULE_HOURS_1 / SCHEDULE_HOURS_2 default to 0 when source value is null/blank
  * so BigQuery always stores a number (not NULL).
- * REGULAR_HOURS_* and GREATER_THAN_EIGHT_HOURS_* are populated only when clientState is CA;
- * all other states (and blank/null state) get 0 for those four columns.
+ * REGULAR_HOURS_* are populated only when clientState is CA;
+ * all other states (and blank/null state) get 0 for those two columns.
  */
 function mapDealSheetHoursDetailsToBq(hoursRow, clientState) {
   const stateNorm =
@@ -531,8 +531,6 @@ function mapDealSheetHoursDetailsToBq(hoursRow, clientState) {
       SCHEDULE_HOURS_2: 0,
       REGULAR_HOURS_1: 0,
       REGULAR_HOURS_2: 0,
-      GREATER_THAN_EIGHT_HOURS_1: 0,
-      GREATER_THAN_EIGHT_HOURS_2: 0,
     };
   }
   return {
@@ -541,8 +539,6 @@ function mapDealSheetHoursDetailsToBq(hoursRow, clientState) {
     SCHEDULE_HOURS_2: toNumberOrNull(hoursRow.scheduled_hrs_2) ?? 0,
     REGULAR_HOURS_1: isCa ? (toNumberOrNull(hoursRow.regular_hrs_1) ?? 0) : 0,
     REGULAR_HOURS_2: isCa ? (toNumberOrNull(hoursRow.regular_hrs_2) ?? 0) : 0,
-    GREATER_THAN_EIGHT_HOURS_1: isCa ? (toNumberOrNull(hoursRow.greater_than_eight_hrs_1) ?? 0) : 0,
-    GREATER_THAN_EIGHT_HOURS_2: isCa ? (toNumberOrNull(hoursRow.greater_than_eight_hrs_2) ?? 0) : 0,
   };
 }
 
@@ -1255,8 +1251,6 @@ const API_OWNED_COLUMNS = new Set([
   "SCHEDULE_HOURS_2",
   "REGULAR_HOURS_1",
   "REGULAR_HOURS_2",
-  "GREATER_THAN_EIGHT_HOURS_1",
-  "GREATER_THAN_EIGHT_HOURS_2",
   "GROSS_MARGIN",
   "ADDITIONAL_BONUS",
   "RATE_CHANGE",

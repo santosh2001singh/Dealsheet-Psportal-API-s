@@ -217,7 +217,7 @@ test("mapDealSheetHoursDetailsToBq maps schedule hours as plain numbers", () => 
   assert.equal(Object.hasOwn(mapped, "NEW_GUARANTEED_HOURS"), false);
 });
 
-test("mapDealSheetHoursDetailsToBq maps regular and greater-than-eight hours from API payload when CA", () => {
+test("mapDealSheetHoursDetailsToBq maps regular hours from API payload when CA", () => {
   const mapped = mapDealSheetHoursDetailsToBq(
     {
       total_assignment_hrs: 144,
@@ -225,8 +225,6 @@ test("mapDealSheetHoursDetailsToBq maps regular and greater-than-eight hours fro
       scheduled_hrs_2: null,
       regular_hrs_1: 24,
       regular_hrs_2: null,
-      greater_than_eight_hrs_1: 12,
-      greater_than_eight_hrs_2: null,
       deal_sheet: 5170193,
     },
     "CA"
@@ -236,11 +234,9 @@ test("mapDealSheetHoursDetailsToBq maps regular and greater-than-eight hours fro
   assert.equal(mapped.SCHEDULE_HOURS_2, 0);
   assert.equal(mapped.REGULAR_HOURS_1, 24);
   assert.equal(mapped.REGULAR_HOURS_2, 0);
-  assert.equal(mapped.GREATER_THAN_EIGHT_HOURS_1, 12);
-  assert.equal(mapped.GREATER_THAN_EIGHT_HOURS_2, 0);
 });
 
-test("mapDealSheetHoursDetailsToBq REGULAR_HOURS and GREATER_THAN_EIGHT_HOURS are 0 when clientState is not CA", () => {
+test("mapDealSheetHoursDetailsToBq REGULAR_HOURS are 0 when clientState is not CA", () => {
   const mapped = mapDealSheetHoursDetailsToBq(
     {
       total_assignment_hrs: 144,
@@ -248,8 +244,6 @@ test("mapDealSheetHoursDetailsToBq REGULAR_HOURS and GREATER_THAN_EIGHT_HOURS ar
       scheduled_hrs_2: 48,
       regular_hrs_1: 24,
       regular_hrs_2: 20,
-      greater_than_eight_hrs_1: 12,
-      greater_than_eight_hrs_2: 8,
     },
     "TX"
   );
@@ -259,8 +253,6 @@ test("mapDealSheetHoursDetailsToBq REGULAR_HOURS and GREATER_THAN_EIGHT_HOURS ar
   assert.equal(mapped.SCHEDULE_HOURS_2, 48);
   assert.equal(mapped.REGULAR_HOURS_1, 0);
   assert.equal(mapped.REGULAR_HOURS_2, 0);
-  assert.equal(mapped.GREATER_THAN_EIGHT_HOURS_1, 0);
-  assert.equal(mapped.GREATER_THAN_EIGHT_HOURS_2, 0);
 });
 
 test("mapDealSheetHoursDetailsToBq normalizes lowercase ca and trims whitespace for hours columns", () => {
@@ -268,13 +260,11 @@ test("mapDealSheetHoursDetailsToBq normalizes lowercase ca and trims whitespace 
     {
       scheduled_hrs_1: 36,
       regular_hrs_1: 24,
-      greater_than_eight_hrs_1: 12,
     },
     " ca "
   );
 
   assert.equal(mapped.REGULAR_HOURS_1, 24);
-  assert.equal(mapped.GREATER_THAN_EIGHT_HOURS_1, 12);
 });
 
 test("mapDealSheetHoursDetailsToBq defaults SCHEDULE_HOURS_2 to 0 when scheduled_hrs_2 missing", () => {
@@ -332,8 +322,6 @@ test("mapDealSheetHoursDetailsToBq defaults to zeros when hoursRow is null", () 
   assert.equal(mapped.SCHEDULE_HOURS_2, 0);
   assert.equal(mapped.REGULAR_HOURS_1, 0);
   assert.equal(mapped.REGULAR_HOURS_2, 0);
-  assert.equal(mapped.GREATER_THAN_EIGHT_HOURS_1, 0);
-  assert.equal(mapped.GREATER_THAN_EIGHT_HOURS_2, 0);
 });
 
 test("mapDealSheetHoursDetailsToBq defaults to zeros when scheduled hours are blank strings", () => {
@@ -343,8 +331,6 @@ test("mapDealSheetHoursDetailsToBq defaults to zeros when scheduled hours are bl
       scheduled_hrs_2: "",
       regular_hrs_1: "",
       regular_hrs_2: "",
-      greater_than_eight_hrs_1: "",
-      greater_than_eight_hrs_2: "",
     },
     "CA"
   );
@@ -353,8 +339,6 @@ test("mapDealSheetHoursDetailsToBq defaults to zeros when scheduled hours are bl
   assert.equal(mapped.SCHEDULE_HOURS_2, 0);
   assert.equal(mapped.REGULAR_HOURS_1, 0);
   assert.equal(mapped.REGULAR_HOURS_2, 0);
-  assert.equal(mapped.GREATER_THAN_EIGHT_HOURS_1, 0);
-  assert.equal(mapped.GREATER_THAN_EIGHT_HOURS_2, 0);
 });
 
 test("computeDerivedPlacementFields calculates ENDED placement metrics including DAYS_WORKED", () => {
