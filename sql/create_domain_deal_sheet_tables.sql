@@ -170,7 +170,8 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_deal_shee
   DELIVERY_DIRECTOR_EMP_NO STRING,
   ID STRING,
   MOVE_RUNRATE STRING,
-  IS_REJECTED STRING
+  IS_REJECTED STRING,
+  REJECTION_REASON STRING
 );
 
 CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_canada_deal_sheet`

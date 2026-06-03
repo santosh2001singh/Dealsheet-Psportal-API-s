@@ -61,21 +61,19 @@ function parseStartDateMs(value) {
 }
 
 /**
- * Match key: candidate + email + phone + job + client.
+ * Match key: candidate + email + phone + client.
  * @param {object} row
  * @returns {string|null}
  */
 function buildContractMatchKey(row) {
   const candidateNexusId = toInt64OrNull(row?.CANDIDATE_NEXUS_ID);
   if (candidateNexusId == null) return null;
-  const jobId = toInt64OrNull(row?.NEXUS_INTERNAL_JOB_ID);
-  if (jobId == null) return null;
   const clientId = toInt64OrNull(row?.CLIENT_ID);
   if (clientId == null) return null;
   const email =
     row?.CANDIDATE_EMAIL == null ? "" : String(row.CANDIDATE_EMAIL).trim().toLowerCase();
   const phone = row?.PHONE_NUMBER == null ? "" : String(row.PHONE_NUMBER).trim();
-  return `${candidateNexusId}|${email}|${phone}|${jobId}|${clientId}`;
+  return `${candidateNexusId}|${email}|${phone}|${clientId}`;
 }
 
 /**
@@ -288,7 +286,6 @@ async function resolveContractIdsForRows(rows, deps = {}) {
       candidateNexusId: toInt64OrNull(row.CANDIDATE_NEXUS_ID),
       candidateEmail: row.CANDIDATE_EMAIL,
       phoneNumber: row.PHONE_NUMBER,
-      jobId: toInt64OrNull(row.NEXUS_INTERNAL_JOB_ID),
       clientId: toInt64OrNull(row.CLIENT_ID),
       startDate: row.START_DATE,
       _row: row,

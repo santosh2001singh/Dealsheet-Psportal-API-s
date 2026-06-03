@@ -1733,7 +1733,7 @@ async function fetchContractIdsByDealSheetIds(dealSheetIds, options = {}) {
 
 /**
  * For EXTENSION rows, find original DEAL CONTRACT_ID across active tables.
- * @param {Array<{placementId: number, candidateNexusId: number, candidateEmail?: string|null, phoneNumber?: string|null, jobId: number, clientId: number, startDate?: *}>} extensionRows
+ * @param {Array<{placementId: number, candidateNexusId: number, candidateEmail?: string|null, phoneNumber?: string|null, clientId: number, startDate?: *}>} extensionRows
  * @param {object} [options]
  * @returns {Promise<Map<string, number|null>>} placementId string -> contract id or null
  */
@@ -1755,9 +1755,8 @@ async function fetchContractIdsForExtensions(extensionRows, options = {}) {
     for (const ext of chunk) {
       const pid = Number(ext.placementId);
       const cand = Number(ext.candidateNexusId);
-      const job = Number(ext.jobId);
       const client = Number(ext.clientId);
-      if (!Number.isFinite(pid) || !Number.isFinite(cand) || !Number.isFinite(job)) continue;
+      if (!Number.isFinite(pid) || !Number.isFinite(cand)) continue;
       if (!Number.isFinite(client)) continue;
 
       const email = escapeSqlString(
@@ -1772,7 +1771,7 @@ async function fetchContractIdsForExtensions(extensionRows, options = {}) {
       })();
 
       structLiterals.push(
-        `STRUCT(${Math.trunc(pid)} AS placement_id, ${Math.trunc(cand)} AS candidate_nexus_id, '${email}' AS candidate_email, '${phone}' AS phone_number, ${Math.trunc(job)} AS nexus_internal_job_id, ${Math.trunc(client)} AS client_id, ${startDateSql} AS start_date)`
+        `STRUCT(${Math.trunc(pid)} AS placement_id, ${Math.trunc(cand)} AS candidate_nexus_id, '${email}' AS candidate_email, '${phone}' AS phone_number, ${Math.trunc(client)} AS client_id, ${startDateSql} AS start_date)`
       );
     }
 
@@ -1794,7 +1793,6 @@ async function fetchContractIdsForExtensions(extensionRows, options = {}) {
           CANDIDATE_NEXUS_ID,
           LOWER(IFNULL(CANDIDATE_EMAIL, '')) AS candidate_email_norm,
           IFNULL(PHONE_NUMBER, '') AS phone_norm,
-          NEXUS_INTERNAL_JOB_ID,
           CLIENT_ID,
           START_DATE,
           EDIT_DATE
@@ -1815,7 +1813,6 @@ async function fetchContractIdsForExtensions(extensionRows, options = {}) {
           ON d.CANDIDATE_NEXUS_ID = ext.candidate_nexus_id
          AND d.candidate_email_norm = ext.candidate_email
          AND d.phone_norm = ext.phone_number
-         AND d.NEXUS_INTERNAL_JOB_ID = ext.nexus_internal_job_id
          AND d.CLIENT_ID = ext.client_id
          AND (ext.start_date IS NULL OR d.START_DATE <= ext.start_date)
       )

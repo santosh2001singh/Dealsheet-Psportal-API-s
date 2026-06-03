@@ -111,6 +111,26 @@ test("two DEALs same match key in batch allocate once and second reuses", async 
   assert.equal(rows[1].CONTRACT_ID, 100000);
 });
 
+test("two DEALs different NEXUS_INTERNAL_JOB_ID same candidate/client share CONTRACT_ID", async () => {
+  let allocated = 0;
+  const rows = [
+    row({ DEAL_SHEET_ID: 70001, NEXUS_INTERNAL_JOB_ID: 5500 }),
+    row({ DEAL_SHEET_ID: 70002, NEXUS_INTERNAL_JOB_ID: 6600 }),
+  ];
+  await resolveContractIdsForRows(
+    rows,
+    noopDeps({
+      allocateContractIdsFn: async (count) => {
+        allocated = count;
+        return [100000];
+      },
+    })
+  );
+  assert.equal(allocated, 1);
+  assert.equal(rows[0].CONTRACT_ID, 100000);
+  assert.equal(rows[1].CONTRACT_ID, 100000);
+});
+
 test("two DEALs same candidate different CLIENT_ID get two allocations", async () => {
   let allocated = 0;
   const rows = [

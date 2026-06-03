@@ -69,7 +69,7 @@ Runs at **:30** Eastern on the same hours as the insert trigger.
 
 ### 3. `dealSheetSyncOfferRejected` (HTTP — manual)
 
-Ended-style stream: submittals `EARLY_TERM,COMPLETED,CANCELLED,CANCELED` (override with `submittal_codes`), deal sheets **FINAL** only, **domain-routed ended** tables. **Placement filter** (after enrich): `DID NOT START`, `ENDED`, `ENDED<30`, `DID NOT ACCEPT`. **Start date:** `START_DATE >= 2026-04-01` (UTC). Logs each flush with prefix **`[offer-rejected-transform]`** (`enriched_in`, `after_placement_status_filter`, `after_start_date_filter`).
+Ended-style stream: submittals `EARLY_TERM,COMPLETED,CANCELLED,CANCELED` (override with `submittal_codes`), deal sheets **FINAL** only, **domain-routed ended** tables. **Placement filter** (after enrich): `DID NOT START`, `ENDED`, `ENDED<30`, `DID NOT ACCEPT`. **Start date:** `START_DATE >= 2026-05-01` (UTC). Logs each flush with prefix **`[offer-rejected-transform]`** (`enriched_in`, `after_placement_status_filter`, `after_start_date_filter`).
 
 **BigQuery behaviour (aligned with scheduled active sync):** `append_on_change_by_dealsheet`, `generated_uuid_field: ID`, same `compare_ignore_fields`, and **`first_insert_placement_status_allowlist`** = expanded active list (`STARTED`, `BOOKED`, `ENDED`, `ENDED<30`, `DID NOT START`, `DID NOT ACCEPT`). Defaults: **`dedupe_by_placement_id=false`**, **`skip_did_not_accept_existing=false`** (pass `dedupe_by_placement_id=true` or `skip_did_not_accept_existing=true` if you need the older skip behaviour).
 
