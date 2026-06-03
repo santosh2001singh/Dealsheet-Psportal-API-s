@@ -749,6 +749,50 @@ function sanitizeRowForBigQueryStreamingInsert(row) {
   return out;
 }
 
+function isEmptyDateFieldValue(value) {
+  if (value == null) return true;
+  if (typeof value === "string" && value.trim() === "") return true;
+  return false;
+}
+
+function formatDateInTimeZone(dateTime, timeZone) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date(dateTime));
+}
+
+/**
+ * Stamp NEW_HIRE_DATE / EXTENSION_DATE on first insert only (when row fields are empty).
+ * @returns {Record<string, string>} fields to merge into insert json (may be empty)
+ */
+function computeDealSheetFirstInsertDateStamps(row, dateTime) {
+  const out = {};
+  if (!row || typeof row !== "object") return out;
+  if (dateTime == null || String(dateTime).trim() === "") return out;
+
+  const dealType = row?.DEAL_TYPE == null ? "" : String(row.DEAL_TYPE).trim().toUpperCase();
+  const placementStatus = row?.PLACEMENT_STATUS == null
+    ? ""
+    : String(row.PLACEMENT_STATUS).trim().toUpperCase();
+
+  if (dealType === "DEAL" && isEmptyDateFieldValue(row.NEW_HIRE_DATE)) {
+    out.NEW_HIRE_DATE = String(dateTime);
+  }
+
+  if (
+    dealType === "EXTENSION"
+    && placementStatus === "BOOKED"
+    && isEmptyDateFieldValue(row.EXTENSION_DATE)
+  ) {
+    out.EXTENSION_DATE = formatDateInTimeZone(dateTime, "America/New_York");
+  }
+
+  return out;
+}
+
 /**
  * Insert rows to BigQuery using streaming insert
  */
@@ -771,14 +815,18 @@ async function insertAll(rows, options = {}) {
     const dateTime = clean?.DATE_AND_TIME != null && String(clean.DATE_AND_TIME).trim() !== ""
       ? clean.DATE_AND_TIME
       : insertTs;
+    let json = {
+      ...clean,
+      DATE_AND_TIME: dateTime,
+    };
+    if (options.applyDealSheetDateStamps === true) {
+      Object.assign(json, computeDealSheetFirstInsertDateStamps(clean, dateTime));
+    }
     return {
       insertId: computeInsertId(clean, options.insertIdBase + idx, {
         insertIdField: options.insertIdField,
       }),
-      json: {
-        ...clean,
-        DATE_AND_TIME: dateTime,
-      },
+      json,
     };
   });
 
@@ -1102,6 +1150,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     insertIdBase,
     datasetId: options.datasetId,
     tableId: options.tableId,
+    applyDealSheetDateStamps: true,
   });
   const hasErrors = result.errors && result.errors.length > 0;
 
@@ -1879,6 +1928,7 @@ module.exports = {
   applyMoveRunrateAppendOverride,
   applyIsRejectedResetForChangedUpdate,
   applyManualColumnsCarryForward,
+  computeDealSheetFirstInsertDateStamps,
   fetchContractIdsByDealSheetIds,
   fetchContractIdsForExtensions,
   buildActiveDealSheetsUnionSql,
