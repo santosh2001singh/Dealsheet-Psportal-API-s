@@ -828,6 +828,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
   const explicitBqTable =
     typeof params.bq_table === "string" && params.bq_table.trim() !== "";
   const useEndedDomainRouting = params.use_ended_domain_routing === true && !explicitBqTable;
+  const skipContractId = params.skip_contract_id === true || useEndedDomainRouting;
   const checkpointUseSubmittalPage = params.checkpoint_use_submittal_page === true;
   const effectiveTableId = explicitBqTable ? params.bq_table.trim() : config.tableId;
   const bqWriteOptions = { datasetId: effectiveDatasetId, tableId: effectiveTableId };
@@ -876,7 +877,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
   const startMs = Date.now();
 
   logLine(
-    `[enriched sync] === syncEnrichedDealSheetCandidatesToBigQuery START === table=${tableFqn} submittalCodes=${allowedSubmittalCodes} dealSheetStatusCodes=${dealSheetStatusCodesCsv} followNextPage=${followNextPage} onlyNewDealSheets=${onlyNewDealSheets} dedupeByPlacementId=${dedupeByPlacementId} skipDidNotAcceptIfAlreadyDidNotAccept=${skipDidNotAcceptIfAlreadyDidNotAccept} maxStreamRows=${maxCandidates || "none"} maxSubmittalPages=${maxPages || "none"} testSubmittalLimit=${testSubmittalLimit || "none"} batchSize=${config.batchSize} enrichBatchSize=${enrichBatchSize} fetchAllMax=${config.fetchAllMax} batchDelayMs=${config.batchDelayMs}`
+    `[enriched sync] === syncEnrichedDealSheetCandidatesToBigQuery START === table=${tableFqn} submittalCodes=${allowedSubmittalCodes} dealSheetStatusCodes=${dealSheetStatusCodesCsv} followNextPage=${followNextPage} onlyNewDealSheets=${onlyNewDealSheets} dedupeByPlacementId=${dedupeByPlacementId} skipDidNotAcceptIfAlreadyDidNotAccept=${skipDidNotAcceptIfAlreadyDidNotAccept} skipContractId=${skipContractId ? "true" : "false"} maxStreamRows=${maxCandidates || "none"} maxSubmittalPages=${maxPages || "none"} testSubmittalLimit=${testSubmittalLimit || "none"} batchSize=${config.batchSize} enrichBatchSize=${enrichBatchSize} fetchAllMax=${config.fetchAllMax} batchDelayMs=${config.batchDelayMs}`
   );
 
   logLine(
@@ -1028,6 +1029,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
       {
         allowedSubmittalCodes: allowedSubmittalCodes,
         persistDealSheetStatusFromCandidate: includeVerbalDealSheets,
+        skip_contract_id: skipContractId,
       }
     );
     const rowsForInsert = transformRowsFn ? await transformRowsFn(combined) : combined;
@@ -1047,6 +1049,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
         ? { first_insert_placement_status_allowlist: firstInsertPlacementStatusAllowlist }
         : {}),
       ...bqWriteOptions,
+      ...(skipContractId ? { skip_contract_id: true } : {}),
       ...(insertRoutedResolveTableId ? { resolveTableId: insertRoutedResolveTableId } : {}),
     });
     totalRowsInserted += result.inserted;

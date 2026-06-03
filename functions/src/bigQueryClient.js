@@ -1125,12 +1125,19 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     return { inserted: 0, attempted: 0, errorBatches: 0, insertedKeys: new Set() };
   }
 
-  // Phase B: allocate Firestore-backed CONTRACT_IDs only for rows that will
-  // actually be inserted (defer allocation pattern). Rows already carrying a
-  // CONTRACT_ID from Phase A (resolveContractIdsForRows) are left untouched.
-  // Lazy require to avoid module-load circular dependency with contractIdResolver.
-  const { allocateContractIdsForInsertableRows } = require("./contractIdResolver");
-  await allocateContractIdsForInsertableRows(rowsToInsert);
+  if (options.skip_contract_id === true) {
+    rowsToInsert = rowsToInsert.map((row) => ({ ...row, CONTRACT_ID: null }));
+    logLine(
+      `[enriched sync] [BigQuery insertAll] skip_contract_id: CONTRACT_ID cleared for insert count=${rowsToInsert.length}`
+    );
+  } else {
+    // Phase B: allocate Firestore-backed CONTRACT_IDs only for rows that will
+    // actually be inserted (defer allocation pattern). Rows already carrying a
+    // CONTRACT_ID from Phase A (resolveContractIdsForRows) are left untouched.
+    // Lazy require to avoid module-load circular dependency with contractIdResolver.
+    const { allocateContractIdsForInsertableRows } = require("./contractIdResolver");
+    await allocateContractIdsForInsertableRows(rowsToInsert);
+  }
 
   const generatedUuidField =
     typeof options.generatedUuidField === "string" && options.generatedUuidField.trim() !== ""

@@ -809,12 +809,16 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     );
   }
 
-  await resolveContractIdsForRows(combined, {
-    skipAllocation: true,
-    allocateContractIdsFn: allocateContractIds,
-    fetchContractIdsByDealSheetIdsFn: fetchContractIdsByDealSheetIds,
-    fetchContractIdsForExtensionsFn: fetchContractIdsForExtensions,
-  });
+  if (!options.skip_contract_id) {
+    await resolveContractIdsForRows(combined, {
+      skipAllocation: true,
+      allocateContractIdsFn: allocateContractIds,
+      fetchContractIdsByDealSheetIdsFn: fetchContractIdsByDealSheetIds,
+      fetchContractIdsForExtensionsFn: fetchContractIdsForExtensions,
+    });
+  } else {
+    logLine("[enriched sync] STEP 3/4 ENRICH: skip_contract_id — CONTRACT_ID resolution skipped");
+  }
 
   return { rows: combined, additionalCostLogRows };
 }

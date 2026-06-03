@@ -482,6 +482,7 @@ exports.dealSheetSyncUpdateTrigger = onSchedule(
  * If you need one row per placement only, pass `dedupe_by_placement_id=true` and do not rely on append-on-change for that placement.
  *
  * Placement filter: DID NOT START, ENDED, ENDED<30, DID NOT ACCEPT; TENTATIVE_DATE >= 2026-05-01 UTC.
+ * CONTRACT_ID: always null on ended inserts (`skip_contract_id`); allocation only on active insert (`dealSheetSyncTrigger` / `dealSheetSync` HTTP).
  * After deploy, delete the legacy GCP job `firebase-schedule-dealSheetSyncOfferRejectedTrigger-*` if it still exists.
  * To run from Cloud Scheduler, create an HTTP job targeting this function URL (GET/POST).
  */
@@ -538,6 +539,7 @@ exports.dealSheetSyncOfferRejected = onRequest(
           compare_ignore_fields: ["ID", "DATE_AND_TIME", "IS_REJECTED"],
           first_insert_placement_status_allowlist: ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES,
           transform_rows_fn: transformOfferRejectedEndedRowsForBigQuery,
+          skip_contract_id: true,
         };
 
         if (resetCheckpoint) params.reset_checkpoint = true;

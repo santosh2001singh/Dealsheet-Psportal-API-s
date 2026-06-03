@@ -48,6 +48,7 @@ test("offer-rejected HTTP function uses Firestore pagination and ended routing",
   assert.equal(block.includes('"DATE_AND_TIME"'), true);
   assert.equal(block.includes("first_insert_placement_status_allowlist: ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES"), true);
   assert.equal(block.includes("dedupe_by_placement_id: dedupeByPlacementId"), true);
+  assert.equal(block.includes("skip_contract_id: true"), true);
   assert.equal(source.includes("transformOfferRejectedEndedRowsForBigQuery"), true);
   assert.equal(source.includes("./offerRejectedRowTransform"), true);
   const transformSource = fs.readFileSync(
@@ -73,6 +74,7 @@ test("dealSheetSyncTrigger applies min START_DATE transform before BigQuery", ()
     true,
     "scheduled insert trigger should filter rows by START_DATE >= 2026-05-01"
   );
+  assert.equal(block.includes("skip_contract_id"), false, "active insert trigger should allocate CONTRACT_ID");
 });
 
 test("dealSheetSyncTrigger is insert-only and skips existing deal sheet or placement", () => {
