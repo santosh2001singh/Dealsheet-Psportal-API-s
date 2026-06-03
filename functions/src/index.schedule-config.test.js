@@ -48,8 +48,17 @@ test("offer-rejected HTTP function uses Firestore pagination and ended routing",
   assert.equal(block.includes('"DATE_AND_TIME"'), true);
   assert.equal(block.includes("first_insert_placement_status_allowlist: ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES"), true);
   assert.equal(block.includes("dedupe_by_placement_id: dedupeByPlacementId"), true);
-  assert.equal(source.includes("[offer-rejected-transform]"), true);
-  assert.equal(source.includes('status === "DID NOT ACCEPT"'), true);
+  assert.equal(source.includes("transformOfferRejectedEndedRowsForBigQuery"), true);
+  assert.equal(source.includes("./offerRejectedRowTransform"), true);
+  const transformSource = fs.readFileSync(
+    path.join(__dirname, "offerRejectedRowTransform.js"),
+    "utf8"
+  );
+  assert.equal(transformSource.includes("[offer-rejected-transform]"), true);
+  assert.equal(transformSource.includes('status === "DID NOT ACCEPT"'), true);
+  assert.equal(transformSource.includes("after_tentative_date_filter"), true);
+  assert.equal(transformSource.includes("TENTATIVE_DATE>=2026-05-01 UTC"), true);
+  assert.equal(transformSource.includes("after_start_date_filter"), false);
   assert.equal(block.includes('bq_table: "ch_ended_records"'), false);
 });
 

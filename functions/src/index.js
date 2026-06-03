@@ -21,6 +21,7 @@ const {
 const { syncPeopleStrongEmployeeDetailsToBigQuery } = require("./peoplestrongEmployeeDetailsService");
 const { logLine, logError, withTimingAsync } = require("./logger");
 const { startDateOnOrAfterUtcMin, effectiveMinFilterDate } = require("./columnMappings");
+const { transformOfferRejectedEndedRowsForBigQuery } = require("./offerRejectedRowTransform");
 
 admin.initializeApp();
 
@@ -37,8 +38,6 @@ const ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES =
   "STARTED,BOOKED,ENDED,ENDED<30,DID NOT START,DID NOT ACCEPT";
 /** Active HTTP/trigger + scheduled update: only insert rows with START_DATE on or after this day (UTC). */
 const DEAL_SHEET_MIN_START_DATE_MS = Date.UTC(2026, 4, 1);
-/** Offer-rejected (`dealSheetSyncOfferRejected`) only: ENDED / DID NOT ACCEPT / DID NOT START / ENDED<30 rows must have START_DATE on or after this day (UTC). */
-const OFFER_REJECTED_MIN_START_DATE_MS = Date.UTC(2026, 4, 1); // 2026-05-01 UTC
 
 /** Nexus submittal filter for scheduled insert trigger (new deal sheets only) */
 const ACTIVE_BOOTSTRAP_SUBMITTAL_CODES = "PERM_STARTS,ACTIVE,BOOKED";
@@ -47,38 +46,6 @@ function filterEnrichedRowsByDealSheetMinStartDate(rows) {
   return rows.filter((row) =>
     startDateOnOrAfterUtcMin(effectiveMinFilterDate(row), DEAL_SHEET_MIN_START_DATE_MS)
   );
-}
-
-function filterOfferRejectedRowsByMinStartDate(rows) {
-  return rows.filter((row) =>
-    startDateOnOrAfterUtcMin(effectiveMinFilterDate(row), OFFER_REJECTED_MIN_START_DATE_MS)
-  );
-}
-
-/** Placement statuses allowed into BigQuery for `dealSheetSyncOfferRejected` (before START_DATE filter). */
-function filterOfferRejectedEndedPlacementStatuses(rows) {
-  return rows.filter((row) => {
-    const status = String(row?.PLACEMENT_STATUS || "").trim().toUpperCase();
-    return (
-      status === "DID NOT START" ||
-      status === "ENDED" ||
-      status === "ENDED<30" ||
-      status === "DID NOT ACCEPT"
-    );
-  });
-}
-
-/** Logs per-batch transform stages for `dealSheetSyncOfferRejected` (filter in Cloud Logging: `[offer-rejected-transform]`). */
-function transformOfferRejectedEndedRowsForBigQuery(rows) {
-  const n = rows?.length ?? 0;
-  logLine(`[offer-rejected-transform] enriched_in=${n}`);
-  const afterStatus = filterOfferRejectedEndedPlacementStatuses(rows);
-  logLine(
-    `[offer-rejected-transform] after_placement_status_filter=${afterStatus.length} (allowed=DID NOT START,ENDED,ENDED<30,DID NOT ACCEPT)`
-  );
-  const afterDate = filterOfferRejectedRowsByMinStartDate(afterStatus);
-  logLine(`[offer-rejected-transform] after_start_date_filter=${afterDate.length} (START_DATE>=2026-05-01 UTC)`);
-  return afterDate;
 }
 
 /** Max placement composites refreshed per `dealSheetSyncUpdateTrigger` invocation (env override). */
@@ -514,7 +481,7 @@ exports.dealSheetSyncUpdateTrigger = onSchedule(
  * With default `dedupe_by_placement_id=false`, multiple history rows per placement are possible (like active tables).
  * If you need one row per placement only, pass `dedupe_by_placement_id=true` and do not rely on append-on-change for that placement.
  *
- * Placement filter: DID NOT START, ENDED, ENDED<30, DID NOT ACCEPT; START_DATE >= 2026-05-01 UTC.
+ * Placement filter: DID NOT START, ENDED, ENDED<30, DID NOT ACCEPT; TENTATIVE_DATE >= 2026-05-01 UTC.
  * After deploy, delete the legacy GCP job `firebase-schedule-dealSheetSyncOfferRejectedTrigger-*` if it still exists.
  * To run from Cloud Scheduler, create an HTTP job targeting this function URL (GET/POST).
  */
