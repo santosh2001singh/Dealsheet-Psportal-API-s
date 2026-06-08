@@ -1195,6 +1195,84 @@ function coerceApiFloatNullsToZero(row) {
   return out;
 }
 
+/** Placement statuses eligible for cancellation/termination detail API lookup. */
+const TERMINATION_API_ELIGIBLE_PLACEMENT_STATUSES = new Set([
+  "ENDED<30",
+  "DID NOT START",
+  "DID NOT ACCEPT",
+  "CANCELLED",
+  "CANCELED",
+]);
+
+function normalizePlacementStatusKeyForTermination(status) {
+  if (status == null) return "";
+  return String(status).trim().toUpperCase().replace(/\s+/g, " ");
+}
+
+function isTerminationApiEligiblePlacementStatus(status) {
+  const key = normalizePlacementStatusKeyForTermination(status);
+  return key !== "" && TERMINATION_API_ELIGIBLE_PLACEMENT_STATUSES.has(key);
+}
+
+/**
+ * Pick display VALUE from cancellation/termination API item (priority order).
+ */
+function extractTerminationReasonValue(apiItem) {
+  if (!apiItem || typeof apiItem !== "object") return null;
+  const cr = apiItem.cancellation_reason;
+  if (cr?.value != null && String(cr.value).trim() !== "") return String(cr.value).trim();
+  const et = apiItem.early_term_reason;
+  if (et?.value != null && String(et.value).trim() !== "") return String(et.value).trim();
+  const ctr = apiItem.cancellation_termination_reason;
+  if (ctr != null && typeof ctr === "object" && ctr.value != null && String(ctr.value).trim() !== "") {
+    return String(ctr.value).trim();
+  }
+  if (typeof ctr === "string" && ctr.trim() !== "") return ctr.trim();
+  return null;
+}
+
+function pickLatestTerminationDetailItem(items) {
+  if (!items || items.length === 0) return null;
+  if (items.length === 1) return items[0];
+  const sorted = [...items].sort((a, b) => {
+    const ma = Date.parse(a?.modified_date || a?.created_date || 0);
+    const mb = Date.parse(b?.modified_date || b?.created_date || 0);
+    return (Number.isFinite(mb) ? mb : 0) - (Number.isFinite(ma) ? ma : 0);
+  });
+  return sorted[0] ?? null;
+}
+
+/**
+ * Build one termination-reason log row from Nexus cancellation/termination API item.
+ */
+function mapTerminationReasonLogRowForDealSheet(apiItem, contextRow, captureTimestamp) {
+  if (!apiItem || typeof apiItem !== "object") return null;
+  const detailId = toIntOrNull(apiItem.id);
+  if (detailId == null) return null;
+  const ts = captureTimestamp != null ? captureTimestamp : new Date().toISOString();
+  const value = extractTerminationReasonValue(apiItem);
+  const cancelledBy = apiItem.cancelled_by == null ? null : String(apiItem.cancelled_by).trim() || null;
+  const notes = apiItem.notes == null ? null : String(apiItem.notes).trim() || null;
+  const terminationType =
+    apiItem.termination_type == null ? null : String(apiItem.termination_type).trim() || null;
+  const dnrAt = apiItem.dnr_at == null ? null : String(apiItem.dnr_at).trim() || null;
+  if (value == null && cancelledBy == null && notes == null && terminationType == null && dnrAt == null) {
+    return null;
+  }
+  return {
+    DATE_AND_TIME: ts,
+    DEAL_SHEET_ID: toIntOrNull(contextRow?.DEAL_SHEET_ID),
+    PLACEMENT_ID: toIntOrNull(contextRow?.PLACEMENT_ID),
+    CONTRACT_ID: toIntOrNull(contextRow?.CONTRACT_ID),
+    TERMINATION_DETAIL_ID: detailId,
+    CANCELLED_BY: cancelledBy,
+    NOTES: notes,
+    VALUE: value,
+    TERMINATION_TYPE: terminationType,
+    DNR_AT: dnrAt,
+  };
+}
+
 /**
  * Columns owned by the Nexus enrichment pipeline. Any column not in this set
  * (and not in SYSTEM_CONTROLLED_COLUMNS) is treated as a manual BigQuery edit
@@ -1232,7 +1310,6 @@ const API_OWNED_COLUMNS = new Set([
   "VMS_JOB_ID",
   "START_DATE",
   "OFFER_TIME_START_DATE",
-  "TENTATIVE_DATE",
   "END_DATE",
   "OFFERING",
   "JOB_TYPE",
@@ -1240,6 +1317,7 @@ const API_OWNED_COLUMNS = new Set([
   "PLACEMENT_ID",
   "SUBMISSION_DATE",
   "PLACEMENT_STATUS",
+  "TERMINATION_REASON",
   "MSP_ID",
   "MSP_NAME",
   "LINE_OF_BUSINESS",
@@ -1288,13 +1366,17 @@ Object.freeze(API_OWNED_COLUMNS);
  * Columns written by the insert pipeline itself (never carried forward from baseline).
  * `ID` is generated per insert, `DATE_AND_TIME` is set at insert time,
  * `IS_REJECTED` is reset by applyIsRejectedResetForChangedUpdate,
- * `MOVE_RUNRATE` is gated by applyMoveRunrateAppendOverride.
+ * `MOVE_RUNRATE` is gated by applyMoveRunrateAppendOverride,
+ * `TENTATIVE_DATE` is frozen by applyTentativeDateFreeze (release on START_DATE change),
+ * `NEW_HIRE_DATE` is frozen by applyNewHireDateFreeze (first insert only per placement).
  */
 const SYSTEM_CONTROLLED_COLUMNS = new Set([
   "ID",
   "DATE_AND_TIME",
   "IS_REJECTED",
   "MOVE_RUNRATE",
+  "TENTATIVE_DATE",
+  "NEW_HIRE_DATE",
 ]);
 Object.freeze(SYSTEM_CONTROLLED_COLUMNS);
 
@@ -1332,6 +1414,10 @@ module.exports = {
   startDateOnOrAfterUtcMin,
   effectiveMinFilterDate,
   coerceApiFloatNullsToZero,
+  isTerminationApiEligiblePlacementStatus,
+  extractTerminationReasonValue,
+  pickLatestTerminationDetailItem,
+  mapTerminationReasonLogRowForDealSheet,
   API_OWNED_COLUMNS,
   SYSTEM_CONTROLLED_COLUMNS,
 };

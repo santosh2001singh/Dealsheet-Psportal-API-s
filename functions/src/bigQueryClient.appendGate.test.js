@@ -15,7 +15,11 @@ const {
   applyMoveRunrateAppendOverride,
   applyIsRejectedResetForChangedUpdate,
   applyManualColumnsCarryForward,
+  applyTentativeDateFreeze,
+  applyNewHireDateFreeze,
 } = require("./bigQueryClient");
+const { API_OWNED_COLUMNS } = require("./columnMappings");
+const { resolvePairedActiveTableId } = require("./recruiterDomainTables");
 
 const IGNORE = new Set(["ID", "DATE_AND_TIME"]);
 
@@ -260,4 +264,189 @@ test("applyManualColumnsCarryForward: null baseline returns incoming unchanged w
   const out = applyManualColumnsCarryForward(incoming, null);
   assert.equal(out.row, incoming);
   assert.equal(out.carriedCount, 0);
+});
+
+test("ORIGINAL_START_DATE is not API-owned (carried forward on update-append)", () => {
+  assert.equal(API_OWNED_COLUMNS.has("ORIGINAL_START_DATE"), false);
+});
+
+test("applyManualColumnsCarryForward: preserves ORIGINAL_START_DATE from baseline", () => {
+  const incoming = {
+    PLACEMENT_STATUS: "ENDED",
+    START_DATE: "2026-06-01",
+    ORIGINAL_START_DATE: null,
+  };
+  const baseline = {
+    PLACEMENT_STATUS: "STARTED",
+    START_DATE: "2026-01-05",
+    ORIGINAL_START_DATE: "2025-11-20",
+  };
+  const out = applyManualColumnsCarryForward(incoming, baseline);
+  assert.equal(out.row.ORIGINAL_START_DATE, "2025-11-20");
+  assert.equal(out.row.START_DATE, "2026-06-01");
+});
+
+test("TENTATIVE_DATE is not API-owned (frozen per placement on update-append)", () => {
+  assert.equal(API_OWNED_COLUMNS.has("TENTATIVE_DATE"), false);
+});
+
+test("hasBusinessColumnChanges: tentative-only change with same START_DATE skips", () => {
+  const existing = {
+    DEAL_SHEET_ID: 1,
+    PLACEMENT_ID: 2,
+    PLACEMENT_STATUS: "STARTED",
+    START_DATE: "2026-01-05",
+    TENTATIVE_DATE: "2026-06-01",
+  };
+  const incoming = {
+    DEAL_SHEET_ID: 1,
+    PLACEMENT_ID: 2,
+    PLACEMENT_STATUS: "STARTED",
+    START_DATE: "2026-01-05",
+    TENTATIVE_DATE: "2026-07-15",
+  };
+  assert.equal(hasBusinessColumnChanges(incoming, existing, IGNORE), false);
+});
+
+test("hasBusinessColumnChanges: START_DATE change still detected", () => {
+  const existing = {
+    DEAL_SHEET_ID: 1,
+    PLACEMENT_ID: 2,
+    PLACEMENT_STATUS: "STARTED",
+    START_DATE: "2026-01-05",
+    TENTATIVE_DATE: "2026-06-01",
+  };
+  const incoming = {
+    DEAL_SHEET_ID: 1,
+    PLACEMENT_ID: 2,
+    PLACEMENT_STATUS: "STARTED",
+    START_DATE: "2026-02-01",
+    TENTATIVE_DATE: "2026-07-15",
+  };
+  assert.equal(hasBusinessColumnChanges(incoming, existing, IGNORE), true);
+});
+
+test("applyTentativeDateFreeze: same START_DATE freezes tentative from baseline", () => {
+  const incoming = {
+    START_DATE: "2026-01-05",
+    TENTATIVE_DATE: "2026-07-15",
+  };
+  const baseline = {
+    START_DATE: "2026-01-05",
+    TENTATIVE_DATE: "2026-06-01",
+  };
+  const out = applyTentativeDateFreeze(incoming, baseline);
+  assert.equal(out.row.TENTATIVE_DATE, "2026-06-01");
+  assert.equal(out.frozen, true);
+});
+
+test("applyTentativeDateFreeze: changed START_DATE keeps incoming tentative", () => {
+  const incoming = {
+    START_DATE: "2026-02-01",
+    TENTATIVE_DATE: "2026-08-01",
+  };
+  const baseline = {
+    START_DATE: "2026-01-05",
+    TENTATIVE_DATE: "2026-06-01",
+  };
+  const out = applyTentativeDateFreeze(incoming, baseline);
+  assert.equal(out.row.TENTATIVE_DATE, "2026-08-01");
+  assert.equal(out.frozen, false);
+});
+
+test("applyTentativeDateFreeze: null baseline keeps incoming unchanged", () => {
+  const incoming = {
+    START_DATE: "2026-01-05",
+    TENTATIVE_DATE: "2026-06-01",
+  };
+  const out = applyTentativeDateFreeze(incoming, null);
+  assert.equal(out.row.TENTATIVE_DATE, "2026-06-01");
+  assert.equal(out.frozen, false);
+});
+
+test("applyManualColumnsCarryForward: does not carry TENTATIVE_DATE from baseline", () => {
+  const incoming = {
+    PLACEMENT_STATUS: "ENDED",
+    START_DATE: "2026-01-05",
+    TENTATIVE_DATE: "2026-08-01",
+  };
+  const baseline = {
+    PLACEMENT_STATUS: "STARTED",
+    START_DATE: "2026-01-05",
+    TENTATIVE_DATE: "2026-06-01",
+    SKU_NUMBER: "12345",
+  };
+  const out = applyManualColumnsCarryForward(incoming, baseline);
+  assert.equal(out.row.TENTATIVE_DATE, "2026-08-01");
+  assert.equal(out.row.SKU_NUMBER, "12345");
+});
+
+test("NEW_HIRE_DATE is not API-owned (frozen per placement on update-append)", () => {
+  assert.equal(API_OWNED_COLUMNS.has("NEW_HIRE_DATE"), false);
+});
+
+test("applyNewHireDateFreeze: baseline with value freezes NEW_HIRE_DATE", () => {
+  const incoming = {
+    PLACEMENT_STATUS: "ENDED",
+    NEW_HIRE_DATE: "2026-06-03T10:13:07.779Z",
+  };
+  const baseline = {
+    PLACEMENT_STATUS: "STARTED",
+    NEW_HIRE_DATE: "2026-05-31T00:13:22.094Z",
+  };
+  const out = applyNewHireDateFreeze(incoming, baseline);
+  assert.equal(out.row.NEW_HIRE_DATE, "2026-05-31T00:13:22.094Z");
+  assert.equal(out.frozen, true);
+});
+
+test("applyNewHireDateFreeze: null baseline keeps incoming unchanged", () => {
+  const incoming = {
+    NEW_HIRE_DATE: "2026-05-31T00:13:22.094Z",
+  };
+  const out = applyNewHireDateFreeze(incoming, null);
+  assert.equal(out.row.NEW_HIRE_DATE, "2026-05-31T00:13:22.094Z");
+  assert.equal(out.frozen, false);
+});
+
+test("applyNewHireDateFreeze: baseline null NEW_HIRE_DATE keeps incoming", () => {
+  const incoming = {
+    NEW_HIRE_DATE: "2026-06-03T10:13:07.779Z",
+  };
+  const baseline = {
+    NEW_HIRE_DATE: null,
+  };
+  const out = applyNewHireDateFreeze(incoming, baseline);
+  assert.equal(out.row.NEW_HIRE_DATE, "2026-06-03T10:13:07.779Z");
+  assert.equal(out.frozen, false);
+});
+
+test("applyManualColumnsCarryForward: does not carry NEW_HIRE_DATE from baseline", () => {
+  const incoming = {
+    PLACEMENT_STATUS: "ENDED",
+    NEW_HIRE_DATE: "2026-06-03T10:13:07.779Z",
+  };
+  const baseline = {
+    PLACEMENT_STATUS: "STARTED",
+    NEW_HIRE_DATE: "2026-05-31T00:13:22.094Z",
+    SKU_NUMBER: "9999",
+  };
+  const out = applyManualColumnsCarryForward(incoming, baseline);
+  assert.equal(out.row.NEW_HIRE_DATE, "2026-06-03T10:13:07.779Z");
+  assert.equal(out.row.SKU_NUMBER, "9999");
+});
+
+test("resolvePairedActiveTableId maps ended tables to active counterparts", () => {
+  assert.equal(
+    resolvePairedActiveTableId("cynet_health_ended_deal_sheet"),
+    "cynet_health_deal_sheet"
+  );
+  assert.equal(
+    resolvePairedActiveTableId("cynet_health_canada_ended_deal_sheet"),
+    "cynet_health_canada_deal_sheet"
+  );
+  assert.equal(
+    resolvePairedActiveTableId("cynet_locums_ended_deal_sheet"),
+    "cynet_locums_deal_sheet"
+  );
+  assert.equal(resolvePairedActiveTableId("cynet_health_deal_sheet"), null);
 });

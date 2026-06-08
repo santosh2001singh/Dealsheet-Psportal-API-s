@@ -22,6 +22,10 @@ const {
   mapDealSheetRevenueDetailsToBq,
   mapDealSheetAdditionalCostsToBq,
   mapAdditionalCostLogRowsForDealSheet,
+  isTerminationApiEligiblePlacementStatus,
+  extractTerminationReasonValue,
+  pickLatestTerminationDetailItem,
+  mapTerminationReasonLogRowForDealSheet,
   mapTravelAllowanceToAdditionalBonus,
   mapTravelAllowanceLogRowsForDealSheet,
   mapDealSheetClientCostsToAdditionalBonus,
@@ -44,10 +48,12 @@ const { computeWeekSplit } = require("../weekSplit");
 const { computeNewRateFamily } = require("../w2PayRateNew");
 const { shouldExcludeRowFromBigQuery } = require("../bqRowExclusions");
 const { resolveContractIdsForRows } = require("../contractIdResolver");
+const { resolveOriginalStartDatesForRows } = require("../originalStartDateResolver");
 const { allocateContractIds } = require("../contractIdSequence");
 const {
   fetchContractIdsByDealSheetIds,
   fetchContractIdsForExtensions,
+  fetchOriginalStartDatesForExtensions,
 } = require("../bigQueryClient");
 
 /**
@@ -286,10 +292,13 @@ function collectCandidateApiFailureKinds({
 async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSubmittals = null, options = {}) {
   const combined = [];
   const additionalCostLogRows = [];
+  const terminationLogRows = [];
   let excludedDummyOrTraining = 0;
   if (!candidates || candidates.length === 0) {
-    return { rows: combined, additionalCostLogRows };
+    return { rows: combined, additionalCostLogRows, terminationLogRows };
   }
+
+  const fetchTerminationDetails = options?.fetchTerminationDetails === true;
 
   const allowedSubmittalCodesCsv =
     options && String(options.allowedSubmittalCodes || "").trim()
@@ -608,6 +617,86 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     else submittalByKey.set(`${op.jobId}:${op.recruiterId}:${op.candId}`, pickAllowedSubmittalFromRun(json, op.candId));
   }
 
+  /** @type {Map<string, object[]>} */
+  const terminationByPlacementId = new Map();
+
+  if (fetchTerminationDetails) {
+    function resolveSubmittalRowForCandidate(c) {
+      const jobId = normalizeNexusResourceId(c?.job);
+      const candId = normalizeNexusResourceId(c?.candidate);
+      const dealSheetId = normalizeNexusResourceId(c?.deal_sheet);
+      let submittalRow = hasPreloadedSubmittals
+        ? getPreloadedSubmittalRow(preloadedSubmittals, jobId, candId)
+        : null;
+      if (!submittalRow && !hasPreloadedSubmittals && dealSheetId) {
+        const detail = dealSheetById.get(String(dealSheetId));
+        const recruiterIdForSub = detail?.recruiter;
+        const subKey =
+          jobId != null && recruiterIdForSub != null && candId != null
+            ? `${jobId}:${recruiterIdForSub}:${candId}`
+            : null;
+        submittalRow = subKey ? submittalByKey.get(subKey) ?? null : null;
+      }
+      return submittalRow;
+    }
+
+    const eligiblePlacementIds = new Set();
+    for (const c of candidates) {
+      const submittalRow = resolveSubmittalRowForCandidate(c);
+      const jobId = normalizeNexusResourceId(c?.job);
+      const jobObj = jobId == null || String(jobId).trim() === "" ? null : jobById.get(String(jobId)) ?? null;
+      const submittalPart = mapJobSubmittalToBq(submittalRow, jobObj);
+      const placementId = submittalPart?.PLACEMENT_ID;
+      if (placementId == null) continue;
+      if (!isTerminationApiEligiblePlacementStatus(submittalPart?.PLACEMENT_STATUS)) continue;
+      eligiblePlacementIds.add(String(placementId));
+    }
+
+    const wave3Urls = [];
+    const wave3PlacementIds = [];
+    for (const pid of eligiblePlacementIds) {
+      wave3Urls.push(
+        buildUrl(`${config.nexus.baseUrl}/api/job-submittal-cancellation-termination-details/`, {
+          job_submittal_id: pid,
+        })
+      );
+      wave3PlacementIds.push(pid);
+    }
+
+    if (wave3Urls.length > 0) {
+      logLine(
+        `[enriched sync] STEP 3/4 ENRICH APIS wave3: termination-details uniqueCalls=${wave3Urls.length}`
+      );
+      const wave3Start = Date.now();
+      let wave3Responses;
+      try {
+        wave3Responses = await nexusFetchAllJsonBatched(wave3Urls, accessToken);
+      } catch (err) {
+        logLine(
+          `[enriched sync] WARN: wave3 termination batch threw error, attempting individual fallback: ${String(err.message || err).slice(0, 200)}`
+        );
+        wave3Responses = [];
+        for (let i = 0; i < wave3Urls.length; i++) {
+          try {
+            wave3Responses.push(await nexusGetJson(wave3Urls[i], accessToken));
+          } catch (e) {
+            logLine(
+              `[enriched sync] SKIP wave3 termination placement=${wave3PlacementIds[i]} due to error: ${String(e.message || e).slice(0, 100)}`
+            );
+            wave3Responses.push({});
+          }
+        }
+      }
+      for (let i = 0; i < wave3PlacementIds.length; i++) {
+        const items = extractItems(wave3Responses[i]);
+        if (items.length > 0) terminationByPlacementId.set(wave3PlacementIds[i], items);
+      }
+      logLine(
+        `[enriched sync] STEP 3/4 ENRICH APIS wave3: responses=${wave3Responses.length} withData=${terminationByPlacementId.size} httpMs=${Date.now() - wave3Start}`
+      );
+    }
+  }
+
   for (const c of candidates) {
     const dealSheetId = normalizeNexusResourceId(c?.deal_sheet);
     if (dealSheetId == null || dealSheetId === "") continue;
@@ -753,6 +842,13 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
           ? "FT Hire"
           : mspNameNorm;
 
+    let terminationReason = null;
+    if (fetchTerminationDetails && submittalPart?.PLACEMENT_ID != null) {
+      const termItems = terminationByPlacementId.get(String(submittalPart.PLACEMENT_ID)) ?? [];
+      const latestTerm = pickLatestTerminationDetailItem(termItems);
+      terminationReason = latestTerm ? extractTerminationReasonValue(latestTerm) : null;
+    }
+
     const row = {
       ...candidatePart,
       ...clientPart,
@@ -775,6 +871,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       LINE_OF_BUSINESS: lineOfBusiness,
       START_DATE: submittalPart?.START_DATE ?? null,
       TENTATIVE_DATE: submittalPart?.TENTATIVE_DATE ?? jobPart?.TENTATIVE_DATE ?? null,
+      TERMINATION_REASON: terminationReason,
     };
     const newRateFamilyPart = computeNewRateFamily(row);
     const derivedPart = computeDerivedPlacementFields(row);
@@ -816,11 +913,28 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       fetchContractIdsByDealSheetIdsFn: fetchContractIdsByDealSheetIds,
       fetchContractIdsForExtensionsFn: fetchContractIdsForExtensions,
     });
+    await resolveOriginalStartDatesForRows(combined, {
+      fetchOriginalStartDatesForExtensionsFn: fetchOriginalStartDatesForExtensions,
+      bqOptions: options.bqOptions,
+    });
   } else {
     logLine("[enriched sync] STEP 3/4 ENRICH: skip_contract_id — CONTRACT_ID resolution skipped");
   }
 
-  return { rows: combined, additionalCostLogRows };
+  if (fetchTerminationDetails && terminationByPlacementId.size > 0) {
+    const captureTs = new Date().toISOString();
+    for (const finalRow of combined) {
+      const pid = finalRow?.PLACEMENT_ID;
+      if (pid == null) continue;
+      const items = terminationByPlacementId.get(String(pid)) ?? [];
+      for (const item of items) {
+        const logRow = mapTerminationReasonLogRowForDealSheet(item, finalRow, captureTs);
+        if (logRow) terminationLogRows.push(logRow);
+      }
+    }
+  }
+
+  return { rows: combined, additionalCostLogRows, terminationLogRows };
 }
 
 module.exports = {

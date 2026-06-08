@@ -21,6 +21,7 @@ const {
   insertEnrichedDealSheetBatchRouted,
   insertRateChangeLogBatch,
   insertAdditionalCostLogBatch,
+  insertTerminationReasonLogBatch,
   fetchExistingDealSheetIdsSet,
   fetchExistingDealSheetIdsSetAnyActiveTable,
   fetchExistingPlacementIdsSet,
@@ -29,6 +30,7 @@ const {
   fetchLatestRowsByDealSheetPlacementPairs,
   fetchLatestRowsByDealSheetIds,
   fetchLatestAdditionalCostLogRowsByKeys,
+  fetchLatestTerminationReasonLogRowsByKeys,
   fetchContractRateChangePairsFromActive,
   hasBusinessColumnChanges,
   normalizeForCompare,
@@ -36,6 +38,7 @@ const {
   placementStatusAllowsFirstInsert,
   buildDealSheetPlacementCompositeKey,
   buildAdditionalCostLogCompositeKey,
+  buildTerminationReasonLogCompositeKey,
 } = require("./bigQueryClient");
 const { startDateOnOrAfterUtcMin, effectiveMinFilterDate, API_OWNED_COLUMNS } = require("./columnMappings");
 const { buildEnrichedRowsFromDealSheetCandidates } = require("./api/dealSheetEnricher");
@@ -61,6 +64,20 @@ function resolveAdditionalCostLogTarget(params = {}) {
     params.bq_additional_cost_log_table.trim() !== ""
       ? params.bq_additional_cost_log_table.trim()
       : config.additionalCostLogTableId;
+  return { datasetId, tableId };
+}
+
+function resolveTerminationReasonLogTarget(params = {}) {
+  const datasetId =
+    typeof params.bq_termination_reason_log_dataset === "string" &&
+    params.bq_termination_reason_log_dataset.trim() !== ""
+      ? params.bq_termination_reason_log_dataset.trim()
+      : config.terminationReasonLogDatasetId;
+  const tableId =
+    typeof params.bq_termination_reason_log_table === "string" &&
+    params.bq_termination_reason_log_table.trim() !== ""
+      ? params.bq_termination_reason_log_table.trim()
+      : config.terminationReasonLogTableId;
   return { datasetId, tableId };
 }
 
@@ -95,6 +112,127 @@ function hasAdditionalCostLogChange(incoming, existing) {
   if (!additionalCostLogStringEquals(incoming?.NOTES, existing?.NOTES)) return true;
   if (!additionalCostLogValueEquals(incoming?.VALUE, existing?.VALUE)) return true;
   return false;
+}
+
+function terminationReasonLogStringEquals(a, b) {
+  const sa = a == null ? "" : String(a).trim();
+  const sb = b == null ? "" : String(b).trim();
+  return sa === sb;
+}
+
+/**
+ * Returns true when incoming termination log differs from latest existing log row.
+ */
+function hasTerminationReasonLogChange(incoming, existing) {
+  if (!existing) return true;
+  if (!terminationReasonLogStringEquals(incoming?.VALUE, existing?.VALUE)) return true;
+  if (!terminationReasonLogStringEquals(incoming?.NOTES, existing?.NOTES)) return true;
+  if (!terminationReasonLogStringEquals(incoming?.CANCELLED_BY, existing?.CANCELLED_BY)) return true;
+  if (!terminationReasonLogStringEquals(incoming?.TERMINATION_TYPE, existing?.TERMINATION_TYPE)) return true;
+  if (!terminationReasonLogStringEquals(incoming?.DNR_AT, existing?.DNR_AT)) return true;
+  if (!terminationReasonLogStringEquals(incoming?.CONTRACT_ID, existing?.CONTRACT_ID)) return true;
+  return false;
+}
+
+/**
+ * Write termination-reason log rows with append-on-change dedupe (no duplicate unchanged snapshots).
+ */
+async function writeTerminationReasonLogRows(terminationLogRows, insertIdBase, params = {}, options = {}) {
+  if (!terminationLogRows || terminationLogRows.length === 0) return { inserted: 0 };
+
+  let rowsToWrite = terminationLogRows;
+
+  const insertedKeys = options.insertedKeys instanceof Set ? options.insertedKeys : null;
+  if (insertedKeys) {
+    const filtered = [];
+    let droppedNotInserted = 0;
+    let keptNoCompositeKey = 0;
+    for (const row of rowsToWrite) {
+      const key = buildDealSheetPlacementCompositeKey(row?.DEAL_SHEET_ID, row?.PLACEMENT_ID);
+      if (!key) {
+        filtered.push(row);
+        keptNoCompositeKey++;
+        continue;
+      }
+      if (insertedKeys.has(key)) {
+        filtered.push(row);
+      } else {
+        droppedNotInserted++;
+      }
+    }
+    rowsToWrite = filtered;
+    if (droppedNotInserted > 0 || keptNoCompositeKey > 0) {
+      logLine(
+        `[termination-reason logs] gate-by-inserted-deal-sheets: droppedNotInserted=${droppedNotInserted} keptNoCompositeKey=${keptNoCompositeKey} remaining=${rowsToWrite.length}`
+      );
+    }
+  }
+
+  if (rowsToWrite.length === 0) {
+    logLine(`[termination-reason logs] SKIP: no rows survive inserted-deal-sheet gate`);
+    return { inserted: 0 };
+  }
+
+  try {
+    const logTarget = resolveTerminationReasonLogTarget(params);
+
+    let latestByKey;
+    try {
+      latestByKey = await fetchLatestTerminationReasonLogRowsByKeys(rowsToWrite, {
+        datasetId: logTarget.datasetId,
+        tableId: logTarget.tableId,
+      });
+    } catch (err) {
+      logLine(
+        `[termination-reason logs] latest-fetch failed; falling back to insert-without-compare: ${err?.message || err}`
+      );
+      latestByKey = new Map();
+    }
+
+    const filtered = [];
+    let unchangedSkipped = 0;
+    let newIncluded = 0;
+    let changedIncluded = 0;
+    for (const row of rowsToWrite) {
+      const key = buildTerminationReasonLogCompositeKey(row?.PLACEMENT_ID, row?.TERMINATION_DETAIL_ID);
+      if (!key) {
+        filtered.push(row);
+        newIncluded++;
+        continue;
+      }
+      const existing = latestByKey.get(key);
+      if (!existing) {
+        filtered.push(row);
+        newIncluded++;
+        continue;
+      }
+      if (hasTerminationReasonLogChange(row, existing)) {
+        filtered.push(row);
+        changedIncluded++;
+      } else {
+        unchangedSkipped++;
+      }
+    }
+    rowsToWrite = filtered;
+    logLine(
+      `[termination-reason logs] append-on-change: newIncluded=${newIncluded} changedIncluded=${changedIncluded} unchangedSkipped=${unchangedSkipped} remaining=${rowsToWrite.length}`
+    );
+
+    if (rowsToWrite.length === 0) {
+      logLine(`[termination-reason logs] SKIP: no rows changed vs latest log snapshot`);
+      return { inserted: 0 };
+    }
+
+    const result = await insertTerminationReasonLogBatch(rowsToWrite, insertIdBase, {
+      datasetId: logTarget.datasetId,
+      tableId: logTarget.tableId,
+      generatedUuidField: "ID",
+    });
+    return result;
+  } catch (err) {
+    logLine(`[termination-reason logs] write failed (non-fatal): ${err?.message || err}`);
+    return { inserted: 0, errorBatches: 1 };
+  }
 }
 
 /**
@@ -519,6 +657,23 @@ function buildRefreshAdditionalCostLogsSummary(action, additionalCostLogRows, lo
   return { attempted, inserted: 0, errorBatches: 0, rows };
 }
 
+function buildRefreshTerminationReasonLogsSummary(action, terminationLogRows, logResult) {
+  const rows = Array.isArray(terminationLogRows) ? terminationLogRows : [];
+  const attempted = rows.length;
+  if (action === "INSERTED" && logResult) {
+    return {
+      attempted,
+      inserted: logResult.inserted ?? 0,
+      errorBatches: logResult.errorBatches ?? 0,
+      rows,
+    };
+  }
+  if (attempted > 0 && action !== "INSERTED") {
+    return { attempted, inserted: 0, skipped_reason: "not inserted", rows };
+  }
+  return { attempted, inserted: 0, errorBatches: 0, rows };
+}
+
 async function refreshPlacementRecordToBigQuery(params = {}) {
   const startMs = Date.now();
   const compareIgnoreFields = Array.isArray(params.compare_ignore_fields)
@@ -561,14 +716,16 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     preloadedSubmittals.set(`${seed.jobId}:${seed.candidateId}`, seed.submittalRow);
   }
 
-  const { rows: enrichedRows, additionalCostLogRows } = await buildEnrichedRowsFromDealSheetCandidates(
-    [seed.preferredCandidateRow],
-    preloadedSubmittals,
-    {
-      allowedSubmittalCodes: params.organization_submittal_status_code || config.submittalStatusCodes,
-      persistDealSheetStatusFromCandidate: true,
-    }
-  );
+  const { rows: enrichedRows, additionalCostLogRows, terminationLogRows } =
+    await buildEnrichedRowsFromDealSheetCandidates(
+      [seed.preferredCandidateRow],
+      preloadedSubmittals,
+      {
+        allowedSubmittalCodes: params.organization_submittal_status_code || config.submittalStatusCodes,
+        persistDealSheetStatusFromCandidate: true,
+        fetchTerminationDetails: true,
+      }
+    );
   const row = enrichedRows[0] || null;
   if (!row) {
     return {
@@ -702,6 +859,13 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     });
   }
 
+  let terminationReasonLogWriteResult = null;
+  if (action === "INSERTED" && terminationLogRows.length > 0) {
+    terminationReasonLogWriteResult = await writeTerminationReasonLogRows(terminationLogRows, 0, params, {
+      insertedKeys: insertResult.insertedKeys instanceof Set ? insertResult.insertedKeys : new Set(),
+    });
+  }
+
   return {
     action,
     reason,
@@ -713,6 +877,11 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
       action,
       additionalCostLogRows,
       additionalCostLogWriteResult
+    ),
+    termination_reason_logs: buildRefreshTerminationReasonLogsSummary(
+      action,
+      terminationLogRows,
+      terminationReasonLogWriteResult
     ),
     resolved_ids: {
       placement_id: seed.placementId || normalizeNexusResourceId(row?.PLACEMENT_ID) || null,
@@ -1718,6 +1887,7 @@ module.exports = {
   parseJobSubmittalsPageQueryFromUrl,
   resolveNextNexusSubmittalsPageForCheckpoint,
   hasAdditionalCostLogChange,
+  hasTerminationReasonLogChange,
   additionalCostLogValueEquals,
   additionalCostLogStringEquals,
   ADDITIONAL_COST_LOG_VALUE_TOLERANCE,

@@ -74,6 +74,22 @@ function buildEndedDealSheetRoutingSentinel(projectId, datasetId) {
   return `${p}.${d}:ENDED_DOMAIN_ROUTED`;
 }
 
+const ENDED_TO_ACTIVE_TABLE = new Map([
+  [TABLE_ENDED_CYNET_HEALTH, TABLE_CYNET_HEALTH],
+  [TABLE_ENDED_CYNET_HEALTH_CANADA, TABLE_CYNET_HEALTH_CANADA],
+  [TABLE_ENDED_CYNET_LOCUMS, TABLE_CYNET_LOCUMS],
+]);
+
+/**
+ * @param {unknown} endedTableId
+ * @returns {string|null} paired active table id, or null if not an ended table
+ */
+function resolvePairedActiveTableId(endedTableId) {
+  const key = endedTableId == null ? "" : String(endedTableId).trim();
+  if (!key) return null;
+  return ENDED_TO_ACTIVE_TABLE.get(key) ?? null;
+}
+
 module.exports = {
   ACTIVE_DEAL_SHEET_TABLE_IDS,
   resolveActiveDealSheetTableId,
@@ -87,4 +103,5 @@ module.exports = {
   TABLE_ENDED_CYNET_HEALTH,
   TABLE_ENDED_CYNET_HEALTH_CANADA,
   TABLE_ENDED_CYNET_LOCUMS,
+  resolvePairedActiveTableId,
 };

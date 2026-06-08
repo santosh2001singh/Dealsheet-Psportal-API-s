@@ -19,6 +19,11 @@ const {
   mapDealSheetRatesListToBq,
   mapDealSheetUsersToBq,
   computeBqEndDateFromSubmittal,
+  isTerminationApiEligiblePlacementStatus,
+  extractTerminationReasonValue,
+  pickLatestTerminationDetailItem,
+  mapTerminationReasonLogRowForDealSheet,
+  API_OWNED_COLUMNS,
 } = require("./columnMappings");
 
 /** Sample rates with both CA (>8) and default (>40) OT bill_rate_codes */
@@ -972,4 +977,84 @@ test("mapDealSheetRatesListToBq leaves non-OT rates unchanged by state", () => {
   assert.equal(tx.PAY_RATE, 25.75);
   assert.equal(ca.BILL_RATE, 110);
   assert.equal(tx.BILL_RATE, 110);
+});
+
+test("isTerminationApiEligiblePlacementStatus allows ended/cancelled family only", () => {
+  assert.equal(isTerminationApiEligiblePlacementStatus("ENDED<30"), true);
+  assert.equal(isTerminationApiEligiblePlacementStatus("ended<30"), true);
+  assert.equal(isTerminationApiEligiblePlacementStatus("DID NOT START"), true);
+  assert.equal(isTerminationApiEligiblePlacementStatus("DID NOT ACCEPT"), true);
+  assert.equal(isTerminationApiEligiblePlacementStatus("CANCELLED"), true);
+  assert.equal(isTerminationApiEligiblePlacementStatus("CANCELED"), true);
+  assert.equal(isTerminationApiEligiblePlacementStatus("STARTED"), false);
+  assert.equal(isTerminationApiEligiblePlacementStatus("ENDED"), false);
+});
+
+test("extractTerminationReasonValue prefers cancellation_reason.value", () => {
+  const item = {
+    cancellation_reason: { value: "Other" },
+    early_term_reason: { value: "Other Job Opportunity" },
+  };
+  assert.equal(extractTerminationReasonValue(item), "Other");
+});
+
+test("extractTerminationReasonValue uses early_term_reason when cancellation absent", () => {
+  const item = {
+    early_term_reason: { value: "Other Job Opportunity" },
+    cancellation_reason: null,
+  };
+  assert.equal(extractTerminationReasonValue(item), "Other Job Opportunity");
+});
+
+test("mapTerminationReasonLogRowForDealSheet maps cancellation sample fields", () => {
+  const apiItem = {
+    id: 76581,
+    cancelled_by: "CLIENT",
+    notes: "client cancelled, changed shift last min\n",
+    cancellation_reason: { value: "Other" },
+    termination_type: null,
+    dnr_at: null,
+  };
+  const context = {
+    DEAL_SHEET_ID: 5210448,
+    PLACEMENT_ID: 1454975,
+    CONTRACT_ID: 100015,
+  };
+  const out = mapTerminationReasonLogRowForDealSheet(apiItem, context, "2026-06-03T10:00:00.000Z");
+  assert.equal(out.PLACEMENT_ID, 1454975);
+  assert.equal(out.CONTRACT_ID, 100015);
+  assert.equal(out.TERMINATION_DETAIL_ID, 76581);
+  assert.equal(out.CANCELLED_BY, "CLIENT");
+  assert.equal(out.VALUE, "Other");
+  assert.equal(out.NOTES, "client cancelled, changed shift last min");
+});
+
+test("mapTerminationReasonLogRowForDealSheet maps early_term sample fields", () => {
+  const apiItem = {
+    id: 76543,
+    cancelled_by: null,
+    notes: "Voluntary Cancel without notice",
+    early_term_reason: { value: "Other Job Opportunity" },
+    termination_type: "VOLUNTARY",
+    dnr_at: "AT_CLIENT_ONLY",
+  };
+  const context = { DEAL_SHEET_ID: 1, PLACEMENT_ID: 1457532, CONTRACT_ID: 100020 };
+  const out = mapTerminationReasonLogRowForDealSheet(apiItem, context, "2026-06-03T10:00:00.000Z");
+  assert.equal(out.VALUE, "Other Job Opportunity");
+  assert.equal(out.TERMINATION_TYPE, "VOLUNTARY");
+  assert.equal(out.DNR_AT, "AT_CLIENT_ONLY");
+});
+
+test("pickLatestTerminationDetailItem chooses newest modified_date", () => {
+  const items = [
+    { id: 1, modified_date: "2026-05-01T00:00:00Z", cancellation_reason: { value: "Old" } },
+    { id: 2, modified_date: "2026-06-01T00:00:00Z", cancellation_reason: { value: "New" } },
+  ];
+  const latest = pickLatestTerminationDetailItem(items);
+  assert.equal(latest.id, 2);
+  assert.equal(extractTerminationReasonValue(latest), "New");
+});
+
+test("TERMINATION_REASON is API-owned on deal sheet", () => {
+  assert.equal(API_OWNED_COLUMNS.has("TERMINATION_REASON"), true);
 });

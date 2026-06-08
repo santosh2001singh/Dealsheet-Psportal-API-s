@@ -8,7 +8,12 @@ const { randomUUID } = require("crypto");
 const config = require("./config");
 const { logLine, logError } = require("./logger");
 const { shouldExcludeRowFromBigQuery } = require("./bqRowExclusions");
-const { ACTIVE_DEAL_SHEET_TABLE_IDS, resolveActiveDealSheetTableId } = require("./recruiterDomainTables");
+const {
+  ACTIVE_DEAL_SHEET_TABLE_IDS,
+  ENDED_DEAL_SHEET_TABLE_IDS,
+  resolveActiveDealSheetTableId,
+  resolvePairedActiveTableId,
+} = require("./recruiterDomainTables");
 const { API_OWNED_COLUMNS, SYSTEM_CONTROLLED_COLUMNS } = require("./columnMappings");
 
 let bigquery;
@@ -512,6 +517,68 @@ async function fetchLatestAdditionalCostLogRowsByKeys(logRows, options = {}) {
 }
 
 /**
+ * Pair-key (PLACEMENT_ID|TERMINATION_DETAIL_ID) used for termination log dedupe lookup.
+ */
+function buildTerminationReasonLogCompositeKey(placementId, terminationDetailId) {
+  const pid = placementId == null ? "" : String(placementId).trim();
+  const tid = terminationDetailId == null ? "" : String(terminationDetailId).trim();
+  if (!pid || !tid) return "";
+  return `${pid}|${tid}`;
+}
+
+/**
+ * Returns Map<"PLACEMENT_ID|TERMINATION_DETAIL_ID", latest log row> from termination log table.
+ */
+async function fetchLatestTerminationReasonLogRowsByKeys(logRows, options = {}) {
+  const out = new Map();
+  if (!logRows || logRows.length === 0) return out;
+
+  const { datasetId, tableId } = resolveBqDatasetTable(options);
+  const pairMap = new Map();
+  for (const row of logRows) {
+    const key = buildTerminationReasonLogCompositeKey(row?.PLACEMENT_ID, row?.TERMINATION_DETAIL_ID);
+    if (!key || pairMap.has(key)) continue;
+    pairMap.set(key, {
+      pid: row?.PLACEMENT_ID == null ? "" : String(row.PLACEMENT_ID).trim(),
+      tid: row?.TERMINATION_DETAIL_ID == null ? "" : String(row.TERMINATION_DETAIL_ID).trim(),
+    });
+  }
+  const pairs = Array.from(pairMap.values());
+  if (!pairs.length) return out;
+
+  const chunkSize = 200;
+  for (let i = 0; i < pairs.length; i += chunkSize) {
+    const chunk = pairs.slice(i, i + chunkSize);
+    const wherePairs = chunk
+      .map(
+        ({ pid, tid }) =>
+          `(CAST(PLACEMENT_ID AS STRING) = '${escapeSqlString(pid)}' AND ` +
+          `CAST(TERMINATION_DETAIL_ID AS STRING) = '${escapeSqlString(tid)}')`
+      )
+      .join(" OR ");
+    const sql = `SELECT * EXCEPT(_rn)
+                 FROM (
+                   SELECT
+                     *,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY CAST(PLACEMENT_ID AS STRING), CAST(TERMINATION_DETAIL_ID AS STRING)
+                       ORDER BY DATE_AND_TIME DESC NULLS LAST
+                     ) AS _rn
+                   FROM \`${config.projectId}.${datasetId}.${tableId}\`
+                   WHERE ${wherePairs}
+                 )
+                 WHERE _rn = 1`;
+    const dbRows = await queryObjects(sql, chunk.length * 2);
+    for (const row of dbRows) {
+      const key = buildTerminationReasonLogCompositeKey(row?.PLACEMENT_ID, row?.TERMINATION_DETAIL_ID);
+      if (!key) continue;
+      out.set(key, row);
+    }
+  }
+  return out;
+}
+
+/**
  * Returns Map<"DEAL_SHEET_ID|PLACEMENT_ID", latest row object> from BigQuery
  */
 async function fetchLatestRowsByDealSheetPlacementPairs(rows, options = {}) {
@@ -698,6 +765,111 @@ function applyManualColumnsCarryForward(incomingRow, baselineRow) {
 }
 
 /**
+ * Freeze TENTATIVE_DATE from baseline when START_DATE is unchanged; keep incoming
+ * API value when START_DATE changed (then freeze again on subsequent same-start runs).
+ */
+function applyTentativeDateFreeze(incomingRow, baselineRow) {
+  if (!baselineRow || !incomingRow || typeof incomingRow !== "object") {
+    return { row: incomingRow, frozen: false };
+  }
+  const incomingStart = normalizeForCompare(incomingRow.START_DATE);
+  const baselineStart = normalizeForCompare(baselineRow.START_DATE);
+  if (incomingStart === baselineStart) {
+    return {
+      row: { ...incomingRow, TENTATIVE_DATE: baselineRow.TENTATIVE_DATE },
+      frozen: true,
+    };
+  }
+  return { row: incomingRow, frozen: false };
+}
+
+/**
+ * Freeze NEW_HIRE_DATE from baseline when present (first insert per placement only).
+ */
+function applyNewHireDateFreeze(incomingRow, baselineRow) {
+  if (!baselineRow || !incomingRow || typeof incomingRow !== "object") {
+    return { row: incomingRow, frozen: false };
+  }
+  if (isEmptyDateFieldValue(baselineRow.NEW_HIRE_DATE)) {
+    return { row: incomingRow, frozen: false };
+  }
+  return {
+    row: { ...incomingRow, NEW_HIRE_DATE: baselineRow.NEW_HIRE_DATE },
+    frozen: true,
+  };
+}
+
+/**
+ * Latest NEW_HIRE_DATE per DEAL_SHEET_ID+PLACEMENT_ID from paired active table.
+ * @param {object[]} rows
+ * @param {object} options - datasetId, tableId (ended table)
+ * @returns {Promise<Map<string, string>>}
+ */
+async function fetchNewHireDatesFromActiveTable(rows, options = {}) {
+  const out = new Map();
+  if (!rows || rows.length === 0) return out;
+
+  const { datasetId, tableId } = resolveBqDatasetTable(options);
+  const activeTableId = resolvePairedActiveTableId(tableId);
+  if (!activeTableId) return out;
+
+  const latestByKey = await fetchLatestRowsByDealSheetPlacementPairs(rows, {
+    datasetId,
+    tableId: activeTableId,
+  });
+  for (const [key, row] of latestByKey) {
+    if (isEmptyDateFieldValue(row?.NEW_HIRE_DATE)) continue;
+    out.set(key, String(row.NEW_HIRE_DATE));
+  }
+  return out;
+}
+
+/**
+ * For ended-table inserts, inherit NEW_HIRE_DATE from active when placement already exists there.
+ * @param {object[]} rows
+ * @param {object} options
+ * @returns {Promise<object[]>}
+ */
+async function resolveNewHireDatesForEndedRows(rows, options = {}) {
+  if (!rows || rows.length === 0) return rows;
+
+  const { tableId } = resolveBqDatasetTable(options);
+  const endedTableId = tableId == null ? "" : String(tableId).trim();
+  if (!ENDED_DEAL_SHEET_TABLE_IDS.includes(endedTableId)) return rows;
+
+  const needsLookup = [];
+  for (const row of rows) {
+    const dealType = row?.DEAL_TYPE == null ? "" : String(row.DEAL_TYPE).trim().toUpperCase();
+    if (dealType !== "DEAL") continue;
+    if (!isEmptyDateFieldValue(row.NEW_HIRE_DATE)) continue;
+    needsLookup.push(row);
+  }
+  if (needsLookup.length === 0) return rows;
+
+  const lookedUp = await fetchNewHireDatesFromActiveTable(needsLookup, options);
+  let inheritedCount = 0;
+  let stillEmptyCount = 0;
+  for (const row of needsLookup) {
+    const key = buildDealSheetPlacementCompositeKey(row?.DEAL_SHEET_ID, row?.PLACEMENT_ID);
+    if (!key) {
+      stillEmptyCount++;
+      continue;
+    }
+    const fromActive = lookedUp.get(key);
+    if (fromActive == null || fromActive === "") {
+      stillEmptyCount++;
+      continue;
+    }
+    row.NEW_HIRE_DATE = fromActive;
+    inheritedCount++;
+  }
+  logLine(
+    `[enriched sync] [BigQuery insertAll] ended NEW_HIRE_DATE inherit from active: inherited=${inheritedCount} stillEmpty=${stillEmptyCount}`
+  );
+  return rows;
+}
+
+/**
  * Compute insert ID for deduplication
  */
 function computeInsertId(obj, absoluteIndex, options = {}) {
@@ -780,6 +952,11 @@ function computeDealSheetFirstInsertDateStamps(row, dateTime) {
 
   if (dealType === "DEAL" && isEmptyDateFieldValue(row.NEW_HIRE_DATE)) {
     out.NEW_HIRE_DATE = String(dateTime);
+  }
+
+  if (dealType === "DEAL" && isEmptyDateFieldValue(row.ORIGINAL_START_DATE)) {
+    const sd = formatDateOnlyForSql(row.START_DATE);
+    if (sd != null) out.ORIGINAL_START_DATE = sd;
   }
 
   if (
@@ -1056,6 +1233,8 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     let moveRunrateKeptNull = 0;
     let isRejectedResetCount = 0;
     let manualColumnsCarriedTotal = 0;
+    let tentativeFrozenCount = 0;
+    let newHireFrozenCount = 0;
     for (const row of rowsToInsert) {
       const dsid = row?.DEAL_SHEET_ID == null ? "" : String(row.DEAL_SHEET_ID).trim();
       if (!dsid) {
@@ -1089,7 +1268,11 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
         changedIncluded++;
         const carryForward = applyManualColumnsCarryForward(row, existing);
         manualColumnsCarriedTotal += carryForward.carriedCount;
-        const moveRunrateAdjusted = applyMoveRunrateAppendOverride(carryForward.row, existing);
+        const tentativeAdjusted = applyTentativeDateFreeze(carryForward.row, existing);
+        if (tentativeAdjusted.frozen) tentativeFrozenCount++;
+        const newHireAdjusted = applyNewHireDateFreeze(tentativeAdjusted.row, existing);
+        if (newHireAdjusted.frozen) newHireFrozenCount++;
+        const moveRunrateAdjusted = applyMoveRunrateAppendOverride(newHireAdjusted.row, existing);
         const withRejectedReset = applyIsRejectedResetForChangedUpdate(moveRunrateAdjusted.row, existing);
         if (moveRunrateAdjusted.forcedFalse) moveRunrateForcedFalse++;
         if (moveRunrateAdjusted.keptNull) moveRunrateKeptNull++;
@@ -1103,6 +1286,8 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     logLine(
       `[enriched sync] [BigQuery insertAll] append-on-change(DEAL_SHEET_ID+PLACEMENT_ID): changedIncluded=${changedIncluded} noBaselineIncluded=${noBaselineIncluded} newRowSkippedByPlacementStatus=${newRowSkippedByPlacementStatus} missingPlacementIdCount=${missingPlacementIdCount} moveRunrateForcedFalse=${moveRunrateForcedFalse} moveRunrateKeptNull=${moveRunrateKeptNull} unchangedSkipped=${unchangedSkipped} remaining=${rowsToInsert.length}`
       + ` isRejectedResetCount=${isRejectedResetCount} manualColumnsCarriedTotal=${manualColumnsCarriedTotal}`
+      + ` tentativeFrozenCount=${tentativeFrozenCount}`
+      + ` newHireFrozenCount=${newHireFrozenCount}`
     );
   }
 
@@ -1152,6 +1337,11 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
       return next;
     });
   }
+
+  rowsToInsert = await resolveNewHireDatesForEndedRows(rowsToInsert, {
+    datasetId: options.datasetId,
+    tableId: options.tableId,
+  });
 
   const result = await insertAll(rowsToInsert, {
     insertIdBase,
@@ -1377,6 +1567,44 @@ async function insertAdditionalCostLogBatch(logRows, insertIdBase, options = {})
 
   logLine(
     `[additional-cost logs] [BigQuery insertAll] ${hasErrors ? "PARTIAL" : "OK"} attempted=${result.attempted} inserted=${result.inserted}`
+  );
+  return { inserted: result.inserted, attempted: result.attempted, errorBatches: hasErrors ? 1 : 0 };
+}
+
+/**
+ * Insert termination-reason audit logs (append-only snapshot per sync run).
+ */
+async function insertTerminationReasonLogBatch(logRows, insertIdBase, options = {}) {
+  if (!logRows || logRows.length === 0) {
+    logLine(`[termination-reason logs] [BigQuery insertAll] SKIP: no rows to insert`);
+    return { inserted: 0, attempted: 0, errorBatches: 0 };
+  }
+
+  const generatedUuidField =
+    typeof options.generatedUuidField === "string" && options.generatedUuidField.trim() !== ""
+      ? options.generatedUuidField.trim()
+      : "ID";
+  let rowsToInsert = logRows;
+  if (generatedUuidField) {
+    rowsToInsert = logRows.map((row) => {
+      const next = { ...row };
+      const raw = next[generatedUuidField];
+      const existing = raw == null ? "" : String(raw).trim();
+      if (!existing) next[generatedUuidField] = randomUUID();
+      return next;
+    });
+  }
+
+  const result = await insertAll(rowsToInsert, {
+    insertIdBase,
+    datasetId: options.datasetId,
+    tableId: options.tableId,
+    insertIdField: "ID",
+  });
+  const hasErrors = result.errors && result.errors.length > 0;
+
+  logLine(
+    `[termination-reason logs] [BigQuery insertAll] ${hasErrors ? "PARTIAL" : "OK"} attempted=${result.attempted} inserted=${result.inserted}`
   );
   return { inserted: result.inserted, attempted: result.attempted, errorBatches: hasErrors ? 1 : 0 };
 }
@@ -1719,7 +1947,7 @@ function formatDateOnlyForSql(value) {
 function buildActiveDealSheetsUnionSql(datasetId) {
   return ACTIVE_DEAL_SHEET_TABLE_IDS.map(
     (tableId) =>
-      `SELECT DEAL_SHEET_ID, PLACEMENT_ID, CONTRACT_ID, START_DATE, EDIT_DATE, CANDIDATE_NEXUS_ID, CANDIDATE_EMAIL, PHONE_NUMBER, NEXUS_INTERNAL_JOB_ID, CLIENT_ID, DEAL_TYPE FROM \`${config.projectId}.${datasetId}.${tableId}\``
+      `SELECT DEAL_SHEET_ID, PLACEMENT_ID, CONTRACT_ID, START_DATE, ORIGINAL_START_DATE, EDIT_DATE, CANDIDATE_NEXUS_ID, CANDIDATE_EMAIL, PHONE_NUMBER, NEXUS_INTERNAL_JOB_ID, CLIENT_ID, DEAL_TYPE FROM \`${config.projectId}.${datasetId}.${tableId}\``
   ).join(" UNION ALL ");
 }
 
@@ -1896,6 +2124,106 @@ async function fetchContractIdsForExtensions(extensionRows, options = {}) {
   return out;
 }
 
+/**
+ * For EXTENSION rows, find original DEAL ORIGINAL_START_DATE (or START_DATE fallback)
+ * across active tables.
+ * @param {Array<{placementId: number, candidateNexusId: number, candidateEmail?: string|null, phoneNumber?: string|null, clientId: number, startDate?: *}>} extensionRows
+ * @param {object} [options]
+ * @returns {Promise<Map<string, string|null>>} placementId string -> YYYY-MM-DD or null
+ */
+async function fetchOriginalStartDatesForExtensions(extensionRows, options = {}) {
+  const out = new Map();
+  if (!extensionRows || extensionRows.length === 0) return out;
+
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+  const unionSql = buildActiveDealSheetsUnionSql(datasetId);
+  const chunkSize = 100;
+
+  for (let i = 0; i < extensionRows.length; i += chunkSize) {
+    const chunk = extensionRows.slice(i, i + chunkSize);
+    const structLiterals = [];
+
+    for (const ext of chunk) {
+      const pid = Number(ext.placementId);
+      const cand = Number(ext.candidateNexusId);
+      const client = Number(ext.clientId);
+      if (!Number.isFinite(pid) || !Number.isFinite(cand)) continue;
+      if (!Number.isFinite(client)) continue;
+
+      const email = escapeSqlString(
+        ext.candidateEmail == null ? "" : String(ext.candidateEmail).trim().toLowerCase()
+      );
+      const phone = escapeSqlString(
+        ext.phoneNumber == null ? "" : String(ext.phoneNumber).trim()
+      );
+      const startDateSql = (() => {
+        const d = formatDateOnlyForSql(ext.startDate);
+        return d == null ? "CAST(NULL AS DATE)" : `DATE '${escapeSqlString(d)}'`;
+      })();
+
+      structLiterals.push(
+        `STRUCT(${Math.trunc(pid)} AS placement_id, ${Math.trunc(cand)} AS candidate_nexus_id, '${email}' AS candidate_email, '${phone}' AS phone_number, ${Math.trunc(client)} AS client_id, ${startDateSql} AS start_date)`
+      );
+    }
+
+    if (structLiterals.length === 0) continue;
+
+    const sql = `
+      WITH extensions AS (
+        SELECT * FROM UNNEST([${structLiterals.join(", ")}])
+      ),
+      deals AS (
+        SELECT
+          COALESCE(ORIGINAL_START_DATE, START_DATE) AS orig_start,
+          CANDIDATE_NEXUS_ID,
+          LOWER(IFNULL(CANDIDATE_EMAIL, '')) AS candidate_email_norm,
+          IFNULL(PHONE_NUMBER, '') AS phone_norm,
+          CLIENT_ID,
+          START_DATE,
+          EDIT_DATE
+        FROM (${unionSql})
+        WHERE UPPER(TRIM(DEAL_TYPE)) = 'DEAL'
+          AND COALESCE(ORIGINAL_START_DATE, START_DATE) IS NOT NULL
+      ),
+      joined AS (
+        SELECT
+          ext.placement_id,
+          d.orig_start,
+          ROW_NUMBER() OVER (
+            PARTITION BY ext.placement_id
+            ORDER BY d.START_DATE DESC NULLS LAST, d.EDIT_DATE DESC NULLS LAST
+          ) AS rn
+        FROM extensions ext
+        LEFT JOIN deals d
+          ON d.CANDIDATE_NEXUS_ID = ext.candidate_nexus_id
+         AND d.candidate_email_norm = ext.candidate_email
+         AND d.phone_norm = ext.phone_number
+         AND d.CLIENT_ID = ext.client_id
+         AND (ext.start_date IS NULL OR d.START_DATE <= ext.start_date)
+      )
+      SELECT
+        CAST(placement_id AS STRING) AS placement_id,
+        orig_start
+      FROM joined
+      WHERE rn = 1
+    `;
+
+    const rows = await queryObjects(sql, structLiterals.length);
+    for (const row of rows) {
+      const pid = row?.placement_id;
+      if (pid == null || String(pid).trim() === "") continue;
+      const raw = row?.orig_start;
+      const formatted = formatDateOnlyForSql(raw);
+      out.set(String(pid).trim(), formatted);
+    }
+  }
+
+  return out;
+}
+
 module.exports = {
   queryObjects,
   fetchExistingDealSheetIdsSet,
@@ -1910,6 +2238,9 @@ module.exports = {
   fetchLatestTwoRowsByDealSheetIdsAcrossActive,
   fetchLatestRowsByDealSheetPlacementPairs,
   fetchLatestAdditionalCostLogRowsByKeys,
+  buildTerminationReasonLogCompositeKey,
+  fetchLatestTerminationReasonLogRowsByKeys,
+  insertTerminationReasonLogBatch,
   insertAll,
   insertEnrichedDealSheetBatch,
   insertEnrichedDealSheetBatchRouted,
@@ -1935,9 +2266,14 @@ module.exports = {
   applyMoveRunrateAppendOverride,
   applyIsRejectedResetForChangedUpdate,
   applyManualColumnsCarryForward,
+  applyTentativeDateFreeze,
+  applyNewHireDateFreeze,
+  fetchNewHireDatesFromActiveTable,
+  resolveNewHireDatesForEndedRows,
   computeDealSheetFirstInsertDateStamps,
   fetchContractIdsByDealSheetIds,
   fetchContractIdsForExtensions,
+  fetchOriginalStartDatesForExtensions,
   buildActiveDealSheetsUnionSql,
   formatDateOnlyForSql,
 };

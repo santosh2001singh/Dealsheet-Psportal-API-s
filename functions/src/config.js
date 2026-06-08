@@ -12,6 +12,10 @@ const config = {
   rateChangeLogTableId: process.env.BQ_RATE_CHANGE_LOG_TABLE || "ch_rate_change_logs",
   additionalCostLogDatasetId: process.env.BQ_ADDITIONAL_COST_LOG_DATASET || "rr_project_data",
   additionalCostLogTableId: process.env.BQ_ADDITIONAL_COST_LOG_TABLE || "ch_additional_cost_logs",
+  terminationReasonLogDatasetId:
+    process.env.BQ_TERMINATION_REASON_LOG_DATASET || "rr_project_data",
+  terminationReasonLogTableId:
+    process.env.BQ_TERMINATION_REASON_LOG_TABLE || "ch_termination_reason_logs",
 
   batchSize: parseInt(process.env.BATCH_SIZE || "300", 10),
   /** Nexus job-submittals per_page (deal-sheet sync paths); override via PER_PAGE */
