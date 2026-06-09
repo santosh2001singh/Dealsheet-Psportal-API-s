@@ -1642,11 +1642,17 @@ async function getActiveDealSheetTotalRowCount(options = {}) {
   return n == null ? null : Number(n);
 }
 
+function normalizePlacementStatusFromBigQuery(value) {
+  if (value == null) return null;
+  const s = String(value).trim().toUpperCase();
+  return s === "" ? null : s;
+}
+
 /**
  * Update-sync targets: one row per DEAL_SHEET_ID (latest row); PLACEMENT_ID-only when DEAL_SHEET_ID is null.
  * @param {object} [options]
  * @param {string} [options.datasetId]
- * @returns {Promise<Array<{deal_sheet_id: string|null, placement_id: string|null, table_id: string}>>}
+ * @returns {Promise<Array<{deal_sheet_id: string|null, placement_id: string|null, table_id: string, placement_status: string|null}>>}
  */
 async function fetchActiveDealSheetUpdateTargets(options = {}) {
   const datasetId =
@@ -1661,11 +1667,13 @@ async function fetchActiveDealSheetUpdateTargets(options = {}) {
   for (const tableId of ACTIVE_DEAL_SHEET_TABLE_IDS) {
     const sqlByDealSheet = `SELECT
       CAST(DEAL_SHEET_ID AS STRING) AS deal_sheet_id,
-      CAST(PLACEMENT_ID AS STRING) AS placement_id
+      CAST(PLACEMENT_ID AS STRING) AS placement_id,
+      UPPER(TRIM(CAST(PLACEMENT_STATUS AS STRING))) AS placement_status
     FROM (
       SELECT
         DEAL_SHEET_ID,
         PLACEMENT_ID,
+        PLACEMENT_STATUS,
         ROW_NUMBER() OVER (
           PARTITION BY CAST(DEAL_SHEET_ID AS STRING)
           ORDER BY DATE_AND_TIME DESC NULLS LAST
@@ -1683,14 +1691,17 @@ async function fetchActiveDealSheetUpdateTargets(options = {}) {
       if (seenDealSheets.has(dedupeKey)) continue;
       seenDealSheets.add(dedupeKey);
       const placement_id = row?.placement_id == null ? null : String(row.placement_id).trim() || null;
-      out.push({ deal_sheet_id, placement_id, table_id: tableId });
+      const placement_status = normalizePlacementStatusFromBigQuery(row?.placement_status);
+      out.push({ deal_sheet_id, placement_id, table_id: tableId, placement_status });
     }
 
     const sqlByPlacementFallback = `SELECT
-      CAST(PLACEMENT_ID AS STRING) AS placement_id
+      CAST(PLACEMENT_ID AS STRING) AS placement_id,
+      UPPER(TRIM(CAST(PLACEMENT_STATUS AS STRING))) AS placement_status
     FROM (
       SELECT
         PLACEMENT_ID,
+        PLACEMENT_STATUS,
         ROW_NUMBER() OVER (
           PARTITION BY CAST(PLACEMENT_ID AS STRING)
           ORDER BY DATE_AND_TIME DESC NULLS LAST
@@ -1707,7 +1718,8 @@ async function fetchActiveDealSheetUpdateTargets(options = {}) {
       const dedupeKey = `pid|${placement_id}`;
       if (seenPlacementFallback.has(dedupeKey)) continue;
       seenPlacementFallback.add(dedupeKey);
-      out.push({ deal_sheet_id: null, placement_id, table_id: tableId });
+      const placement_status = normalizePlacementStatusFromBigQuery(row?.placement_status);
+      out.push({ deal_sheet_id: null, placement_id, table_id: tableId, placement_status });
     }
   }
 

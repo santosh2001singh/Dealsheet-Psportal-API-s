@@ -48,7 +48,7 @@ curl "https://<region>-cynetdatabase.cloudfunctions.net/dealSheetSync?max_candid
 
 ### 2. `dealSheetSyncTrigger` (Scheduled — insert only)
 
-Runs every **4 hours at :00** Eastern (`01:00, 05:00, 09:00, 13:00, 17:00, 21:00`). Writes to **domain-routed active** tables — no `bq_table` on the function.
+Runs **hourly at :00** Eastern from **9:00 AM through 7:00 PM** (`09:00`–`19:00`). Writes to **domain-routed active** tables — no `bq_table` on the function.
 
 - **Skips insert** if **`DEAL_SHEET_ID` or `PLACEMENT_ID`** already exists in BigQuery (checked before enrich and again at insert).
 - **`append_on_change_by_dealsheet` is off** — no updates on this trigger; insert-only.
@@ -56,11 +56,11 @@ Runs every **4 hours at :00** Eastern (`01:00, 05:00, 09:00, 13:00, 17:00, 21:00
 - **First row** for net-new keys: **`STARTED` or `BOOKED`** only (`first_insert_placement_status_allowlist`).
 - **Row filter:** `START_DATE >= 2026-05-01` (UTC).
 
-Does **not** refresh existing deal sheets — use **`dealSheetSyncUpdateTrigger`** (runs **30 minutes later** on the same hours).
+Does **not** refresh existing deal sheets — use **`dealSheetSyncUpdateTrigger`** (runs **30 minutes later** each hour, 9:30 AM–7:30 PM Eastern).
 
 ### 2b. `dealSheetSyncUpdateTrigger` (Scheduled — updates)
 
-Runs at **:30** Eastern on the same hours as the insert trigger.
+Runs **hourly at :30** Eastern from **9:30 AM through 7:30 PM** (30 minutes after each insert trigger run).
 
 1. Loads one target per **`DEAL_SHEET_ID`** from all three active domain tables (latest row per deal sheet). Rows with null deal sheet use **`PLACEMENT_ID`** as fallback only.
 2. For each target (batched, env `DEAL_SHEET_UPDATE_TRIGGER_MAX_PAIRS` per run, default **500**): Nexus refresh by **deal sheet id** (or placement fallback) → enrich → compare **all business columns** to the **latest BigQuery row for that deal sheet** → **append** if different (ignores `ID`, `DATE_AND_TIME`, `IS_REJECTED`). Does not create first rows.

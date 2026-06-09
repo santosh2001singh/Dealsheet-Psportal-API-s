@@ -376,7 +376,7 @@ exports.peoplestrongEmployeeDetailsSyncTrigger = onSchedule(
  */
 exports.dealSheetSyncTrigger = onSchedule(
   {
-    schedule: "0 1,5,9,13,17,21 * * *",
+    schedule: "0 9-19 * * *",
     timeZone: "America/New_York",
     region: REGION,
     timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
@@ -421,12 +421,12 @@ exports.dealSheetSyncTrigger = onSchedule(
 );
 
 /**
- * Scheduled: 30 minutes after insert trigger (:30 Eastern on the same hours).
+ * Scheduled: hourly :30 Eastern, 9:30 AM–7:30 PM (30 min after each insert trigger run).
  * Loads existing DEAL_SHEET_IDs from BigQuery (placement_id fallback when deal sheet null), refreshes via Nexus, appends on column diff vs latest deal-sheet row.
  */
 exports.dealSheetSyncUpdateTrigger = onSchedule(
   {
-    schedule: "30 1,5,9,13,17,21 * * *",
+    schedule: "30 9-19 * * *",
     timeZone: "America/New_York",
     region: REGION,
     timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
@@ -442,7 +442,7 @@ exports.dealSheetSyncUpdateTrigger = onSchedule(
       const maxPairsPerRun = resolveDealSheetUpdateTriggerMaxPairs();
 
       logLine(
-        `[dealSheetSyncUpdateTrigger] Scheduled update: cynetdatabase.${bqDataset}; BQ deal_sheet targets -> Nexus refresh; baseline=deal_sheet_id; max_pairs_per_run=${maxPairsPerRun}; checkpoint_key=${ACTIVE_UPDATE_SYNC_CHECKPOINT_KEY}; START_DATE>=2026-05-01`
+        `[dealSheetSyncUpdateTrigger] Scheduled update: cynetdatabase.${bqDataset}; BQ deal_sheet targets -> Nexus refresh; baseline=deal_sheet_id; priority=STARTED,BOOKED,ACTIVE (all each run); batch=ENDED,ENDED<30,DID NOT START,DID NOT ACCEPT+unknown; max_pairs_per_run=${maxPairsPerRun} (batch only); checkpoint_key=${ACTIVE_UPDATE_SYNC_CHECKPOINT_KEY}; START_DATE>=2026-05-01`
       );
       logLine("[dealSheetSyncUpdateTrigger] Invoking syncExistingActiveDealSheetUpdatesFromBigQuery");
 
@@ -458,7 +458,7 @@ exports.dealSheetSyncUpdateTrigger = onSchedule(
       });
 
       logLine(
-        `[dealSheetSyncUpdateTrigger] Pipeline result checked=${result.checked} appended=${result.appended} no_change=${result.no_change} not_found=${result.not_found} no_baseline=${result.no_baseline ?? 0} skipped_date=${result.skipped_date} errors=${result.errors} targetTotal=${result.targetTotal ?? result.pairTotal ?? "n/a"} targetOffsetEnd=${result.targetOffsetEnd ?? result.pairOffsetEnd ?? "n/a"} hasMore=${result.hasMore ? "yes" : "no"} elapsed=${result.elapsed || "n/a"}`
+        `[dealSheetSyncUpdateTrigger] Pipeline result checked=${result.checked} appended=${result.appended} no_change=${result.no_change} not_found=${result.not_found} no_baseline=${result.no_baseline ?? 0} skipped_date=${result.skipped_date} errors=${result.errors} priorityTotal=${result.priorityTotal ?? "n/a"} priorityChecked=${result.priorityChecked ?? "n/a"} batchTotal=${result.batchTotal ?? "n/a"} batchCheckedThisRun=${result.batchCheckedThisRun ?? "n/a"} batchOffsetEnd=${result.batchOffsetEnd ?? result.targetOffsetEnd ?? "n/a"} targetTotal=${result.targetTotal ?? result.pairTotal ?? "n/a"} hasMore=${result.hasMore ? "yes" : "no"} elapsed=${result.elapsed || "n/a"}`
       );
 
       return { success: true, result };
@@ -587,7 +587,7 @@ exports.dealSheetSyncOfferRejected = onRequest(
  */
 exports.rateChangeLogSyncTrigger = onSchedule(
   {
-    schedule: "0 1,5,9,13,17,21 * * *",
+    schedule: "0 9-19 * * *",
     timeZone: "America/New_York",
     region: REGION,
     timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
@@ -600,7 +600,7 @@ exports.rateChangeLogSyncTrigger = onSchedule(
 
     return withTimingAsync("rateChangeLogSyncTrigger", async () => {
       logLine(
-        "[rateChangeLogSyncTrigger] Scheduled (every 4h Eastern): BQ CONTRACT_ID scan -> ch_rate_change_logs (RATE_CHANGE=YES on latest row); skip existing CONTRACT_ID+EFFECTIVE_DATE"
+        "[rateChangeLogSyncTrigger] Scheduled (hourly :00 Eastern, 9 AM–7 PM): BQ CONTRACT_ID scan -> ch_rate_change_logs (RATE_CHANGE=YES on latest row); skip existing CONTRACT_ID+EFFECTIVE_DATE"
       );
       logLine("[rateChangeLogSyncTrigger] Invoking syncRateChangeLogsFromBigQuery");
 

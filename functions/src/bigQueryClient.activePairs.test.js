@@ -9,6 +9,8 @@ test("fetchActiveDealSheetUpdateTargets partitions by DEAL_SHEET_ID with placeme
   assert.ok(fnStart >= 0, "fetchActiveDealSheetUpdateTargets should exist");
   const fnBody = source.slice(fnStart, fnStart + 3500);
   assert.equal(fnBody.includes("PARTITION BY CAST(DEAL_SHEET_ID AS STRING)"), true);
+  assert.equal(fnBody.includes("PLACEMENT_STATUS"), true);
+  assert.equal(fnBody.includes("placement_status"), true);
   assert.equal(fnBody.includes("DEAL_SHEET_ID IS NULL AND PLACEMENT_ID IS NOT NULL"), true);
   assert.equal(fnBody.includes("PARTITION BY CAST(PLACEMENT_ID AS STRING)"), true);
   assert.equal(fnBody.includes("deal_sheet_id: null"), true);

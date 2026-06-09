@@ -93,6 +93,16 @@ test("dealSheetSyncTrigger is insert-only and skips existing deal sheet or place
   assert.equal(block.includes("max_pages"), false);
 });
 
+test("dealSheetSyncTrigger runs hourly at :00 Eastern 9 AM through 7 PM", () => {
+  const filePath = path.join(__dirname, "index.js");
+  const source = fs.readFileSync(filePath, "utf8");
+  const block = extractDealSheetSyncTriggerBlock(source);
+
+  assert.notEqual(block, "", "dealSheetSyncTrigger block should exist");
+  assert.equal(block.includes('schedule: "0 9-19 * * *"'), true);
+  assert.equal(block.includes('timeZone: "America/New_York"'), true);
+});
+
 test("rateChangeLogSyncTrigger uses BigQuery CONTRACT_ID scan (no Nexus pipeline)", () => {
   const filePath = path.join(__dirname, "index.js");
   const source = fs.readFileSync(filePath, "utf8");
@@ -106,6 +116,8 @@ test("rateChangeLogSyncTrigger uses BigQuery CONTRACT_ID scan (no Nexus pipeline
   assert.equal(block.includes("only_new_deal_sheets"), false);
   assert.equal(block.includes("PERM_STARTS,ACTIVE,BOOKED"), false);
   assert.equal(block.includes('bq_table: "ch_rate_change_logs"'), true);
+  assert.equal(block.includes('schedule: "0 9-19 * * *"'), true);
+  assert.equal(block.includes('timeZone: "America/New_York"'), true);
 });
 
 function extractRefreshDealSheetByPlacementIdBlock(source) {
@@ -135,7 +147,7 @@ test("dealSheetSyncUpdateTrigger uses deal-sheet targets and deal_sheet_id basel
   const block = extractDealSheetSyncUpdateTriggerBlock(source);
 
   assert.notEqual(block, "", "dealSheetSyncUpdateTrigger block should exist");
-  assert.equal(block.includes('schedule: "30 1,5,9,13,17,21 * * *"'), true);
+  assert.equal(block.includes('schedule: "30 9-19 * * *"'), true);
   assert.equal(block.includes("syncExistingActiveDealSheetUpdatesFromBigQuery"), true);
   assert.equal(block.includes("ACTIVE_UPDATE_SYNC_CHECKPOINT_KEY"), true);
   assert.equal(block.includes("resume_from_checkpoint: true"), true);

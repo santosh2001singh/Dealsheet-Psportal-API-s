@@ -10,12 +10,12 @@ and writes enriched rows to **one of** (by `ASSIGNMENT_RECRUITER_EMAIL` domain):
 - `cynetdatabase.rr_project_data.cynet_health_deal_sheet` — `@cynethealth.com` and default for unknown/other domains
 - `cynetdatabase.rr_project_data.cynet_locums_deal_sheet` — `@cynetlocums.com`
 
-**Scheduled job:** `dealSheetSyncTrigger` runs **every 4 hours in `America/New_York`**, aligned so **9:00 AM Eastern** is included (local hours **01:00, 05:00, 09:00, 13:00, 17:00, 21:00**). It does **not** pass `bq_table`, so inserts are domain-routed. For HTTP runs with `only_new=true`, each row’s `DEAL_SHEET_ID` is checked only in that row’s **resolved** target table (no duplicate deal sheets per domain table).
+**Scheduled job:** `dealSheetSyncTrigger` runs **hourly at :00 in `America/New_York`**, from **9:00 AM through 7:00 PM Eastern** (cron `0 9-19 * * *`). It does **not** pass `bq_table`, so inserts are domain-routed. For HTTP runs with `only_new=true`, each row’s `DEAL_SHEET_ID` is checked only in that row’s **resolved** target table (no duplicate deal sheets per domain table).
 
 **Scheduled active sync (split):**
 
-- **`dealSheetSyncTrigger` (:00 ET, every 4h):** Insert only when **`DEAL_SHEET_ID` and `PLACEMENT_ID` are both new** in BQ (no append-on-change). Nexus **`PERM_STARTS,ACTIVE,BOOKED`**, full list pagination. First row: **`STARTED,BOOKED`** only. `START_DATE >= 2026-05-01`.
-- **`dealSheetSyncUpdateTrigger` (:30 ET, same hours):** One target per **`DEAL_SHEET_ID`** from BQ (`PLACEMENT_ID` fallback if deal sheet null). Nexus refresh by deal sheet, append when **business columns** differ vs latest deal-sheet row (no first-row inserts). Cursor: **`active-deal-sheet-update-cursor`**; **`DEAL_SHEET_UPDATE_TRIGGER_MAX_PAIRS`** per run (default 500).
+- **`dealSheetSyncTrigger` (:00 ET, hourly 9 AM–7 PM):** Insert only when **`DEAL_SHEET_ID` and `PLACEMENT_ID` are both new** in BQ (no append-on-change). Nexus **`PERM_STARTS,ACTIVE,BOOKED`**, full list pagination. First row: **`STARTED,BOOKED`** only. `START_DATE >= 2026-05-01`.
+- **`dealSheetSyncUpdateTrigger` (:30 ET, hourly 9:30 AM–7:30 PM):** One target per **`DEAL_SHEET_ID`** from active BQ tables (`PLACEMENT_ID` fallback if deal sheet null). Nexus refresh by deal sheet, append when **business columns** differ vs latest deal-sheet row (no first-row inserts). **Two-tier sync:** every run refreshes **all** targets whose latest `PLACEMENT_STATUS` is **`STARTED`**, **`BOOKED`**, or **`ACTIVE`**; then processes up to **`DEAL_SHEET_UPDATE_TRIGGER_MAX_PAIRS`** (default 500) from the batch tier (`ENDED`, `ENDED<30`, `DID NOT START`, `DID NOT ACCEPT`, and any other/unknown status). Batch cursor: **`active-deal-sheet-update-cursor`** (`batchOffset` / `batchTotal` only).
 
 ## 1) Environment configuration
 

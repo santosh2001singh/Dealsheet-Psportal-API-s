@@ -1671,6 +1671,32 @@ async function syncRateChangeLogsFromBigQuery(params = {}) {
   };
 }
 
+const UPDATE_SYNC_PRIORITY_PLACEMENT_STATUSES = new Set(["STARTED", "BOOKED", "ACTIVE"]);
+
+function normalizeUpdateSyncPlacementStatusKey(status) {
+  if (status == null) return "";
+  return String(status).trim().toUpperCase();
+}
+
+/**
+ * Split active update targets: STARTED/BOOKED/ACTIVE every run; ended-family + unknown in batch tier.
+ * @param {Array<{deal_sheet_id?: string|null, placement_id?: string|null, table_id?: string, placement_status?: string|null}>} targets
+ * @returns {{priorityTargets: typeof targets, batchTargets: typeof targets}}
+ */
+function splitActiveDealSheetUpdateTargetsByPlacementStatus(targets) {
+  const priorityTargets = [];
+  const batchTargets = [];
+  for (const target of targets || []) {
+    const key = normalizeUpdateSyncPlacementStatusKey(target?.placement_status);
+    if (key !== "" && UPDATE_SYNC_PRIORITY_PLACEMENT_STATUSES.has(key)) {
+      priorityTargets.push(target);
+    } else {
+      batchTargets.push(target);
+    }
+  }
+  return { priorityTargets, batchTargets };
+}
+
 /**
  * Build refresh params for scheduled active update (same identifier pattern as refreshDealSheetByPlacementId).
  * @param {{deal_sheet_id?: string|null, placement_id?: string|null, table_id?: string}} target
@@ -1719,34 +1745,33 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
       ? params.generated_uuid_field.trim()
       : "ID";
 
-  logLine(
-    `[update sync] === syncExistingActiveDealSheetUpdatesFromBigQuery START === dataset=${effectiveDatasetId} maxPairsPerRun=${maxPairsPerRun} checkpointKey=${checkpointKey} resume=${resumeFromCheckpoint ? "yes" : "no"}`
-  );
-
   const allTargets = await fetchActiveDealSheetUpdateTargets({ datasetId: effectiveDatasetId });
+  const { priorityTargets, batchTargets } = splitActiveDealSheetUpdateTargetsByPlacementStatus(allTargets);
+  const priorityTotal = priorityTargets.length;
+  const batchTotal = batchTargets.length;
   const targetTotal = allTargets.length;
 
-  let targetOffset = 0;
+  let batchOffset = 0;
   const checkpointRef = resumeFromCheckpoint ? getCheckpointRef(checkpointKey) : null;
   if (checkpointRef) {
     try {
       const snap = await checkpointRef.get();
       if (snap.exists) {
         const data = snap.data() || {};
-        const savedTotal = Number(data.targetTotal ?? data.pairTotal);
-        const savedOffset = Number(data.targetOffset ?? data.pairOffset);
+        const savedBatchTotal = Number(data.batchTotal);
+        const savedBatchOffset = Number(data.batchOffset);
         if (
-          Number.isFinite(savedTotal) &&
-          savedTotal === targetTotal &&
-          Number.isFinite(savedOffset) &&
-          savedOffset >= 0 &&
-          savedOffset < targetTotal
+          Number.isFinite(savedBatchTotal) &&
+          savedBatchTotal === batchTotal &&
+          Number.isFinite(savedBatchOffset) &&
+          savedBatchOffset >= 0 &&
+          savedBatchOffset < batchTotal
         ) {
-          targetOffset = Math.trunc(savedOffset);
-          logLine(`[update sync] checkpoint resume targetOffset=${targetOffset} targetTotal=${targetTotal}`);
+          batchOffset = Math.trunc(savedBatchOffset);
+          logLine(`[update sync] checkpoint resume batchOffset=${batchOffset} batchTotal=${batchTotal}`);
         } else {
           logLine(
-            `[update sync] checkpoint ignored (stale targetTotal/offset savedTotal=${data.targetTotal ?? data.pairTotal} savedOffset=${data.targetOffset ?? data.pairOffset} currentTotal=${targetTotal})`
+            `[update sync] checkpoint ignored (stale batchTotal/offset savedBatchTotal=${data.batchTotal} savedBatchOffset=${data.batchOffset} currentBatchTotal=${batchTotal})`
           );
         }
       }
@@ -1755,7 +1780,15 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
     }
   }
 
-  const slice = allTargets.slice(targetOffset, targetOffset + maxPairsPerRun);
+  const batchSlice = batchTargets.slice(batchOffset, batchOffset + maxPairsPerRun);
+  const slice = [...priorityTargets, ...batchSlice];
+  const priorityCheckedPlanned = priorityTotal;
+  const batchCheckedPlanned = batchSlice.length;
+
+  logLine(
+    `[update sync] === syncExistingActiveDealSheetUpdatesFromBigQuery START === dataset=${effectiveDatasetId} maxPairsPerRun=${maxPairsPerRun} checkpointKey=${checkpointKey} resume=${resumeFromCheckpoint ? "yes" : "no"} priority=${priorityTotal} batch=${batchTotal} batchOffset=${batchOffset} slice=${slice.length} (priorityAll=${priorityCheckedPlanned} batchThisRun=${batchCheckedPlanned})`
+  );
+
   const concurrency = Math.max(1, Math.min(Number(config.fetchAllMax) || 20, 20));
 
   let checked = 0;
@@ -1817,28 +1850,28 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
     }
   }
 
-  const targetOffsetEnd = targetOffset + slice.length;
-  const hasMore = targetOffsetEnd < targetTotal;
+  const batchOffsetEnd = batchOffset + batchSlice.length;
+  const hasMore = batchOffsetEnd < batchTotal;
+  const priorityChecked = Math.min(checked, priorityCheckedPlanned);
+  const batchCheckedThisRun = Math.max(0, checked - priorityChecked);
 
   if (checkpointRef) {
     try {
       if (!hasMore && clearCheckpointOnComplete) {
         await checkpointRef.delete();
-        logLine(`[update sync] checkpoint deleted key=${checkpointKey} (full pass complete)`);
+        logLine(`[update sync] checkpoint deleted key=${checkpointKey} (batch pass complete)`);
       } else if (hasMore) {
         await checkpointRef.set(
           {
             key: checkpointKey,
-            targetOffset: targetOffsetEnd,
-            targetTotal,
-            pairOffset: targetOffsetEnd,
-            pairTotal: targetTotal,
+            batchOffset: batchOffsetEnd,
+            batchTotal,
             updatedAt: new Date().toISOString(),
           },
           { merge: true }
         );
         logLine(
-          `[update sync] checkpoint saved key=${checkpointKey} targetOffset=${targetOffsetEnd} targetTotal=${targetTotal}`
+          `[update sync] checkpoint saved key=${checkpointKey} batchOffset=${batchOffsetEnd} batchTotal=${batchTotal}`
         );
       }
     } catch (err) {
@@ -1848,7 +1881,7 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
 
   const elapsed = formatDuration(Date.now() - startMs);
   logLine(
-    `[update sync] === DONE === checked=${checked} appended=${appended} no_change=${no_change} not_found=${not_found} no_baseline=${no_baseline} skipped_date=${skipped_date} errors=${errors} targetOffset=${targetOffset} targetOffsetEnd=${targetOffsetEnd} targetTotal=${targetTotal} hasMore=${hasMore ? "yes" : "no"} elapsed=${elapsed}`
+    `[update sync] === DONE === checked=${checked} appended=${appended} no_change=${no_change} not_found=${not_found} no_baseline=${no_baseline} skipped_date=${skipped_date} errors=${errors} priorityTotal=${priorityTotal} priorityChecked=${priorityChecked} batchTotal=${batchTotal} batchCheckedThisRun=${batchCheckedThisRun} batchOffset=${batchOffset} batchOffsetEnd=${batchOffsetEnd} targetTotal=${targetTotal} hasMore=${hasMore ? "yes" : "no"} elapsed=${elapsed}`
   );
 
   return {
@@ -1859,12 +1892,18 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
     no_baseline,
     skipped_date,
     errors,
+    priorityTotal,
+    priorityChecked,
+    batchTotal,
+    batchCheckedThisRun,
+    batchOffset,
+    batchOffsetEnd,
     targetTotal,
     pairTotal: targetTotal,
-    targetOffset,
-    pairOffset: targetOffset,
-    targetOffsetEnd,
-    pairOffsetEnd: targetOffsetEnd,
+    targetOffset: batchOffset,
+    pairOffset: batchOffset,
+    targetOffsetEnd: batchOffsetEnd,
+    pairOffsetEnd: batchOffsetEnd,
     targetsProcessedThisRun: slice.length,
     pairsProcessedThisRun: slice.length,
     hasMore,
@@ -1879,6 +1918,7 @@ module.exports = {
   refreshPlacementRecordToBigQuery,
   buildRefreshAdditionalCostLogsSummary,
   buildActiveUpdateRefreshParams,
+  splitActiveDealSheetUpdateTargetsByPlacementStatus,
   buildRateChangeLogRow,
   parseBooleanLike,
   computeChangedFields,
