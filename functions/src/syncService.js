@@ -894,6 +894,289 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   };
 }
 
+function resolveBulkBackfillMaxPlacementIds() {
+  const raw = process.env.BULK_BACKFILL_MAX_PLACEMENT_IDS;
+  const n = parseInt(String(raw != null && raw !== "" ? raw : "200").trim(), 10);
+  if (!Number.isFinite(n) || n < 1) return 200;
+  return n;
+}
+
+function normalizeBulkPlacementIds(placementIds) {
+  if (!Array.isArray(placementIds)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of placementIds) {
+    const id = raw == null ? "" : String(raw).trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+/**
+ * Nexus-only backfill: enrich and insert without BigQuery baseline/existence checks.
+ * CONTRACT_ID is always null. Log tables use append-on-change dedupe when deal sheet inserts.
+ */
+async function backfillPlacementRecordFromNexus(params = {}) {
+  const startMs = Date.now();
+  const generatedUuidField =
+    typeof params.generated_uuid_field === "string" && params.generated_uuid_field.trim() !== ""
+      ? params.generated_uuid_field.trim()
+      : "ID";
+  const effectiveDatasetId =
+    typeof params.bq_dataset === "string" && params.bq_dataset.trim() !== ""
+      ? params.bq_dataset.trim()
+      : "rr_project_data";
+  const applyUpdateToggle = parseBooleanLike(params.apply_update);
+  const applyUpdate = applyUpdateToggle == null ? true : applyUpdateToggle;
+  const inputPlacementId =
+    typeof params.placement_id === "string" || typeof params.placement_id === "number"
+      ? String(params.placement_id).trim()
+      : "";
+
+  const accessToken = await getNexusAccessToken();
+  const seed = await resolveRefreshSeed(accessToken, params);
+
+  if (!seed.jobId || !seed.preferredCandidateRow || !seed.dealSheetId) {
+    return {
+      placement_id: inputPlacementId || seed.placementId || null,
+      action: "NOT_FOUND",
+      inserted: 0,
+      attempted: 0,
+      diff_fields: [],
+      reason: "Unable to resolve candidate/deal-sheet from provided identifiers",
+      resolved_ids: {
+        placement_id: seed.placementId || inputPlacementId || null,
+        job_id: seed.jobId || null,
+        candidate_id: seed.candidateId || null,
+        deal_sheet_id: seed.dealSheetId || null,
+      },
+      data: null,
+      additional_cost_logs: buildRefreshAdditionalCostLogsSummary("NOT_FOUND", [], null),
+      termination_reason_logs: buildRefreshTerminationReasonLogsSummary("NOT_FOUND", [], null),
+      elapsed: formatDuration(Date.now() - startMs),
+    };
+  }
+
+  const preloadedSubmittals = new Map();
+  if (seed.jobId && seed.candidateId && seed.submittalRow) {
+    preloadedSubmittals.set(`${seed.jobId}:${seed.candidateId}`, seed.submittalRow);
+  }
+
+  const { rows: enrichedRows, additionalCostLogRows, terminationLogRows } =
+    await buildEnrichedRowsFromDealSheetCandidates(
+      [seed.preferredCandidateRow],
+      preloadedSubmittals,
+      {
+        allowedSubmittalCodes: params.organization_submittal_status_code || config.submittalStatusCodes,
+        persistDealSheetStatusFromCandidate: true,
+        fetchTerminationDetails: true,
+        skip_contract_id: true,
+      }
+    );
+  const row = enrichedRows[0] || null;
+  if (!row) {
+    return {
+      placement_id: inputPlacementId || seed.placementId || null,
+      action: "NOT_FOUND",
+      inserted: 0,
+      attempted: 0,
+      diff_fields: [],
+      reason: "Enrichment returned no row",
+      resolved_ids: {
+        placement_id: seed.placementId || inputPlacementId || null,
+        job_id: seed.jobId || null,
+        candidate_id: seed.candidateId || null,
+        deal_sheet_id: seed.dealSheetId || null,
+      },
+      data: null,
+      additional_cost_logs: buildRefreshAdditionalCostLogsSummary("NOT_FOUND", [], null),
+      termination_reason_logs: buildRefreshTerminationReasonLogsSummary("NOT_FOUND", [], null),
+      elapsed: formatDuration(Date.now() - startMs),
+    };
+  }
+
+  const explicitBqTable = typeof params.bq_table === "string" && params.bq_table.trim() !== "";
+  const effectiveTableId = explicitBqTable
+    ? params.bq_table.trim()
+    : resolveActiveDealSheetTableId(row.ASSIGNMENT_RECRUITER_EMAIL);
+
+  if (!applyUpdate) {
+    return {
+      placement_id: inputPlacementId || normalizeNexusResourceId(row?.PLACEMENT_ID) || null,
+      action: "PREVIEW",
+      reason: "Enriched row (preview only, no write)",
+      inserted: 0,
+      attempted: 0,
+      diff_fields: [],
+      additional_cost_logs: buildRefreshAdditionalCostLogsSummary("PREVIEW", additionalCostLogRows, null),
+      termination_reason_logs: buildRefreshTerminationReasonLogsSummary("PREVIEW", terminationLogRows, null),
+      resolved_ids: {
+        placement_id: seed.placementId || normalizeNexusResourceId(row?.PLACEMENT_ID) || null,
+        job_id: seed.jobId || normalizeNexusResourceId(seed.preferredCandidateRow?.job) || null,
+        candidate_id: seed.candidateId || normalizeNexusResourceId(seed.preferredCandidateRow?.candidate) || null,
+        deal_sheet_id: seed.dealSheetId || normalizeNexusResourceId(seed.preferredCandidateRow?.deal_sheet) || null,
+      },
+      data: row,
+      elapsed: formatDuration(Date.now() - startMs),
+    };
+  }
+
+  const insertResult = await insertEnrichedDealSheetBatch([row], 0, {
+    appendOnChangeByDealSheet: false,
+    skip_contract_id: true,
+    generatedUuidField,
+    datasetId: effectiveDatasetId,
+    tableId: effectiveTableId,
+  });
+
+  let action = "NO_INSERT";
+  let reason = "Insert pipeline filtered row";
+  if (insertResult.inserted > 0) {
+    action = "INSERTED";
+    reason = "Backfill inserted from Nexus";
+  }
+
+  let additionalCostLogWriteResult = null;
+  if (action === "INSERTED" && additionalCostLogRows.length > 0) {
+    additionalCostLogWriteResult = await writeAdditionalCostLogRows(additionalCostLogRows, 0, params, {
+      insertedKeys: insertResult.insertedKeys instanceof Set ? insertResult.insertedKeys : new Set(),
+    });
+  }
+
+  let terminationReasonLogWriteResult = null;
+  if (action === "INSERTED" && terminationLogRows.length > 0) {
+    terminationReasonLogWriteResult = await writeTerminationReasonLogRows(terminationLogRows, 0, params, {
+      insertedKeys: insertResult.insertedKeys instanceof Set ? insertResult.insertedKeys : new Set(),
+    });
+  }
+
+  return {
+    placement_id: inputPlacementId || normalizeNexusResourceId(row?.PLACEMENT_ID) || null,
+    action,
+    reason,
+    inserted: insertResult.inserted,
+    attempted: insertResult.attempted,
+    errorBatches: insertResult.errorBatches,
+    diff_fields: [],
+    additional_cost_logs: buildRefreshAdditionalCostLogsSummary(
+      action,
+      additionalCostLogRows,
+      additionalCostLogWriteResult
+    ),
+    termination_reason_logs: buildRefreshTerminationReasonLogsSummary(
+      action,
+      terminationLogRows,
+      terminationReasonLogWriteResult
+    ),
+    resolved_ids: {
+      placement_id: seed.placementId || normalizeNexusResourceId(row?.PLACEMENT_ID) || null,
+      job_id: seed.jobId || normalizeNexusResourceId(seed.preferredCandidateRow?.job) || null,
+      candidate_id: seed.candidateId || normalizeNexusResourceId(seed.preferredCandidateRow?.candidate) || null,
+      deal_sheet_id: seed.dealSheetId || normalizeNexusResourceId(seed.preferredCandidateRow?.deal_sheet) || null,
+    },
+    data: row,
+    elapsed: formatDuration(Date.now() - startMs),
+  };
+}
+
+/**
+ * Bulk Nexus backfill by placement_id (concurrent, capped per request).
+ */
+async function bulkBackfillPlacementRecordsFromNexus(params = {}) {
+  const startMs = Date.now();
+  const maxIds = resolveBulkBackfillMaxPlacementIds();
+  const placementIds = normalizeBulkPlacementIds(params.placement_ids);
+
+  if (placementIds.length === 0) {
+    return {
+      _badRequest: true,
+      error: "Provide placement_ids array with at least one id",
+    };
+  }
+  if (placementIds.length > maxIds) {
+    return {
+      _badRequest: true,
+      error: `Too many placement_ids (${placementIds.length}); max per request is ${maxIds}`,
+    };
+  }
+
+  const concurrency = Math.max(1, Math.min(Number(config.fetchAllMax) || 20, 20));
+  const baseParams = { ...params };
+  delete baseParams.placement_ids;
+
+  const results = new Array(placementIds.length);
+  let inserted = 0;
+  let not_found = 0;
+  let preview = 0;
+  let no_insert = 0;
+  let errors = 0;
+
+  async function processOne(placementId, index) {
+    try {
+      const result = await backfillPlacementRecordFromNexus({
+        ...baseParams,
+        placement_id: placementId,
+      });
+      results[index] = result;
+      if (result.action === "INSERTED") inserted++;
+      else if (result.action === "NOT_FOUND") not_found++;
+      else if (result.action === "PREVIEW") preview++;
+      else if (result.action === "ERROR") errors++;
+      else no_insert++;
+    } catch (err) {
+      errors++;
+      results[index] = {
+        placement_id: placementId,
+        action: "ERROR",
+        reason: err?.message || String(err),
+        inserted: 0,
+        attempted: 0,
+        diff_fields: [],
+        data: null,
+        additional_cost_logs: buildRefreshAdditionalCostLogsSummary("ERROR", [], null),
+        termination_reason_logs: buildRefreshTerminationReasonLogsSummary("ERROR", [], null),
+        resolved_ids: {
+          placement_id: placementId,
+          job_id: null,
+          candidate_id: null,
+          deal_sheet_id: null,
+        },
+        elapsed: formatDuration(Date.now() - startMs),
+      };
+    }
+  }
+
+  for (let i = 0; i < placementIds.length; i += concurrency) {
+    const batch = placementIds.slice(i, i + concurrency);
+    await Promise.all(batch.map((placementId, batchIndex) => processOne(placementId, i + batchIndex)));
+    if (i + concurrency < placementIds.length) {
+      logLine(
+        `[bulk backfill] progress processed=${Math.min(i + concurrency, placementIds.length)}/${placementIds.length} inserted=${inserted} not_found=${not_found} errors=${errors}`
+      );
+    }
+  }
+
+  logLine(
+    `[bulk backfill] complete total=${placementIds.length} inserted=${inserted} not_found=${not_found} preview=${preview} no_insert=${no_insert} errors=${errors}`
+  );
+
+  return {
+    success: errors === 0,
+    summary: {
+      total: placementIds.length,
+      inserted,
+      not_found,
+      preview,
+      no_insert,
+      errors,
+    },
+    results,
+    executionTimeMs: Date.now() - startMs,
+  };
+}
+
 /**
  * Why a deal-sheet-candidate row was excluded from sync (for logs).
  * @returns {"EMPTY_STATUS"|"NOT_ALLOWED_STATUS"|null} null if row passes status filter
@@ -1916,6 +2199,10 @@ module.exports = {
   syncExistingActiveDealSheetUpdatesFromBigQuery,
   syncRateChangeLogsFromBigQuery,
   refreshPlacementRecordToBigQuery,
+  backfillPlacementRecordFromNexus,
+  bulkBackfillPlacementRecordsFromNexus,
+  resolveBulkBackfillMaxPlacementIds,
+  normalizeBulkPlacementIds,
   buildRefreshAdditionalCostLogsSummary,
   buildActiveUpdateRefreshParams,
   splitActiveDealSheetUpdateTargetsByPlacementStatus,

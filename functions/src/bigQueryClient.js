@@ -954,11 +954,6 @@ function computeDealSheetFirstInsertDateStamps(row, dateTime) {
     out.NEW_HIRE_DATE = String(dateTime);
   }
 
-  if (dealType === "DEAL" && isEmptyDateFieldValue(row.ORIGINAL_START_DATE)) {
-    const sd = formatDateOnlyForSql(row.START_DATE);
-    if (sd != null) out.ORIGINAL_START_DATE = sd;
-  }
-
   if (
     dealType === "EXTENSION"
     && placementStatus === "BOOKED"
@@ -2136,106 +2131,6 @@ async function fetchContractIdsForExtensions(extensionRows, options = {}) {
   return out;
 }
 
-/**
- * For EXTENSION rows, find original DEAL ORIGINAL_START_DATE (or START_DATE fallback)
- * across active tables.
- * @param {Array<{placementId: number, candidateNexusId: number, candidateEmail?: string|null, phoneNumber?: string|null, clientId: number, startDate?: *}>} extensionRows
- * @param {object} [options]
- * @returns {Promise<Map<string, string|null>>} placementId string -> YYYY-MM-DD or null
- */
-async function fetchOriginalStartDatesForExtensions(extensionRows, options = {}) {
-  const out = new Map();
-  if (!extensionRows || extensionRows.length === 0) return out;
-
-  const datasetId =
-    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
-      ? options.datasetId.trim()
-      : config.datasetId;
-  const unionSql = buildActiveDealSheetsUnionSql(datasetId);
-  const chunkSize = 100;
-
-  for (let i = 0; i < extensionRows.length; i += chunkSize) {
-    const chunk = extensionRows.slice(i, i + chunkSize);
-    const structLiterals = [];
-
-    for (const ext of chunk) {
-      const pid = Number(ext.placementId);
-      const cand = Number(ext.candidateNexusId);
-      const client = Number(ext.clientId);
-      if (!Number.isFinite(pid) || !Number.isFinite(cand)) continue;
-      if (!Number.isFinite(client)) continue;
-
-      const email = escapeSqlString(
-        ext.candidateEmail == null ? "" : String(ext.candidateEmail).trim().toLowerCase()
-      );
-      const phone = escapeSqlString(
-        ext.phoneNumber == null ? "" : String(ext.phoneNumber).trim()
-      );
-      const startDateSql = (() => {
-        const d = formatDateOnlyForSql(ext.startDate);
-        return d == null ? "CAST(NULL AS DATE)" : `DATE '${escapeSqlString(d)}'`;
-      })();
-
-      structLiterals.push(
-        `STRUCT(${Math.trunc(pid)} AS placement_id, ${Math.trunc(cand)} AS candidate_nexus_id, '${email}' AS candidate_email, '${phone}' AS phone_number, ${Math.trunc(client)} AS client_id, ${startDateSql} AS start_date)`
-      );
-    }
-
-    if (structLiterals.length === 0) continue;
-
-    const sql = `
-      WITH extensions AS (
-        SELECT * FROM UNNEST([${structLiterals.join(", ")}])
-      ),
-      deals AS (
-        SELECT
-          COALESCE(ORIGINAL_START_DATE, START_DATE) AS orig_start,
-          CANDIDATE_NEXUS_ID,
-          LOWER(IFNULL(CANDIDATE_EMAIL, '')) AS candidate_email_norm,
-          IFNULL(PHONE_NUMBER, '') AS phone_norm,
-          CLIENT_ID,
-          START_DATE,
-          EDIT_DATE
-        FROM (${unionSql})
-        WHERE UPPER(TRIM(DEAL_TYPE)) = 'DEAL'
-          AND COALESCE(ORIGINAL_START_DATE, START_DATE) IS NOT NULL
-      ),
-      joined AS (
-        SELECT
-          ext.placement_id,
-          d.orig_start,
-          ROW_NUMBER() OVER (
-            PARTITION BY ext.placement_id
-            ORDER BY d.START_DATE DESC NULLS LAST, d.EDIT_DATE DESC NULLS LAST
-          ) AS rn
-        FROM extensions ext
-        LEFT JOIN deals d
-          ON d.CANDIDATE_NEXUS_ID = ext.candidate_nexus_id
-         AND d.candidate_email_norm = ext.candidate_email
-         AND d.phone_norm = ext.phone_number
-         AND d.CLIENT_ID = ext.client_id
-         AND (ext.start_date IS NULL OR d.START_DATE <= ext.start_date)
-      )
-      SELECT
-        CAST(placement_id AS STRING) AS placement_id,
-        orig_start
-      FROM joined
-      WHERE rn = 1
-    `;
-
-    const rows = await queryObjects(sql, structLiterals.length);
-    for (const row of rows) {
-      const pid = row?.placement_id;
-      if (pid == null || String(pid).trim() === "") continue;
-      const raw = row?.orig_start;
-      const formatted = formatDateOnlyForSql(raw);
-      out.set(String(pid).trim(), formatted);
-    }
-  }
-
-  return out;
-}
-
 module.exports = {
   queryObjects,
   fetchExistingDealSheetIdsSet,
@@ -2285,7 +2180,6 @@ module.exports = {
   computeDealSheetFirstInsertDateStamps,
   fetchContractIdsByDealSheetIds,
   fetchContractIdsForExtensions,
-  fetchOriginalStartDatesForExtensions,
   buildActiveDealSheetsUnionSql,
   formatDateOnlyForSql,
 };

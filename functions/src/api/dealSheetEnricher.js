@@ -48,12 +48,10 @@ const { computeWeekSplit } = require("../weekSplit");
 const { computeNewRateFamily } = require("../w2PayRateNew");
 const { shouldExcludeRowFromBigQuery } = require("../bqRowExclusions");
 const { resolveContractIdsForRows } = require("../contractIdResolver");
-const { resolveOriginalStartDatesForRows } = require("../originalStartDateResolver");
 const { allocateContractIds } = require("../contractIdSequence");
 const {
   fetchContractIdsByDealSheetIds,
   fetchContractIdsForExtensions,
-  fetchOriginalStartDatesForExtensions,
 } = require("../bigQueryClient");
 
 /**
@@ -912,10 +910,6 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       allocateContractIdsFn: allocateContractIds,
       fetchContractIdsByDealSheetIdsFn: fetchContractIdsByDealSheetIds,
       fetchContractIdsForExtensionsFn: fetchContractIdsForExtensions,
-    });
-    await resolveOriginalStartDatesForRows(combined, {
-      fetchOriginalStartDatesForExtensionsFn: fetchOriginalStartDatesForExtensions,
-      bqOptions: options.bqOptions,
     });
   } else {
     logLine("[enriched sync] STEP 3/4 ENRICH: skip_contract_id — CONTRACT_ID resolution skipped");

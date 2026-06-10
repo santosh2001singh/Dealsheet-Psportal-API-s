@@ -18,6 +18,7 @@ const {
   coerceApiFloatNullsToZero,
   mapDealSheetRatesListToBq,
   mapDealSheetUsersToBq,
+  mapJobProfessionSpecialtyFromJob,
   computeBqEndDateFromSubmittal,
   isTerminationApiEligiblePlacementStatus,
   extractTerminationReasonValue,
@@ -803,6 +804,7 @@ test("mapDealSheetUsersToBq prefers deal-sheet recruiter user over submittal rec
   assert.equal(out.ASSIGNMENT_RECRUITER, "New Recruiter");
   assert.equal(out.ASSIGNMENT_RECRUITER_EMAIL, "new.recruiter@cynethealth.com");
   assert.equal(out.CLIENT_SALES_REP, "Sales Rep");
+  assert.equal(out.CLIENT_SALES_REP_ID, 300);
   assert.equal(out.ONSITE_AM, "Sales Rep");
 });
 
@@ -821,7 +823,16 @@ test("mapDealSheetUsersToBq falls back to submittal recruiter when deal-sheet us
   assert.equal(out.ASSIGNMENT_RECRUITER, "Sub Recruiter");
   assert.equal(out.ASSIGNMENT_RECRUITER_EMAIL, "sub.recruiter@cynethealth.com");
   assert.equal(out.CLIENT_SALES_REP, null);
+  assert.equal(out.CLIENT_SALES_REP_ID, null);
   assert.equal(out.ONSITE_AM, null);
+});
+
+test("mapDealSheetUsersToBq falls back to submittal sales_rep id when deal-sheet sales_rep null", () => {
+  const dealSheet = { recruiter: null, sales_rep: null };
+  const submittalRow = { sales_rep: 400 };
+  const out = mapDealSheetUsersToBq(dealSheet, null, null, submittalRow);
+  assert.equal(out.CLIENT_SALES_REP_ID, 400);
+  assert.equal(out.CLIENT_SALES_REP, null);
 });
 
 test("mapDealSheetUsersToBq uses deal-sheet recruiter id when both users null", () => {
@@ -831,7 +842,29 @@ test("mapDealSheetUsersToBq uses deal-sheet recruiter id when both users null", 
   assert.equal(out.ASSIGNMENT_RECRUITER, null);
   assert.equal(out.ASSIGNMENT_RECRUITER_EMAIL, null);
   assert.equal(out.CLIENT_SALES_REP, null);
+  assert.equal(out.CLIENT_SALES_REP_ID, null);
   assert.equal(out.ONSITE_AM, null);
+});
+
+test("mapJobProfessionSpecialtyFromJob maps profession and specialty ids and names", () => {
+  const out = mapJobProfessionSpecialtyFromJob({
+    profession: { id: 3303, name: "Therapy" },
+    specialty: { id: 24394, name: "RRT" },
+  });
+  assert.equal(out.CATEGORIZATION_OF_POSITION, "Therapy");
+  assert.equal(out.CATEGORIZATION_OF_POSITION_ID, 3303);
+  assert.equal(out.POSITION, "RRT");
+  assert.equal(out.POSITION_ID, 24394);
+});
+
+test("mapJobProfessionSpecialtyFromJob returns null ids when profession or specialty missing", () => {
+  assert.deepEqual(mapJobProfessionSpecialtyFromJob(null), {});
+  const partial = mapJobProfessionSpecialtyFromJob({
+    profession: { name: "Therapy" },
+    specialty: { name: "RRT" },
+  });
+  assert.equal(partial.CATEGORIZATION_OF_POSITION_ID, null);
+  assert.equal(partial.POSITION_ID, null);
 });
 
 test("coerceApiFloatNullsToZero preserves finite numbers including 0 and negatives", () => {
@@ -987,7 +1020,7 @@ test("isTerminationApiEligiblePlacementStatus allows ended/cancelled family only
   assert.equal(isTerminationApiEligiblePlacementStatus("CANCELLED"), true);
   assert.equal(isTerminationApiEligiblePlacementStatus("CANCELED"), true);
   assert.equal(isTerminationApiEligiblePlacementStatus("STARTED"), false);
-  assert.equal(isTerminationApiEligiblePlacementStatus("ENDED"), false);
+  assert.equal(isTerminationApiEligiblePlacementStatus("ENDED"), true);
 });
 
 test("extractTerminationReasonValue prefers cancellation_reason.value", () => {
@@ -1057,4 +1090,10 @@ test("pickLatestTerminationDetailItem chooses newest modified_date", () => {
 
 test("TERMINATION_REASON is API-owned on deal sheet", () => {
   assert.equal(API_OWNED_COLUMNS.has("TERMINATION_REASON"), true);
+});
+
+test("position and sales rep id columns are API-owned", () => {
+  assert.equal(API_OWNED_COLUMNS.has("CATEGORIZATION_OF_POSITION_ID"), true);
+  assert.equal(API_OWNED_COLUMNS.has("POSITION_ID"), true);
+  assert.equal(API_OWNED_COLUMNS.has("CLIENT_SALES_REP_ID"), true);
 });

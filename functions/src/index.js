@@ -7,6 +7,7 @@
  * 4. dealSheetSyncUpdateTrigger — scheduled update (existing BQ composites)
  * 5. dealSheetSyncOfferRejected — HTTP ended / offer-rejected stream (manual)
  * 6. rateChangeLogSyncTrigger — scheduled rate-change logs (BigQuery CONTRACT_ID scan)
+ * 7. bulkBackfillByPlacementId — HTTP bulk Nexus backfill (no BQ baseline checks)
  */
 
 const { onRequest } = require("firebase-functions/v2/https");
@@ -17,6 +18,8 @@ const {
   syncExistingActiveDealSheetUpdatesFromBigQuery,
   syncRateChangeLogsFromBigQuery,
   refreshPlacementRecordToBigQuery,
+  bulkBackfillPlacementRecordsFromNexus,
+  resolveBulkBackfillMaxPlacementIds,
 } = require("./syncService");
 const { syncPeopleStrongEmployeeDetailsToBigQuery } = require("./peoplestrongEmployeeDetailsService");
 const { logLine, logError, withTimingAsync } = require("./logger");
@@ -326,6 +329,87 @@ exports.refreshDealSheetByPlacementId = onRequest(
     } catch (error) {
       const executionTimeMs = Date.now() - wallStartMs;
       logError(`[refreshDealSheetByPlacementId] FAILED after ${executionTimeMs}ms`, error);
+      res.status(500).json({
+        success: false,
+        error: error.message,
+        executionTimeMs,
+      });
+    }
+  }
+);
+
+/**
+ * HTTP: bulk Nexus backfill by placement_id (POST JSON).
+ * No BigQuery baseline/existence checks on deal-sheet rows; CONTRACT_ID always null.
+ */
+exports.bulkBackfillByPlacementId = onRequest(
+  {
+    region: REGION,
+    timeoutSeconds: HTTP_TIMEOUT_SEC,
+    memory: HTTP_MEMORY,
+  },
+  async (req, res) => {
+    const wallStartMs = Date.now();
+    try {
+      const result = await withTimingAsync("bulkBackfillByPlacementId", async () => {
+        const body = req.body && typeof req.body === "object" ? req.body : {};
+        const q = req.query || {};
+
+        let placementIds = [];
+        if (Array.isArray(body.placement_ids)) {
+          placementIds = body.placement_ids;
+        } else if (typeof body.placement_ids === "string" && body.placement_ids.trim() !== "") {
+          placementIds = body.placement_ids.split(",");
+        } else if (typeof q.placement_ids === "string" && q.placement_ids.trim() !== "") {
+          placementIds = q.placement_ids.split(",");
+        }
+
+        const params = { placement_ids: placementIds };
+        const applyUpdate =
+          body.apply_update != null
+            ? body.apply_update
+            : q.apply_update != null
+              ? q.apply_update
+              : undefined;
+        if (applyUpdate != null) params.apply_update = applyUpdate;
+
+        const bqDataset =
+          typeof body.bq_dataset === "string"
+            ? body.bq_dataset.trim()
+            : typeof q.bq_dataset === "string"
+              ? q.bq_dataset.trim()
+              : "";
+        if (bqDataset) params.bq_dataset = bqDataset;
+
+        const bqTable =
+          typeof body.bq_table === "string"
+            ? body.bq_table.trim()
+            : typeof q.bq_table === "string"
+              ? q.bq_table.trim()
+              : "";
+        if (bqTable) params.bq_table = bqTable;
+
+        const maxIds = resolveBulkBackfillMaxPlacementIds();
+        logLine(
+          `[bulkBackfillByPlacementId] method=${req.method} placement_ids=${placementIds.length} max_per_request=${maxIds} apply_update=${applyUpdate == null ? "default:true" : applyUpdate} bq_dataset=${bqDataset || "rr_project_data"} bq_table=${bqTable || "domain-routed (from ASSIGNMENT_RECRUITER_EMAIL)"}`
+        );
+
+        return bulkBackfillPlacementRecordsFromNexus(params);
+      });
+
+      if (result && result._badRequest) {
+        res.status(400).json({ success: false, error: result.error });
+        return;
+      }
+
+      const executionTimeMs = Date.now() - wallStartMs;
+      res.status(200).json({
+        ...result,
+        executionTimeMs,
+      });
+    } catch (error) {
+      const executionTimeMs = Date.now() - wallStartMs;
+      logError(`[bulkBackfillByPlacementId] FAILED after ${executionTimeMs}ms`, error);
       res.status(500).json({
         success: false,
         error: error.message,

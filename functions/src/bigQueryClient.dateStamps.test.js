@@ -14,37 +14,6 @@ test("computeDealSheetFirstInsertDateStamps: deal sets NEW_HIRE_DATE only", () =
   const out = computeDealSheetFirstInsertDateStamps(row, insertTs);
   assert.equal(out.NEW_HIRE_DATE, insertTs);
   assert.equal(Object.hasOwn(out, "EXTENSION_DATE"), false);
-});
-
-test("computeDealSheetFirstInsertDateStamps: deal sets ORIGINAL_START_DATE from START_DATE", () => {
-  const row = { DEAL_TYPE: "deal", START_DATE: "2026-01-15" };
-  const out = computeDealSheetFirstInsertDateStamps(row, insertTs);
-  assert.equal(out.ORIGINAL_START_DATE, "2026-01-15");
-});
-
-test("computeDealSheetFirstInsertDateStamps: extension does not self-stamp ORIGINAL_START_DATE", () => {
-  const row = {
-    DEAL_TYPE: "extension",
-    PLACEMENT_STATUS: "booked",
-    START_DATE: "2026-04-05",
-  };
-  const out = computeDealSheetFirstInsertDateStamps(row, insertTs);
-  assert.equal(Object.hasOwn(out, "ORIGINAL_START_DATE"), false);
-});
-
-test("computeDealSheetFirstInsertDateStamps: does not overwrite populated ORIGINAL_START_DATE", () => {
-  const row = {
-    DEAL_TYPE: "deal",
-    START_DATE: "2026-06-01",
-    ORIGINAL_START_DATE: "2025-03-10",
-  };
-  const out = computeDealSheetFirstInsertDateStamps(row, insertTs);
-  assert.equal(Object.hasOwn(out, "ORIGINAL_START_DATE"), false);
-});
-
-test("computeDealSheetFirstInsertDateStamps: deal without START_DATE does not set ORIGINAL_START_DATE", () => {
-  const row = { DEAL_TYPE: "deal" };
-  const out = computeDealSheetFirstInsertDateStamps(row, insertTs);
   assert.equal(Object.hasOwn(out, "ORIGINAL_START_DATE"), false);
 });
 

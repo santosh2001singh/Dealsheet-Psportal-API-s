@@ -285,11 +285,14 @@ function mapDealSheetUsersToBq(dealSheet, recruiterUser, salesRepUser, submittal
   const recruiterFromSubmittal = normalizeRecruiterFromSubmittal(submittalRow);
   const recruiterIdFromDealSheet = toIntOrNull(dealSheet?.recruiter);
   const recruiterObj = recruiterUser ?? recruiterFromSubmittal;
+  const salesRepIdFromSubmittal = toIntOrNull(submittalRow?.sales_rep);
   return {
     RECRUITER_ID: recruiterIdFromDealSheet ?? recruiterFromSubmittal?.id ?? null,
     ASSIGNMENT_RECRUITER: mapUserToFullName(recruiterObj),
     ASSIGNMENT_RECRUITER_EMAIL: recruiterObj?.email ?? null,
     CLIENT_SALES_REP: mapUserToFullName(salesRepUser),
+    CLIENT_SALES_REP_ID:
+      toIntOrNull(dealSheet?.sales_rep) ?? salesRepIdFromSubmittal ?? null,
     ONSITE_AM: mapUserToFullName(salesRepUser),
   };
 }
@@ -507,7 +510,9 @@ function mapJobProfessionSpecialtyFromJob(job) {
     ? String(s.name).trim() || null : null;
   return {
     CATEGORIZATION_OF_POSITION: profName,
+    CATEGORIZATION_OF_POSITION_ID: toIntOrNull(p?.id),
     POSITION: specName,
+    POSITION_ID: toIntOrNull(s?.id),
   };
 }
 
@@ -1197,6 +1202,7 @@ function coerceApiFloatNullsToZero(row) {
 
 /** Placement statuses eligible for cancellation/termination detail API lookup. */
 const TERMINATION_API_ELIGIBLE_PLACEMENT_STATUSES = new Set([
+  "ENDED",
   "ENDED<30",
   "DID NOT START",
   "DID NOT ACCEPT",
@@ -1306,6 +1312,7 @@ const API_OWNED_COLUMNS = new Set([
   "ASSIGNMENT_RECRUITER",
   "ASSIGNMENT_RECRUITER_EMAIL",
   "CLIENT_SALES_REP",
+  "CLIENT_SALES_REP_ID",
   "ONSITE_AM",
   "VMS_JOB_ID",
   "START_DATE",
@@ -1323,7 +1330,9 @@ const API_OWNED_COLUMNS = new Set([
   "LINE_OF_BUSINESS",
   "CLIENT_TYPE",
   "CATEGORIZATION_OF_POSITION",
+  "CATEGORIZATION_OF_POSITION_ID",
   "POSITION",
+  "POSITION_ID",
   "PO_HOURS",
   "SCHEDULE_HOURS_1",
   "SCHEDULE_HOURS_2",
