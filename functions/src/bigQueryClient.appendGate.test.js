@@ -18,7 +18,7 @@ const {
   applyTentativeDateFreeze,
   applyNewHireDateFreeze,
 } = require("./bigQueryClient");
-const { API_OWNED_COLUMNS } = require("./columnMappings");
+const { API_OWNED_COLUMNS, MANUAL_COLUMNS } = require("./columnMappings");
 const { resolvePairedActiveTableId } = require("./recruiterDomainTables");
 
 const IGNORE = new Set(["ID", "DATE_AND_TIME"]);
@@ -213,7 +213,34 @@ test("applyManualColumnsCarryForward: copies manual columns from baseline to inc
   assert.equal(out.row.BGC_AGENCY_NAME, "Acme");
   assert.equal(out.row.ATL, "John Doe");
   assert.equal(out.row.PLACEMENT_STATUS, "ENDED");
-  assert.equal(out.carriedCount, 3);
+  assert.equal(out.carriedCount, MANUAL_COLUMNS.size);
+});
+
+test("applyManualColumnsCarryForward: preserves COMMENTS and BACKOUT_OR_TERMINATION from baseline", () => {
+  const incoming = {
+    PLACEMENT_STATUS: "STARTED",
+    COMMENTS: null,
+    BACKOUT_OR_TERMINATION: null,
+  };
+  const baseline = {
+    PLACEMENT_STATUS: "ENDED",
+    COMMENTS: "Contract extended till 08/01/2026",
+    BACKOUT_OR_TERMINATION: "No",
+  };
+  const out = applyManualColumnsCarryForward(incoming, baseline);
+  assert.equal(out.row.COMMENTS, "Contract extended till 08/01/2026");
+  assert.equal(out.row.BACKOUT_OR_TERMINATION, "No");
+  assert.equal(out.row.PLACEMENT_STATUS, "STARTED");
+});
+
+test("applyManualColumnsCarryForward: copies manual key even when absent from baseline object keys", () => {
+  const incoming = { PLACEMENT_STATUS: "STARTED", SKU_NUMBER: "incoming" };
+  const baseline = Object.create(null);
+  baseline.PLACEMENT_STATUS = "BOOKED";
+  baseline.SKU_NUMBER = "baseline-sku";
+  const out = applyManualColumnsCarryForward(incoming, baseline);
+  assert.equal(out.row.SKU_NUMBER, "baseline-sku");
+  assert.equal(out.row.PLACEMENT_STATUS, "STARTED");
 });
 
 test("applyManualColumnsCarryForward: does not carry API columns from baseline", () => {
@@ -233,7 +260,7 @@ test("applyManualColumnsCarryForward: does not carry API columns from baseline",
   assert.equal(out.row.ASSIGNMENT_RECRUITER, "New Recruiter");
   assert.equal(out.row.PAY_RATE, 50);
   assert.equal(out.row.SKU_NUMBER, "9999");
-  assert.equal(out.carriedCount, 1);
+  assert.equal(out.carriedCount, MANUAL_COLUMNS.size);
 });
 
 test("applyManualColumnsCarryForward: does not carry system-controlled columns from baseline", () => {
@@ -256,7 +283,7 @@ test("applyManualColumnsCarryForward: does not carry system-controlled columns f
   assert.equal(out.row.DATE_AND_TIME, "2026-05-26T00:00:00Z");
   assert.equal(out.row.IS_REJECTED, "False");
   assert.equal(out.row.MOVE_RUNRATE, "FALSE");
-  assert.equal(out.carriedCount, 0);
+  assert.equal(out.carriedCount, MANUAL_COLUMNS.size);
 });
 
 test("applyManualColumnsCarryForward: null baseline returns incoming unchanged with carriedCount=0", () => {

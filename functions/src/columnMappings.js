@@ -1280,9 +1280,8 @@ function mapTerminationReasonLogRowForDealSheet(apiItem, contextRow, captureTime
 }
 
 /**
- * Columns owned by the Nexus enrichment pipeline. Any column not in this set
- * (and not in SYSTEM_CONTROLLED_COLUMNS) is treated as a manual BigQuery edit
- * and carried forward from the baseline row on append-on-change.
+ * Columns owned by the Nexus enrichment pipeline (updated from API on append).
+ * Manual fields are listed explicitly in MANUAL_COLUMNS.
  */
 const API_OWNED_COLUMNS = new Set([
   "END_CLIENT_DEPT_FACILITY",
@@ -1389,6 +1388,97 @@ const SYSTEM_CONTROLLED_COLUMNS = new Set([
 ]);
 Object.freeze(SYSTEM_CONTROLLED_COLUMNS);
 
+/**
+ * Manual BigQuery-edited columns (see sql/create_domain_deal_sheet_tables.sql).
+ * Carried forward from baseline on update-append; never overwritten by Nexus enrich.
+ */
+const MANUAL_COLUMNS = new Set([
+  "ACC_DIR_OR_VERT_HEAD",
+  "AGENCY_SWITCH",
+  "ASSOCIATE_AM",
+  "ASSOCIATE_AM_EMP_NO",
+  "ASSOCIATE_JUNIOR_CSM",
+  "ASSOCIATE_SALES_PERSON",
+  "ACCOUNT_MANAGER",
+  "ACCOUNT_MANAGER_EMP_NO",
+  "ATL",
+  "ATL_EMP_NO",
+  "BACKOUT_OR_TERMINATION",
+  "BGC_AGENCY_NAME",
+  "BGC_AMOUNT1",
+  "BGC_AMOUNT2",
+  "BGC_AMOUNT3",
+  "BGC_CATEGORY1",
+  "BGC_CATEGORY2",
+  "BGC_CATEGORY3",
+  "BGC_TOTAL_BGV_COST",
+  "BOOKING_DATE",
+  "CAND_PYMT_TERMS",
+  "CLIENT_CREATED_DATE",
+  "CLIENT_NAME_IN_CONREP",
+  "CLIENT_OWNER",
+  "CLIENT_RECRUITER",
+  "CLIENT_START_DATE",
+  "CLT_PYMT_TERM",
+  "COMMENTS",
+  "CREDENTIALING_LEAD",
+  "CREDENTIALING_SPECIALIST",
+  "DELIVERY_DIRECTOR",
+  "DELIVERY_DIRECTOR_EMP_NO",
+  "DELIVERY_POC",
+  "DIRECTOR_CLIENT_PARTNERSHIP",
+  "DIVERSITY_STATUS",
+  "EDIT_DATE",
+  "EDITED_BY",
+  "EFFECTIVE_DATE",
+  "ENTITY",
+  "EXTENSION_DATE",
+  "FINAL_INVOICE_PENDING",
+  "FIFTYTWO_TENURE_CANDIDATE_STATUS",
+  "FIFTYTWO_TENURE_RTO_LASTDATE",
+  "GROUP_DIRECTOR",
+  "GRP_DIR_ASSOC_GRP_DIR",
+  "GRP_DIR_ASSOC_GRP_DIR_EMP_NO",
+  "HOURLY_GP",
+  "INV_CYC_TO_CLT",
+  "IS_DELETED",
+  "ONB_CAND_DOB",
+  "ONB_E_VERIFY",
+  "ONB_I9_RECIEVED",
+  "ONB_SUPP_DOC1",
+  "ONB_SUPP_DOC1_EXP_DT",
+  "ONB_SUPP_DOC2",
+  "ONB_SUPP_DOC2_EXP_DT",
+  "ONSITE_CLIENT_OWNER",
+  "ONSITE_OWNER",
+  "ONSITE_VP_AVP",
+  "ORIGINAL_START_DATE",
+  "PAYLOCITY_ID",
+  "PO_RECEIVED",
+  "PRIMARY_SALES_PERSON",
+  "RECRUITER_CLUSTER",
+  "RECRUITMENT_MENTOR",
+  "REJECTION_REASON",
+  "RM",
+  "RM_EMP_NO",
+  "SECONDARY_AM",
+  "SECONDARY_AM_EMP_NO",
+  "SECONDARY_EMAIL",
+  "SECONDARY_RECRUITER",
+  "SECONDARY_RECRUITER_EMP_NO",
+  "SECONDARY_SALES_PERSON",
+  "SKU_NUMBER",
+  "ST_DT_PUSHBACK_REASON",
+  "TEAM_LEAD",
+  "TEAM_LEAD_EMP_NO",
+  "TYPE",
+  "UPDATED_AT",
+  "VP_SRVP",
+  "VP_SRVP_EMP_NO",
+  "WEEKLY_WALLET_MONEY",
+]);
+Object.freeze(MANUAL_COLUMNS);
+
 module.exports = {
   toNumberOrNull,
   addNumbersOrNull,
@@ -1429,4 +1519,5 @@ module.exports = {
   mapTerminationReasonLogRowForDealSheet,
   API_OWNED_COLUMNS,
   SYSTEM_CONTROLLED_COLUMNS,
+  MANUAL_COLUMNS,
 };

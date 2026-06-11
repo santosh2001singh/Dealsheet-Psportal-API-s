@@ -1,4 +1,5 @@
 -- Domain-routed active deal sheet tables (replace legacy ch_active_records).
+-- Manual BigQuery-edited columns: see MANUAL_COLUMNS in functions/src/columnMappings.js
 -- Run in BigQuery after migration. Optional: DROP TABLE IF EXISTS `cynetdatabase.rr_project_data.ch_active_records`;
 
 CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_deal_sheet` (

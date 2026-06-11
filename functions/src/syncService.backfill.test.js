@@ -56,13 +56,14 @@ test("bulkBackfillPlacementRecordsFromNexus rejects over max cap", async () => {
   }
 });
 
-test("backfillPlacementRecordFromNexus uses Nexus enrich without BQ baseline compare", () => {
+test("backfillPlacementRecordFromNexus enriches from Nexus and carries manual columns from baseline", () => {
   const source = fs.readFileSync(path.join(__dirname, "syncService.js"), "utf8");
   const fnStart = source.indexOf("async function backfillPlacementRecordFromNexus");
   assert.ok(fnStart >= 0, "backfillPlacementRecordFromNexus should exist");
   const fnEnd = source.indexOf("async function bulkBackfillPlacementRecordsFromNexus", fnStart);
   const block = source.slice(fnStart, fnEnd);
-  assert.equal(block.includes("fetchLatestRowsByDealSheetPlacementPairs"), false);
+  assert.equal(block.includes("fetchLatestRowsByDealSheetPlacementPairs"), true);
+  assert.equal(block.includes("applyManualColumnsCarryForward"), true);
   assert.equal(block.includes("hasBusinessColumnChanges"), false);
   assert.equal(block.includes("fetchTerminationDetails: true"), true);
   assert.equal(block.includes("skip_contract_id: true"), true);

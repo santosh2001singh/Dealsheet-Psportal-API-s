@@ -14,7 +14,11 @@ const {
   resolveActiveDealSheetTableId,
   resolvePairedActiveTableId,
 } = require("./recruiterDomainTables");
-const { API_OWNED_COLUMNS, SYSTEM_CONTROLLED_COLUMNS } = require("./columnMappings");
+const {
+  API_OWNED_COLUMNS,
+  SYSTEM_CONTROLLED_COLUMNS,
+  MANUAL_COLUMNS,
+} = require("./columnMappings");
 
 let bigquery;
 const tableFqn = `${config.projectId}.${config.datasetId}.${config.tableId}`;
@@ -743,22 +747,22 @@ function applyIsRejectedResetForChangedUpdate(incomingRow, baselineRow) {
 }
 
 /**
- * Copy manual columns (anything not in API_OWNED_COLUMNS and not system-controlled)
- * from the baseline row onto the incoming row before append-on-change insert.
- * Lets BigQuery-only edits (SKU_NUMBER, BGC_*, ATL, RECRUITMENT_MENTOR, etc.)
- * survive across update appends.
+ * Copy explicit MANUAL_COLUMNS from baseline onto incoming before append-on-change insert.
+ * Strips enrich-spread manual keys first so baseline always wins (incl. null).
  */
 function applyManualColumnsCarryForward(incomingRow, baselineRow) {
   if (!baselineRow || !incomingRow || typeof incomingRow !== "object") {
     return { row: incomingRow, carriedCount: 0 };
   }
   const out = { ...incomingRow };
+  for (const key of MANUAL_COLUMNS) {
+    delete out[key];
+  }
   let carriedCount = 0;
-  for (const [key, value] of Object.entries(baselineRow)) {
-    if (key === "_rn") continue;
-    if (API_OWNED_COLUMNS.has(key)) continue;
-    if (SYSTEM_CONTROLLED_COLUMNS.has(key)) continue;
-    out[key] = value;
+  for (const key of MANUAL_COLUMNS) {
+    out[key] = Object.prototype.hasOwnProperty.call(baselineRow, key)
+      ? baselineRow[key]
+      : null;
     carriedCount++;
   }
   return { row: out, carriedCount };

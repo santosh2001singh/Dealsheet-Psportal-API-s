@@ -1,5 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const {
   mapJobToBq,
@@ -25,6 +27,8 @@ const {
   pickLatestTerminationDetailItem,
   mapTerminationReasonLogRowForDealSheet,
   API_OWNED_COLUMNS,
+  SYSTEM_CONTROLLED_COLUMNS,
+  MANUAL_COLUMNS,
 } = require("./columnMappings");
 
 /** Sample rates with both CA (>8) and default (>40) OT bill_rate_codes */
@@ -1096,4 +1100,38 @@ test("position and sales rep id columns are API-owned", () => {
   assert.equal(API_OWNED_COLUMNS.has("CATEGORIZATION_OF_POSITION_ID"), true);
   assert.equal(API_OWNED_COLUMNS.has("POSITION_ID"), true);
   assert.equal(API_OWNED_COLUMNS.has("CLIENT_SALES_REP_ID"), true);
+});
+
+test("deal sheet schema columns are classified as API, SYSTEM, or MANUAL", () => {
+  const sqlPath = path.join(__dirname, "../../sql/create_domain_deal_sheet_tables.sql");
+  const sql = fs.readFileSync(sqlPath, "utf8");
+  const createBlock = sql.match(
+    /CREATE TABLE IF NOT EXISTS `[^`]+cynet_health_deal_sheet` \(([\s\S]*?)\);/
+  );
+  assert.ok(createBlock, "expected cynet_health_deal_sheet CREATE TABLE block");
+  const columns = [...createBlock[1].matchAll(/^\s*(?:`)?([A-Z0-9_]+)(?:`)?\s+/gm)].map(
+    (m) => m[1]
+  );
+  assert.ok(columns.length > 0);
+
+  const orphans = [];
+  const overlaps = [];
+  for (const col of columns) {
+    const inApi = API_OWNED_COLUMNS.has(col);
+    const inSystem = SYSTEM_CONTROLLED_COLUMNS.has(col);
+    const inManual = MANUAL_COLUMNS.has(col);
+    const count = (inApi ? 1 : 0) + (inSystem ? 1 : 0) + (inManual ? 1 : 0);
+    if (count === 0) orphans.push(col);
+    if (count > 1) overlaps.push(col);
+  }
+  assert.deepEqual(orphans, [], `orphan columns: ${orphans.join(", ")}`);
+  assert.deepEqual(overlaps, [], `overlapping columns: ${overlaps.join(", ")}`);
+
+  const schemaSet = new Set(columns);
+  const extras = [
+    ...API_OWNED_COLUMNS,
+    ...SYSTEM_CONTROLLED_COLUMNS,
+    ...MANUAL_COLUMNS,
+  ].filter((col) => !schemaSet.has(col));
+  assert.deepEqual(extras, [], `columns not in schema: ${extras.join(", ")}`);
 });

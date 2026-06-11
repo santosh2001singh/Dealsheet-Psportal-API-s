@@ -39,6 +39,7 @@ const {
   buildDealSheetPlacementCompositeKey,
   buildAdditionalCostLogCompositeKey,
   buildTerminationReasonLogCompositeKey,
+  applyManualColumnsCarryForward,
 } = require("./bigQueryClient");
 const { startDateOnOrAfterUtcMin, effectiveMinFilterDate, API_OWNED_COLUMNS } = require("./columnMappings");
 const { buildEnrichedRowsFromDealSheetCandidates } = require("./api/dealSheetEnricher");
@@ -1023,7 +1024,22 @@ async function backfillPlacementRecordFromNexus(params = {}) {
     };
   }
 
-  const insertResult = await insertEnrichedDealSheetBatch([row], 0, {
+  let rowToInsert = row;
+  const backfillDsid = row?.DEAL_SHEET_ID == null ? "" : String(row.DEAL_SHEET_ID).trim();
+  const backfillPid = row?.PLACEMENT_ID == null ? "" : String(row.PLACEMENT_ID).trim();
+  if (backfillDsid && backfillPid) {
+    const baselineMap = await fetchLatestRowsByDealSheetPlacementPairs([row], {
+      datasetId: effectiveDatasetId,
+      tableId: effectiveTableId,
+    });
+    const compositeKey = buildDealSheetPlacementCompositeKey(backfillDsid, backfillPid);
+    const baseline = baselineMap.get(compositeKey) || null;
+    if (baseline) {
+      rowToInsert = applyManualColumnsCarryForward(row, baseline).row;
+    }
+  }
+
+  const insertResult = await insertEnrichedDealSheetBatch([rowToInsert], 0, {
     appendOnChangeByDealSheet: false,
     skip_contract_id: true,
     generatedUuidField,
