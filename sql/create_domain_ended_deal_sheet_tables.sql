@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_ended_dea
   UPDATED_AT TIMESTAMP,
   GP_PERCENTAGE FLOAT64,
   ONSITE_AM STRING,
+  ONSITE_AM_EMAIL STRING,
   SECONDARY_EMAIL STRING,
   `TYPE` INT64,
   WEEKLY_WALLET_MONEY FLOAT64,
@@ -174,7 +175,10 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_ended_dea
   DELIVERY_DIRECTOR_EMP_NO STRING,
   ID STRING,
   MOVE_RUNRATE STRING,
-  IS_REJECTED STRING
+  IS_REJECTED STRING,
+  LEVEL_2_CSM STRING,
+  LEVEL_3_CSM STRING,
+  LEVEL_4_CSM STRING,
 );
 
 CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_canada_ended_deal_sheet`

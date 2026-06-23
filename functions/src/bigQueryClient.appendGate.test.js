@@ -192,6 +192,26 @@ test("hasBusinessColumnChanges: API column change still detected with manual col
   assert.equal(hasBusinessColumnChanges(incoming, existing, IGNORE), true);
 });
 
+test("applyManualColumnsCarryForward: preserves LEVEL_2_CSM from baseline", () => {
+  const incoming = {
+    PLACEMENT_STATUS: "STARTED",
+    LEVEL_2_CSM: "incoming value",
+    LEVEL_3_CSM: "incoming level 3",
+    LEVEL_4_CSM: "incoming level 4",
+  };
+  const baseline = {
+    PLACEMENT_STATUS: "ENDED",
+    LEVEL_2_CSM: "manual value",
+    LEVEL_3_CSM: "baseline level 3",
+    LEVEL_4_CSM: "baseline level 4",
+  };
+  const out = applyManualColumnsCarryForward(incoming, baseline);
+  assert.equal(out.row.LEVEL_2_CSM, "manual value");
+  assert.equal(out.row.LEVEL_3_CSM, "baseline level 3");
+  assert.equal(out.row.LEVEL_4_CSM, "baseline level 4");
+  assert.equal(out.row.PLACEMENT_STATUS, "STARTED");
+});
+
 test("applyManualColumnsCarryForward: copies manual columns from baseline to incoming", () => {
   const incoming = {
     DEAL_SHEET_ID: 1,
@@ -445,6 +465,34 @@ test("applyNewHireDateFreeze: baseline null NEW_HIRE_DATE keeps incoming", () =>
   const out = applyNewHireDateFreeze(incoming, baseline);
   assert.equal(out.row.NEW_HIRE_DATE, "2026-06-03T10:13:07.779Z");
   assert.equal(out.frozen, false);
+});
+
+test("applyNewHireDateFreeze: EXTENSION baseline with NEW_HIRE_DATE freezes when incoming is null", () => {
+  const incoming = {
+    DEAL_TYPE: "extension",
+    NEW_HIRE_DATE: null,
+  };
+  const baseline = {
+    DEAL_TYPE: "extension",
+    NEW_HIRE_DATE: "2026-05-31T00:13:22.094Z",
+  };
+  const out = applyNewHireDateFreeze(incoming, baseline);
+  assert.equal(out.row.NEW_HIRE_DATE, "2026-05-31T00:13:22.094Z");
+  assert.equal(out.frozen, true);
+});
+
+test("applyNewHireDateFreeze: EXTENSION baseline freezes manual date over incoming API date", () => {
+  const incoming = {
+    DEAL_TYPE: "extension",
+    NEW_HIRE_DATE: "2026-06-03T10:13:07.779Z",
+  };
+  const baseline = {
+    DEAL_TYPE: "extension",
+    NEW_HIRE_DATE: "2026-05-31T00:13:22.094Z",
+  };
+  const out = applyNewHireDateFreeze(incoming, baseline);
+  assert.equal(out.row.NEW_HIRE_DATE, "2026-05-31T00:13:22.094Z");
+  assert.equal(out.frozen, true);
 });
 
 test("applyManualColumnsCarryForward: does not carry NEW_HIRE_DATE from baseline", () => {

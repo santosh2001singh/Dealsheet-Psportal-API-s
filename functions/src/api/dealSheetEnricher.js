@@ -10,6 +10,7 @@ const {
   nexusFetchAllJsonBatched,
   getNexusAccessToken,
   nexusGetJson,
+  nexusGetJsonWithRetry,
   normalizePagedResponse,
   firstPagedItemOrNull,
   normalizeNexusResourceId,
@@ -39,9 +40,13 @@ const {
   mapDealSheetUsersToBq,
   mapCandidateToBq,
   mapCandidateCandidateTypesToBq,
+  clientOfferingHasClientTypeText,
+  resolveClientOfferingForEnrich,
   pickClientOfferingRowForJob,
   computeDerivedPlacementFields,
   coerceApiFloatNullsToZero,
+  resolveNewHireDateFromSubmittalNotes,
+  resolveNewHireDateForDealRow,
 } = require("../columnMappings");
 const { computeBonusTotals } = require("../bonusTotals");
 const { computeWeekSplit } = require("../weekSplit");
@@ -60,6 +65,39 @@ const {
 function extractItems(page) {
   const { items } = normalizePagedResponse(page);
   return Array.isArray(items) ? items : [];
+}
+
+function resolveSubmittalRowForCandidate(c, ctx) {
+  const jobId = normalizeNexusResourceId(c?.job);
+  const candId = normalizeNexusResourceId(c?.candidate);
+  const dealSheetId = normalizeNexusResourceId(c?.deal_sheet);
+  let submittalRow = ctx.hasPreloadedSubmittals
+    ? getPreloadedSubmittalRow(ctx.preloadedSubmittals, jobId, candId)
+    : null;
+  if (!submittalRow && !ctx.hasPreloadedSubmittals && dealSheetId) {
+    const detail = ctx.dealSheetById.get(String(dealSheetId));
+    const recruiterIdForSub = detail?.recruiter;
+    const subKey =
+      jobId != null && recruiterIdForSub != null && candId != null
+        ? `${jobId}:${recruiterIdForSub}:${candId}`
+        : null;
+    submittalRow = subKey ? ctx.submittalByKey.get(subKey) ?? null : null;
+  }
+  return submittalRow;
+}
+
+async function fetchAllJobSubmittalNotesForPlacement(placementId, accessToken) {
+  const items = [];
+  let requestUrl = buildUrl(`${config.nexus.baseUrl}/api/job-submittal-notes/`, {
+    job_submittal_id: placementId,
+  });
+  while (requestUrl) {
+    const page = await nexusGetJsonWithRetry(requestUrl, accessToken);
+    const normalized = normalizePagedResponse(page);
+    if (normalized.items?.length) items.push(...normalized.items);
+    requestUrl = normalized.next || null;
+  }
+  return items;
 }
 
 /**
@@ -151,9 +189,9 @@ function getPreloadedSubmittalRow(preloadedSubmittals, jobId, candidateId) {
 }
 
 /**
- * Check if embedded client object has enough fields to map directly
+ * Embedded client has fields required by mapClientToBq (geo + name).
  */
-function isEmbeddedClientSufficient(clientObj) {
+function isEmbeddedClientGeoSufficient(clientObj) {
   if (!clientObj || typeof clientObj !== "object") return false;
   const hasId = clientObj.id != null && String(clientObj.id).trim() !== "";
   const hasName = clientObj.name != null && String(clientObj.name).trim() !== "";
@@ -166,12 +204,44 @@ function isEmbeddedClientSufficient(clientObj) {
       (zd.zipcode != null && String(zd.zipcode).trim() !== "") ||
       (zd.city != null && String(zd.city).trim() !== "")
     );
+  return hasId && hasName && hasGeo;
+}
+
+function isEmbeddedClientOfferingMspSufficient(clientObj) {
+  const offerings = clientObj?.client_offerings;
+  if (!Array.isArray(offerings) || offerings.length === 0) return false;
+  return offerings.some((o) => o?.msp != null && typeof o.msp === "object");
+}
+
+function embeddedClientOfferingsSkippable(clientObj, jobObj) {
+  if (!isEmbeddedClientOfferingMspSufficient(clientObj)) return false;
   const offerings = clientObj.client_offerings;
-  const hasOfferings = Array.isArray(offerings) && offerings.length > 0;
-  const hasClientSettingType = hasOfferings && offerings.some(
-    (o) => o?.client_setting_type != null && typeof o.client_setting_type === "object"
-  );
-  return hasId && hasName && hasGeo && hasOfferings && hasClientSettingType;
+  if (!jobObj) {
+    return offerings.every((o) => clientOfferingHasClientTypeText(o));
+  }
+  const picked = pickClientOfferingRowForJob(offerings, jobObj);
+  return picked != null && clientOfferingHasClientTypeText(picked);
+}
+
+/** @deprecated use isEmbeddedClientGeoSufficient */
+function isEmbeddedClientSufficient(clientObj) {
+  return isEmbeddedClientGeoSufficient(clientObj);
+}
+
+function registerEmbeddedClientSkips(sub, candidateClientId, jobObj, skipDetail, skipOfferings) {
+  const embeddedClient = sub?.client;
+  const cid = normalizeNexusResourceId(candidateClientId);
+  const embeddedId =
+    embeddedClient?.id == null || String(embeddedClient.id).trim() === ""
+      ? null
+      : String(embeddedClient.id).trim();
+  if (!cid || !embeddedId || cid !== embeddedId) return;
+  if (isEmbeddedClientGeoSufficient(embeddedClient)) {
+    skipDetail.add(cid);
+  }
+  if (embeddedClientOfferingsSkippable(embeddedClient, jobObj)) {
+    skipOfferings.add(cid);
+  }
 }
 
 /**
@@ -234,7 +304,8 @@ function collectCandidateApiFailureKinds({
   jobId,
   candId,
   clientId,
-  skipClientFetchIds,
+  skipClientDetailFetchIds,
+  skipClientOfferingsFetchIds,
   failedIdsByKind,
   failedSubmittalKeys,
   dealSheetById,
@@ -255,14 +326,26 @@ function collectCandidateApiFailureKinds({
     if (failedIdsByKind.cand.has(candKey)) failedKinds.push(`cand:${candKey}`);
     if (failedIdsByKind.candtype.has(candKey)) failedKinds.push(`candtype:${candKey}`);
   }
-  if (clientKey && !skipClientFetchIds.has(clientKey)) {
-    if (failedIdsByKind.client.has(clientKey)) failedKinds.push(`client:${clientKey}`);
-    if (failedIdsByKind.clioff.has(clientKey)) failedKinds.push(`clioff:${clientKey}`);
-    const clientObjEarly = clientById.get(clientKey);
-    if (clientObjEarly) {
-      const parentKeyEarly = normalizeParentClientIdRef(clientObjEarly?.parent_client);
-      if (parentKeyEarly && failedIdsByKind.par.has(parentKeyEarly)) {
-        failedKinds.push(`par:${parentKeyEarly}`);
+  if (clientKey) {
+    if (
+      !skipClientDetailFetchIds.has(clientKey)
+      && failedIdsByKind.client.has(clientKey)
+    ) {
+      failedKinds.push(`client:${clientKey}`);
+    }
+    if (
+      !skipClientOfferingsFetchIds.has(clientKey)
+      && failedIdsByKind.clioff.has(clientKey)
+    ) {
+      failedKinds.push(`clioff:${clientKey}`);
+    }
+    if (!skipClientDetailFetchIds.has(clientKey)) {
+      const clientObjEarly = clientById.get(clientKey);
+      if (clientObjEarly) {
+        const parentKeyEarly = normalizeParentClientIdRef(clientObjEarly?.parent_client);
+        if (parentKeyEarly && failedIdsByKind.par.has(parentKeyEarly)) {
+          failedKinds.push(`par:${parentKeyEarly}`);
+        }
       }
     }
   }
@@ -312,17 +395,18 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
   );
   const hasPreloadedSubmittals = preloadedSubmittals && preloadedSubmittals.size > 0;
 
-  const skipClientFetchIds = new Set();
+  const skipClientDetailFetchIds = new Set();
+  const skipClientOfferingsFetchIds = new Set();
   if (hasPreloadedSubmittals) {
     for (const c of candidates) {
       const sub = getPreloadedSubmittalRow(preloadedSubmittals, c?.job, c?.candidate);
-      const embeddedClient = sub?.client;
-      const cid = normalizeNexusResourceId(c?.client);
-      const embeddedId = embeddedClient?.id == null || String(embeddedClient.id).trim() === "" ? null : String(embeddedClient.id);
-      if (!cid || !embeddedId || cid !== embeddedId) continue;
-      if (isEmbeddedClientSufficient(embeddedClient)) {
-        skipClientFetchIds.add(cid);
-      }
+      registerEmbeddedClientSkips(
+        sub,
+        c?.client,
+        null,
+        skipClientDetailFetchIds,
+        skipClientOfferingsFetchIds
+      );
     }
   }
 
@@ -387,15 +471,22 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
   }
 
   for (const id of clientIds) {
-    if (skipClientFetchIds.has(String(id))) continue;
-    wave1Urls.push(`${config.nexus.baseUrl}/api/clients/${encodeURIComponent(id)}/`);
-    wave1Ops.push({ k: "client", id });
-    wave1Urls.push(buildUrl(`${config.nexus.baseUrl}/api/client-offerings/`, { client_id: id }));
-    wave1Ops.push({ k: "clioff", id });
+    const clientKey = String(id);
+    const skipDetail = skipClientDetailFetchIds.has(clientKey);
+    const skipOfferings = skipClientOfferingsFetchIds.has(clientKey);
+    if (skipDetail && skipOfferings) continue;
+    if (!skipDetail) {
+      wave1Urls.push(`${config.nexus.baseUrl}/api/clients/${encodeURIComponent(id)}/`);
+      wave1Ops.push({ k: "client", id });
+    }
+    if (!skipOfferings) {
+      wave1Urls.push(buildUrl(`${config.nexus.baseUrl}/api/client-offerings/`, { client_id: id }));
+      wave1Ops.push({ k: "clioff", id });
+    }
   }
 
   logLine(
-    `[enriched sync] STEP 3/4 ENRICH APIS wave1: GET deal-sheets, hours, revenue, rates, additionalCosts, travelAllowances, clientCosts, rateChanges, jobs, candidates, candidateTypes, clients, clientOfferings totalRequests=${wave1Urls.length} clientsSkippedWave1=${skipClientFetchIds.size}`
+    `[enriched sync] STEP 3/4 ENRICH APIS wave1: GET deal-sheets, hours, revenue, rates, additionalCosts, travelAllowances, clientCosts, rateChanges, jobs, candidates, candidateTypes, clients, clientOfferings totalRequests=${wave1Urls.length} clientsDetailSkipped=${skipClientDetailFetchIds.size} clientOfferingsSkipped=${skipClientOfferingsFetchIds.size}`
   );
 
   const wave1Start = Date.now();
@@ -469,6 +560,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     if (!obj) continue;
     const ps = normalizeParentClientIdRef(obj?.parent_client);
     if (!ps) continue;
+    if (parentClientNameFromEmbedded(obj)) continue;
     if (parentClientById.has(ps) || parentFetchSeen.has(ps)) continue;
     parentFetchSeen.add(ps);
     parentIdsToFetch.push(ps);
@@ -477,9 +569,10 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     for (const c of candidates) {
       const sub = getPreloadedSubmittalRow(preloadedSubmittals, c?.job, c?.candidate);
       const embeddedClient = sub?.client;
-      if (!isEmbeddedClientSufficient(embeddedClient)) continue;
+      if (!isEmbeddedClientGeoSufficient(embeddedClient)) continue;
       const ps = normalizeParentClientIdRef(embeddedClient?.parent_client);
       if (!ps) continue;
+      if (parentClientNameFromEmbedded(embeddedClient)) continue;
       if (parentClientById.has(ps) || parentFetchSeen.has(ps)) continue;
       parentFetchSeen.add(ps);
       parentIdsToFetch.push(ps);
@@ -618,29 +711,69 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
   /** @type {Map<string, object[]>} */
   const terminationByPlacementId = new Map();
 
-  if (fetchTerminationDetails) {
-    function resolveSubmittalRowForCandidate(c) {
-      const jobId = normalizeNexusResourceId(c?.job);
-      const candId = normalizeNexusResourceId(c?.candidate);
-      const dealSheetId = normalizeNexusResourceId(c?.deal_sheet);
-      let submittalRow = hasPreloadedSubmittals
-        ? getPreloadedSubmittalRow(preloadedSubmittals, jobId, candId)
-        : null;
-      if (!submittalRow && !hasPreloadedSubmittals && dealSheetId) {
-        const detail = dealSheetById.get(String(dealSheetId));
-        const recruiterIdForSub = detail?.recruiter;
-        const subKey =
-          jobId != null && recruiterIdForSub != null && candId != null
-            ? `${jobId}:${recruiterIdForSub}:${candId}`
-            : null;
-        submittalRow = subKey ? submittalByKey.get(subKey) ?? null : null;
-      }
-      return submittalRow;
-    }
+  const submittalCtx = {
+    hasPreloadedSubmittals,
+    preloadedSubmittals,
+    dealSheetById,
+    submittalByKey,
+  };
 
+  /** @type {Map<string, object[]>} */
+  const notesByPlacementId = new Map();
+  const notesPlacementIds = new Set();
+  for (const c of candidates) {
+    const submittalRow = resolveSubmittalRowForCandidate(c, submittalCtx);
+    const jobId = normalizeNexusResourceId(c?.job);
+    const jobObj = jobId == null || String(jobId).trim() === "" ? null : jobById.get(String(jobId)) ?? null;
+    const submittalPart = mapJobSubmittalToBq(submittalRow, jobObj);
+    const placementId = submittalPart?.PLACEMENT_ID;
+    if (placementId != null) notesPlacementIds.add(String(placementId));
+  }
+
+  const notesPlacementIdList = [...notesPlacementIds];
+  if (notesPlacementIdList.length > 0) {
+    logLine(
+      `[enriched sync] STEP 3/4 ENRICH APIS submittal-notes: uniqueCalls=${notesPlacementIdList.length}`
+    );
+    const notesStart = Date.now();
+    const maxPerBatch = config.fetchAllMax;
+    let notesWithData = 0;
+    let notesFailed = 0;
+    for (let i = 0; i < notesPlacementIdList.length; i += maxPerBatch) {
+      const batch = notesPlacementIdList.slice(i, i + maxPerBatch);
+      const results = await Promise.all(
+        batch.map(async (pid) => {
+          try {
+            const items = await fetchAllJobSubmittalNotesForPlacement(pid, accessToken);
+            return { pid, items, error: null };
+          } catch (e) {
+            return { pid, items: [], error: e };
+          }
+        })
+      );
+      for (const { pid, items, error } of results) {
+        if (error) {
+          notesFailed++;
+          logLine(
+            `[enriched sync] WARN submittal-notes placement=${pid} failed: ${String(error.message || error).slice(0, 100)}`
+          );
+          continue;
+        }
+        if (items.length > 0) {
+          notesByPlacementId.set(pid, items);
+          notesWithData++;
+        }
+      }
+    }
+    logLine(
+      `[enriched sync] STEP 3/4 ENRICH APIS submittal-notes: responses=${notesPlacementIdList.length} withData=${notesWithData} failed=${notesFailed} httpMs=${Date.now() - notesStart}`
+    );
+  }
+
+  if (fetchTerminationDetails) {
     const eligiblePlacementIds = new Set();
     for (const c of candidates) {
-      const submittalRow = resolveSubmittalRowForCandidate(c);
+      const submittalRow = resolveSubmittalRowForCandidate(c, submittalCtx);
       const jobId = normalizeNexusResourceId(c?.job);
       const jobObj = jobId == null || String(jobId).trim() === "" ? null : jobById.get(String(jobId)) ?? null;
       const submittalPart = mapJobSubmittalToBq(submittalRow, jobObj);
@@ -711,16 +844,21 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       jobId,
       candId,
       clientId,
-      skipClientFetchIds,
+      skipClientDetailFetchIds,
+      skipClientOfferingsFetchIds,
       failedIdsByKind,
       failedSubmittalKeys,
       dealSheetById,
       clientById,
       hasPreloadedSubmittals,
     });
-    if (submittalRow?.client && isEmbeddedClientSufficient(submittalRow.client)) {
+    if (submittalRow?.client && isEmbeddedClientGeoSufficient(submittalRow.client)) {
       const parentKeyEmbedded = normalizeParentClientIdRef(submittalRow.client?.parent_client);
-      if (parentKeyEmbedded && failedIdsByKind.par.has(parentKeyEmbedded)) {
+      if (
+        parentKeyEmbedded
+        && !parentClientNameFromEmbedded(submittalRow.client)
+        && failedIdsByKind.par.has(parentKeyEmbedded)
+      ) {
         failedKinds.push(`par:${parentKeyEmbedded}`);
       }
     }
@@ -739,7 +877,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     const candidatePart = mapDealSheetCandidateToBq(c, { persistDealSheetStatusFromCandidate });
     const embeddedClient = submittalRow?.client;
     const useEmbeddedClient =
-      isEmbeddedClientSufficient(embeddedClient) &&
+      isEmbeddedClientGeoSufficient(embeddedClient) &&
       clientId != null &&
       clientId !== "" &&
       String(embeddedClient?.id ?? "") === String(clientId);
@@ -793,12 +931,10 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     const jobObj = jobId == null || String(jobId).trim() === "" ? null : jobById.get(String(jobId)) ?? null;
     const jobPart = mapJobToBq(jobObj);
 
-    const clientOfferingItems = useEmbeddedClient
-      ? Array.isArray(embeddedClient?.client_offerings) ? embeddedClient.client_offerings : []
-      : clientId == null || clientId === ""
-        ? []
-        : clientOfferingsByClient.get(String(clientId)) ?? [];
-    const clientOfferingRow = pickClientOfferingRowForJob(clientOfferingItems, jobObj);
+    const apiOfferings = clientId == null || clientId === ""
+      ? []
+      : clientOfferingsByClient.get(String(clientId)) ?? [];
+    const clientOfferingRow = resolveClientOfferingForEnrich(submittalRow, apiOfferings, jobObj);
     const mspPart = mapMspFromClientOfferingRow(clientOfferingRow);
 
     const ratesList = ratesByDs.get(String(dealSheetId)) ?? [];
@@ -847,6 +983,12 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       terminationReason = latestTerm ? extractTerminationReasonValue(latestTerm) : null;
     }
 
+    const placementIdForNotes = submittalPart?.PLACEMENT_ID;
+    const notesForPlacement = placementIdForNotes != null
+      ? notesByPlacementId.get(String(placementIdForNotes)) ?? []
+      : [];
+    const newHireDate = resolveNewHireDateForDealRow(dealSheetPart?.DEAL_TYPE, notesForPlacement);
+
     const row = {
       ...candidatePart,
       ...clientPart,
@@ -870,6 +1012,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       START_DATE: submittalPart?.START_DATE ?? null,
       TENTATIVE_DATE: submittalPart?.TENTATIVE_DATE ?? jobPart?.TENTATIVE_DATE ?? null,
       TERMINATION_REASON: terminationReason,
+      NEW_HIRE_DATE: newHireDate,
     };
     const newRateFamilyPart = computeNewRateFamily(row);
     const derivedPart = computeDerivedPlacementFields(row);
@@ -937,4 +1080,8 @@ module.exports = {
   isAllowedSubmittalStatus,
   createFailedIdsByKind,
   collectCandidateApiFailureKinds,
+  isEmbeddedClientGeoSufficient,
+  isEmbeddedClientOfferingMspSufficient,
+  embeddedClientOfferingsSkippable,
+  registerEmbeddedClientSkips,
 };

@@ -788,10 +788,13 @@ function applyTentativeDateFreeze(incomingRow, baselineRow) {
 }
 
 /**
- * Freeze NEW_HIRE_DATE from baseline when present (first insert per placement only).
+ * Freeze NEW_HIRE_DATE from baseline when present (immutable once set; DEAL and EXTENSION).
  */
 function applyNewHireDateFreeze(incomingRow, baselineRow) {
-  if (!baselineRow || !incomingRow || typeof incomingRow !== "object") {
+  if (!incomingRow || typeof incomingRow !== "object") {
+    return { row: incomingRow, frozen: false };
+  }
+  if (!baselineRow || typeof baselineRow !== "object") {
     return { row: incomingRow, frozen: false };
   }
   if (isEmptyDateFieldValue(baselineRow.NEW_HIRE_DATE)) {
@@ -941,7 +944,8 @@ function formatDateInTimeZone(dateTime, timeZone) {
 }
 
 /**
- * Stamp NEW_HIRE_DATE / EXTENSION_DATE on first insert only (when row fields are empty).
+ * Stamp EXTENSION_DATE on first insert only (when row field is empty).
+ * NEW_HIRE_DATE is sourced from job-submittal-notes during enrich (not stamped here).
  * @returns {Record<string, string>} fields to merge into insert json (may be empty)
  */
 function computeDealSheetFirstInsertDateStamps(row, dateTime) {
@@ -953,10 +957,6 @@ function computeDealSheetFirstInsertDateStamps(row, dateTime) {
   const placementStatus = row?.PLACEMENT_STATUS == null
     ? ""
     : String(row.PLACEMENT_STATUS).trim().toUpperCase();
-
-  if (dealType === "DEAL" && isEmptyDateFieldValue(row.NEW_HIRE_DATE)) {
-    out.NEW_HIRE_DATE = String(dateTime);
-  }
 
   if (
     dealType === "EXTENSION"

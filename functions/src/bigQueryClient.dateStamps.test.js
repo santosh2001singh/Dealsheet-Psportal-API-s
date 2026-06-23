@@ -1,5 +1,5 @@
 /**
- * First-insert date stamps for NEW_HIRE_DATE and EXTENSION_DATE.
+ * First-insert date stamps for EXTENSION_DATE (NEW_HIRE_DATE comes from submittal notes enrich).
  */
 
 const test = require("node:test");
@@ -9,10 +9,10 @@ const { computeDealSheetFirstInsertDateStamps } = require("./bigQueryClient");
 
 const insertTs = "2026-06-03T15:04:05.123Z";
 
-test("computeDealSheetFirstInsertDateStamps: deal sets NEW_HIRE_DATE only", () => {
+test("computeDealSheetFirstInsertDateStamps: deal does not stamp NEW_HIRE_DATE", () => {
   const row = { DEAL_TYPE: "deal", PLACEMENT_STATUS: "BOOKED" };
   const out = computeDealSheetFirstInsertDateStamps(row, insertTs);
-  assert.equal(out.NEW_HIRE_DATE, insertTs);
+  assert.equal(Object.hasOwn(out, "NEW_HIRE_DATE"), false);
   assert.equal(Object.hasOwn(out, "EXTENSION_DATE"), false);
   assert.equal(Object.hasOwn(out, "ORIGINAL_START_DATE"), false);
 });
@@ -30,7 +30,7 @@ test("computeDealSheetFirstInsertDateStamps: extension without booked sets nothi
   assert.deepEqual(out, {});
 });
 
-test("computeDealSheetFirstInsertDateStamps: does not overwrite populated NEW_HIRE_DATE", () => {
+test("computeDealSheetFirstInsertDateStamps: populated NEW_HIRE_DATE unchanged (no stamp)", () => {
   const row = {
     DEAL_TYPE: "deal",
     NEW_HIRE_DATE: "2025-01-01T00:00:00.000Z",
@@ -62,13 +62,7 @@ test("computeDealSheetFirstInsertDateStamps: empty dateTime yields nothing", () 
   assert.deepEqual(computeDealSheetFirstInsertDateStamps(row, ""), {});
 });
 
-test("computeDealSheetFirstInsertDateStamps: blank string fields treated as empty", () => {
-  const dealRow = { DEAL_TYPE: "deal", NEW_HIRE_DATE: "  " };
-  assert.equal(
-    computeDealSheetFirstInsertDateStamps(dealRow, insertTs).NEW_HIRE_DATE,
-    insertTs
-  );
-
+test("computeDealSheetFirstInsertDateStamps: blank EXTENSION_DATE treated as empty", () => {
   const extRow = {
     DEAL_TYPE: "extension",
     PLACEMENT_STATUS: "BOOKED",

@@ -68,8 +68,15 @@ function mapClientToBq(client, parentClientName) {
   
   const stateCode = (zd?.state_code ?? "").toString().trim() || null;
   const region = mapUsStateCodeToRegion(stateCode);
-  const parentName = parentClientName != null && String(parentClientName).trim() !== ""
-    ? String(parentClientName).trim() : null;
+  const facilityName =
+    client.name == null || String(client.name).trim() === ""
+      ? null
+      : String(client.name).trim();
+  const parentFromApi =
+    parentClientName != null && String(parentClientName).trim() !== ""
+      ? String(parentClientName).trim()
+      : null;
+  const parentName = parentFromApi ?? facilityName;
   
   const rawParent = client?.parent_client;
   const rawParentId =
@@ -294,6 +301,7 @@ function mapDealSheetUsersToBq(dealSheet, recruiterUser, salesRepUser, submittal
     CLIENT_SALES_REP_ID:
       toIntOrNull(dealSheet?.sales_rep) ?? salesRepIdFromSubmittal ?? null,
     ONSITE_AM: mapUserToFullName(salesRepUser),
+    ONSITE_AM_EMAIL: salesRepUser?.email ?? null,
   };
 }
 
@@ -447,6 +455,14 @@ function normalizeOfferingKeyForMatch(v) {
   return String(v).trim().toUpperCase();
 }
 
+function offeringKeyFromClientOfferingRow(row) {
+  return normalizeOfferingKeyForMatch(row?.offering ?? row?.offering_id);
+}
+
+function subOfferingKeyFromClientOfferingRow(row) {
+  return normalizeOfferingKeyForMatch(row?.sub_offering ?? row?.sub_offering_id);
+}
+
 /**
  * Pick client offering row for job
  */
@@ -455,16 +471,56 @@ function pickClientOfferingRowForJob(items, job) {
   const jo = normalizeOfferingKeyForMatch(job?.offering);
   const js = normalizeOfferingKeyForMatch(job?.sub_offering);
   if (!jo) return items[0];
-  
+
   for (const r of items) {
-    if (normalizeOfferingKeyForMatch(r?.offering) !== jo) continue;
-    const rs = normalizeOfferingKeyForMatch(r?.sub_offering);
-    if (rs === js) return r;
+    if (offeringKeyFromClientOfferingRow(r) !== jo) continue;
+    if (subOfferingKeyFromClientOfferingRow(r) === js) return r;
   }
   for (const r of items) {
-    if (normalizeOfferingKeyForMatch(r?.offering) === jo) return r;
+    if (offeringKeyFromClientOfferingRow(r) === jo) return r;
   }
   return items[0];
+}
+
+function clientOfferingHasClientTypeText(row) {
+  if (!row || typeof row !== "object") return false;
+  const cst = row.client_setting_type;
+  return cst != null
+    && typeof cst === "object"
+    && cst.value != null
+    && String(cst.value).trim() !== "";
+}
+
+/**
+ * Prefer embedded submittal client offerings; merge CLIENT_TYPE from API list when missing.
+ */
+function resolveClientOfferingForEnrich(submittalRow, clientOfferingsFromApi, job) {
+  const embeddedClient = submittalRow?.client;
+  const embeddedItems = Array.isArray(embeddedClient?.client_offerings)
+    ? embeddedClient.client_offerings
+    : [];
+  const apiItems = Array.isArray(clientOfferingsFromApi) ? clientOfferingsFromApi : [];
+
+  let picked = embeddedItems.length > 0
+    ? pickClientOfferingRowForJob(embeddedItems, job)
+    : null;
+
+  if (picked && clientOfferingHasClientTypeText(picked)) {
+    return picked;
+  }
+
+  if (picked && apiItems.length > 0) {
+    const apiPicked = pickClientOfferingRowForJob(apiItems, job);
+    if (apiPicked && clientOfferingHasClientTypeText(apiPicked)) {
+      return { ...picked, client_setting_type: apiPicked.client_setting_type };
+    }
+  }
+
+  if (!picked && apiItems.length > 0) {
+    return pickClientOfferingRowForJob(apiItems, job);
+  }
+
+  return picked;
 }
 
 /**
@@ -1220,6 +1276,51 @@ function isTerminationApiEligiblePlacementStatus(status) {
   return key !== "" && TERMINATION_API_ELIGIBLE_PLACEMENT_STATUSES.has(key);
 }
 
+function submittalNoteStatusCode(note) {
+  const code = note?.org_submittal_status?.code;
+  return code == null ? "" : String(code).trim().toUpperCase();
+}
+
+function submittalNoteTimestampMs(note) {
+  const raw = note?.modified_date ?? note?.created_date;
+  if (raw == null || String(raw).trim() === "") return Number.POSITIVE_INFINITY;
+  const ms = Date.parse(String(raw).trim());
+  return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Earliest BOOKED job-submittal-note modified_date for NEW_HIRE_DATE.
+ * @param {object[]} notes
+ * @returns {string|null}
+ */
+function resolveNewHireDateFromSubmittalNotes(notes) {
+  if (!notes || notes.length === 0) return null;
+  let earliestMs = Number.POSITIVE_INFINITY;
+  let earliestRaw = null;
+  for (const note of notes) {
+    if (submittalNoteStatusCode(note) !== "BOOKED") continue;
+    const ms = submittalNoteTimestampMs(note);
+    if (ms < earliestMs) {
+      earliestMs = ms;
+      const raw = note?.modified_date ?? note?.created_date;
+      earliestRaw = raw == null ? null : String(raw).trim() || null;
+    }
+  }
+  return earliestRaw;
+}
+
+/**
+ * NEW_HIRE_DATE from submittal notes for DEAL rows only; EXTENSION always null.
+ * @param {string|null|undefined} dealType
+ * @param {object[]} notes
+ * @returns {string|null}
+ */
+function resolveNewHireDateForDealRow(dealType, notes) {
+  const key = dealType == null ? "" : String(dealType).trim().toUpperCase();
+  if (key !== "DEAL") return null;
+  return resolveNewHireDateFromSubmittalNotes(notes);
+}
+
 /**
  * Pick display VALUE from cancellation/termination API item (priority order).
  */
@@ -1313,6 +1414,7 @@ const API_OWNED_COLUMNS = new Set([
   "CLIENT_SALES_REP",
   "CLIENT_SALES_REP_ID",
   "ONSITE_AM",
+  "ONSITE_AM_EMAIL",
   "VMS_JOB_ID",
   "START_DATE",
   "OFFER_TIME_START_DATE",
@@ -1376,7 +1478,8 @@ Object.freeze(API_OWNED_COLUMNS);
  * `IS_REJECTED` is reset by applyIsRejectedResetForChangedUpdate,
  * `MOVE_RUNRATE` is gated by applyMoveRunrateAppendOverride,
  * `TENTATIVE_DATE` is frozen by applyTentativeDateFreeze (release on START_DATE change),
- * `NEW_HIRE_DATE` is frozen by applyNewHireDateFreeze (first insert only per placement).
+ * `NEW_HIRE_DATE` is set from job-submittal-notes (earliest BOOKED modified_date) for DEAL rows when baseline is empty;
+ * EXTENSION rows are not set from API on enrich; once baseline has a value it is frozen on update-append (DEAL or EXTENSION).
  */
 const SYSTEM_CONTROLLED_COLUMNS = new Set([
   "ID",
@@ -1441,6 +1544,9 @@ const MANUAL_COLUMNS = new Set([
   "GRP_DIR_ASSOC_GRP_DIR_EMP_NO",
   "HOURLY_GP",
   "INV_CYC_TO_CLT",
+  "LEVEL_2_CSM",
+  "LEVEL_3_CSM",
+  "LEVEL_4_CSM",
   "IS_DELETED",
   "ONB_CAND_DOB",
   "ONB_E_VERIFY",
@@ -1493,6 +1599,8 @@ module.exports = {
   mapDealSheetUsersToBq,
   mapJobToBq,
   pickClientOfferingRowForJob,
+  clientOfferingHasClientTypeText,
+  resolveClientOfferingForEnrich,
   mapMspFromClientOfferingRow,
   mapJobProfessionSpecialtyFromJob,
   mapDealSheetHoursDetailsToBq,
@@ -1514,6 +1622,8 @@ module.exports = {
   effectiveMinFilterDate,
   coerceApiFloatNullsToZero,
   isTerminationApiEligiblePlacementStatus,
+  resolveNewHireDateFromSubmittalNotes,
+  resolveNewHireDateForDealRow,
   extractTerminationReasonValue,
   pickLatestTerminationDetailItem,
   mapTerminationReasonLogRowForDealSheet,

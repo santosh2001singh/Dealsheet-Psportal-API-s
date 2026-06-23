@@ -23,9 +23,15 @@ const {
   mapJobProfessionSpecialtyFromJob,
   computeBqEndDateFromSubmittal,
   isTerminationApiEligiblePlacementStatus,
+  resolveNewHireDateFromSubmittalNotes,
+  resolveNewHireDateForDealRow,
   extractTerminationReasonValue,
   pickLatestTerminationDetailItem,
   mapTerminationReasonLogRowForDealSheet,
+  pickClientOfferingRowForJob,
+  clientOfferingHasClientTypeText,
+  resolveClientOfferingForEnrich,
+  mapClientToBq,
   API_OWNED_COLUMNS,
   SYSTEM_CONTROLLED_COLUMNS,
   MANUAL_COLUMNS,
@@ -756,6 +762,96 @@ test("mapMspFromClientOfferingRow trims and nulls empty CLIENT_TYPE", () => {
   assert.equal(out.CLIENT_TYPE, null);
 });
 
+test("pickClientOfferingRowForJob matches offering_id and sub_offering_id aliases", () => {
+  const items = [
+    { offering_id: "LOCUMS", sub_offering_id: "PHYSICIAN", msp: { id: 1, name: "Wrong" } },
+    { offering_id: "NURSING", sub_offering_id: null, msp: { id: 263, name: "Medical Solutions" } },
+  ];
+  const job = { offering: "NURSING", sub_offering: null };
+  const picked = pickClientOfferingRowForJob(items, job);
+  assert.equal(picked.msp.name, "Medical Solutions");
+});
+
+test("clientOfferingHasClientTypeText requires client_setting_type.value", () => {
+  assert.equal(
+    clientOfferingHasClientTypeText({ client_setting_type: { value: "VMS" } }),
+    true
+  );
+  assert.equal(clientOfferingHasClientTypeText({ msp: { id: 1, name: "X" } }), false);
+  assert.equal(clientOfferingHasClientTypeText({ client_setting_type: 449 }), false);
+});
+
+test("resolveClientOfferingForEnrich merges CLIENT_TYPE from API when embedded lacks it", () => {
+  const submittalRow = {
+    client: {
+      client_offerings: [
+        {
+          offering_id: "NURSING",
+          msp: { id: 263, name: "Medical Solutions" },
+        },
+      ],
+    },
+  };
+  const apiOfferings = [
+    {
+      offering: "NURSING",
+      client_setting_type: { value: "VMS" },
+      msp: { id: 263, name: "Medical Solutions" },
+    },
+  ];
+  const job = { offering: "NURSING" };
+  const row = resolveClientOfferingForEnrich(submittalRow, apiOfferings, job);
+  const msp = mapMspFromClientOfferingRow(row);
+  assert.equal(msp.MSP_NAME, "Medical Solutions");
+  assert.equal(msp.CLIENT_TYPE, "VMS");
+});
+
+test("embedded submittal client maps geo fields via mapClientToBq", () => {
+  const embeddedClient = {
+    id: 1448683,
+    name: "Union Hospital Clinton",
+    parent_client: { id: 2542959, name: "Union Health - ML" },
+    zipcode_data: {
+      zipcode: "47842",
+      city: "Clinton",
+      state_code: "IN",
+    },
+    client_offerings: [
+      {
+        offering_id: "NURSING",
+        msp: { id: 263, name: "Medical Solutions" },
+      },
+    ],
+  };
+  const out = mapClientToBq(embeddedClient, "Union Health - ML");
+  assert.equal(out.END_CLIENT_DEPT_FACILITY, "Union Hospital Clinton");
+  assert.equal(out.CITY_ZIPCODE, "47842 Clinton");
+  assert.equal(out.CLIENT_STATE, "IN");
+  assert.equal(out.PARENT_CLIENT_NAME, "Union Health - ML");
+  assert.equal(out.NEXUS_PARENT_CLIENT_ID, 2542959);
+});
+
+test("mapClientToBq falls back PARENT_CLIENT_NAME to client name when parent is null", () => {
+  const client = {
+    id: 1448683,
+    name: "Union Hospital Clinton",
+    zipcode_data: { state_code: "IN" },
+  };
+  const out = mapClientToBq(client, null);
+  assert.equal(out.END_CLIENT_DEPT_FACILITY, "Union Hospital Clinton");
+  assert.equal(out.PARENT_CLIENT_NAME, "Union Hospital Clinton");
+});
+
+test("mapClientToBq falls back PARENT_CLIENT_NAME to client name when parent is blank", () => {
+  const client = {
+    id: 1448683,
+    name: "Union Hospital Clinton",
+    zipcode_data: { state_code: "IN" },
+  };
+  const out = mapClientToBq(client, "   ");
+  assert.equal(out.PARENT_CLIENT_NAME, "Union Hospital Clinton");
+});
+
 test("startDateOnOrAfterUtcMin false for null, blank, unparseable", () => {
   assert.equal(startDateOnOrAfterUtcMin(null, MAY_1_2026_MS), false);
   assert.equal(startDateOnOrAfterUtcMin("", MAY_1_2026_MS), false);
@@ -810,6 +906,7 @@ test("mapDealSheetUsersToBq prefers deal-sheet recruiter user over submittal rec
   assert.equal(out.CLIENT_SALES_REP, "Sales Rep");
   assert.equal(out.CLIENT_SALES_REP_ID, 300);
   assert.equal(out.ONSITE_AM, "Sales Rep");
+  assert.equal(out.ONSITE_AM_EMAIL, "sales@cynethealth.com");
 });
 
 test("mapDealSheetUsersToBq falls back to submittal recruiter when deal-sheet user missing", () => {
@@ -829,6 +926,7 @@ test("mapDealSheetUsersToBq falls back to submittal recruiter when deal-sheet us
   assert.equal(out.CLIENT_SALES_REP, null);
   assert.equal(out.CLIENT_SALES_REP_ID, null);
   assert.equal(out.ONSITE_AM, null);
+  assert.equal(out.ONSITE_AM_EMAIL, null);
 });
 
 test("mapDealSheetUsersToBq falls back to submittal sales_rep id when deal-sheet sales_rep null", () => {
@@ -837,6 +935,7 @@ test("mapDealSheetUsersToBq falls back to submittal sales_rep id when deal-sheet
   const out = mapDealSheetUsersToBq(dealSheet, null, null, submittalRow);
   assert.equal(out.CLIENT_SALES_REP_ID, 400);
   assert.equal(out.CLIENT_SALES_REP, null);
+  assert.equal(out.ONSITE_AM_EMAIL, null);
 });
 
 test("mapDealSheetUsersToBq uses deal-sheet recruiter id when both users null", () => {
@@ -848,6 +947,7 @@ test("mapDealSheetUsersToBq uses deal-sheet recruiter id when both users null", 
   assert.equal(out.CLIENT_SALES_REP, null);
   assert.equal(out.CLIENT_SALES_REP_ID, null);
   assert.equal(out.ONSITE_AM, null);
+  assert.equal(out.ONSITE_AM_EMAIL, null);
 });
 
 test("mapJobProfessionSpecialtyFromJob maps profession and specialty ids and names", () => {
@@ -1092,6 +1192,85 @@ test("pickLatestTerminationDetailItem chooses newest modified_date", () => {
   assert.equal(extractTerminationReasonValue(latest), "New");
 });
 
+function bookedNote(modifiedDate, noteText = "Status changed") {
+  return {
+    org_submittal_status: { code: "BOOKED", submittal_status: "Booked" },
+    note: noteText,
+    modified_date: modifiedDate,
+    created_date: modifiedDate,
+  };
+}
+
+test("resolveNewHireDateFromSubmittalNotes: earliest BOOKED modified_date (initial book)", () => {
+  const notes = [
+    bookedNote("2026-03-18T17:20:37Z", "Status changed to Offer Accepted"),
+    bookedNote("2026-03-18T17:20:37Z", " "),
+    {
+      org_submittal_status: { code: "INTERVIEWING" },
+      modified_date: "2026-03-17T19:30:38Z",
+    },
+    {
+      org_submittal_status: { code: "BOOKED" },
+      modified_date: "2026-06-12T15:54:25Z",
+      note: "Extension accepted",
+    },
+  ];
+  assert.equal(
+    resolveNewHireDateFromSubmittalNotes(notes),
+    "2026-03-18T17:20:37Z"
+  );
+});
+
+test("resolveNewHireDateFromSubmittalNotes: extension book uses earliest BOOKED only", () => {
+  const notes = [
+    bookedNote("2026-06-12T15:54:25Z", "Status changed to Offer Accepted"),
+    bookedNote("2026-06-12T15:54:25Z", "Extension accepted"),
+  ];
+  assert.equal(
+    resolveNewHireDateFromSubmittalNotes(notes),
+    "2026-06-12T15:54:25Z"
+  );
+});
+
+test("resolveNewHireDateFromSubmittalNotes: no BOOKED notes returns null", () => {
+  const notes = [
+    { org_submittal_status: { code: "INTERVIEWING" }, modified_date: "2026-03-17T19:30:38Z" },
+  ];
+  assert.equal(resolveNewHireDateFromSubmittalNotes(notes), null);
+  assert.equal(resolveNewHireDateFromSubmittalNotes([]), null);
+  assert.equal(resolveNewHireDateFromSubmittalNotes(null), null);
+});
+
+test("resolveNewHireDateFromSubmittalNotes: falls back to created_date when modified_date missing", () => {
+  const notes = [
+    {
+      org_submittal_status: { code: "BOOKED" },
+      created_date: "2026-01-15T10:00:00Z",
+    },
+  ];
+  assert.equal(
+    resolveNewHireDateFromSubmittalNotes(notes),
+    "2026-01-15T10:00:00Z"
+  );
+});
+
+test("resolveNewHireDateForDealRow: DEAL uses notes date, EXTENSION always null", () => {
+  const notes = [
+    {
+      org_submittal_status: { code: "BOOKED" },
+      modified_date: "2026-03-18T17:20:37Z",
+    },
+  ];
+  assert.equal(
+    resolveNewHireDateForDealRow("deal", notes),
+    "2026-03-18T17:20:37Z"
+  );
+  assert.equal(resolveNewHireDateForDealRow("DEAL", notes), "2026-03-18T17:20:37Z");
+  assert.equal(resolveNewHireDateForDealRow("extension", notes), null);
+  assert.equal(resolveNewHireDateForDealRow("EXTENSION", notes), null);
+  assert.equal(resolveNewHireDateForDealRow("deal", []), null);
+});
+
 test("TERMINATION_REASON is API-owned on deal sheet", () => {
   assert.equal(API_OWNED_COLUMNS.has("TERMINATION_REASON"), true);
 });
@@ -1100,6 +1279,14 @@ test("position and sales rep id columns are API-owned", () => {
   assert.equal(API_OWNED_COLUMNS.has("CATEGORIZATION_OF_POSITION_ID"), true);
   assert.equal(API_OWNED_COLUMNS.has("POSITION_ID"), true);
   assert.equal(API_OWNED_COLUMNS.has("CLIENT_SALES_REP_ID"), true);
+  assert.equal(API_OWNED_COLUMNS.has("ONSITE_AM_EMAIL"), true);
+});
+
+test("LEVEL_2_CSM, LEVEL_3_CSM, LEVEL_4_CSM are manual columns only", () => {
+  for (const col of ["LEVEL_2_CSM", "LEVEL_3_CSM", "LEVEL_4_CSM"]) {
+    assert.equal(MANUAL_COLUMNS.has(col), true);
+    assert.equal(API_OWNED_COLUMNS.has(col), false);
+  }
 });
 
 test("deal sheet schema columns are classified as API, SYSTEM, or MANUAL", () => {
