@@ -29,6 +29,24 @@ test("filterOfferRejectedRowsByMinTentativeDate uses TENTATIVE_DATE not START_DA
   assert.equal(out[0].TENTATIVE_DATE, "2026-05-01");
 });
 
+test("filterOfferRejectedRowsByMinTentativeDate: DID NOT START uses START_DATE when tentative null", () => {
+  const rows = [
+    {
+      PLACEMENT_STATUS: "DID NOT START",
+      TENTATIVE_DATE: null,
+      START_DATE: "2026-06-01",
+    },
+    {
+      PLACEMENT_STATUS: "DID NOT START",
+      TENTATIVE_DATE: null,
+      START_DATE: "2026-04-01",
+    },
+  ];
+  const out = filterOfferRejectedRowsByMinTentativeDate(rows);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].START_DATE, "2026-06-01");
+});
+
 test("transformOfferRejectedEndedRowsForBigQuery applies placement then tentative date", () => {
   const rows = [
     { PLACEMENT_STATUS: "ENDED", TENTATIVE_DATE: "2026-05-01" },

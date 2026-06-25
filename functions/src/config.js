@@ -57,6 +57,12 @@ const config = {
   /** Comma-separated Nexus organization_submittal_status_code values for /api/job-submittals/ list */
   submittalStatusCodes: process.env.SUBMITTAL_STATUS_CODES || "PERM_STARTS,ACTIVE,BOOKED",
 
+  /**
+   * When false, NEW_HIRE_DATE is not frozen on update-append and DEAL NEW_HIRE_DATE diffs trigger append
+   * (one-time migration: set NEW_HIRE_DATE_FREEZE_ENABLED=false in Firebase env, run update sync, re-enable).
+   */
+  newHireDateFreezeEnabled: process.env.NEW_HIRE_DATE_FREEZE_ENABLED !== "false",
+
   backfill: {
     /** Default pages per resume invocation (0 = no cap unless max_pages query is passed) */
     pageLimitPerRun: parseInt(process.env.BACKFILL_PAGE_LIMIT_PER_RUN || "0", 10),

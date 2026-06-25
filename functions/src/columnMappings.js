@@ -4,6 +4,10 @@
  */
 
 const { normalizeNexusResourceId } = require("./nexusClient");
+const {
+  isCynetHealthCanadaRecruiter,
+  computeCanadaDerivedPlacementFields,
+} = require("./canadaDerivedPlacementFields");
 
 /**
  * Convert value to number or null
@@ -842,6 +846,15 @@ function nexusBinaryFlagToBoolean(v) {
 }
 
 /**
+ * Canada tax type from Nexus deal sheet ten_ninty_nine_checked.
+ * true (1099) -> T4A; false/null -> T4.
+ */
+function mapCanadaTypeFromTenNintyNine(dealSheet) {
+  const is1099 = nexusBinaryFlagToBoolean(dealSheet?.ten_ninty_nine_checked);
+  return is1099 ? "T4A" : "T4";
+}
+
+/**
  * Map deal sheet rate change to BigQuery schema
  */
 function mapDealSheetRateChangeToBq(items, jobId) {
@@ -954,6 +967,10 @@ const DAYS_WORKED_ELIGIBLE_STATUSES = new Set([
  * Compute derived placement metrics for active sync rows
  */
 function computeDerivedPlacementFields(row) {
+  if (isCynetHealthCanadaRecruiter(row?.ASSIGNMENT_RECRUITER_EMAIL)) {
+    return computeCanadaDerivedPlacementFields(row);
+  }
+
   const payRate = toNumberOrNull(row?.PAY_RATE);
   const typeVal = row?.TYPE == null ? null : String(row.TYPE).trim();
   const weeklyPerDiem = toNumberOrNull(row?.WEEKLY_PER_DIEM_NON_TAXED) ?? 0;
@@ -1271,6 +1288,28 @@ function normalizePlacementStatusKeyForTermination(status) {
   return String(status).trim().toUpperCase().replace(/\s+/g, " ");
 }
 
+/** Uppercase trimmed placement status key (e.g. DID NOT START). */
+function normalizePlacementStatusKey(status) {
+  return normalizePlacementStatusKeyForTermination(status);
+}
+
+function isDidNotStartPlacementStatus(status) {
+  return normalizePlacementStatusKey(status) === "DID NOT START";
+}
+
+/**
+ * TENTATIVE_DATE for enriched row: null when placement is DID NOT START.
+ * @param {string|null|undefined} placementStatus
+ * @param {string|null|undefined} tentativeDate
+ * @returns {string|null}
+ */
+function resolveTentativeDateForPlacementRow(placementStatus, tentativeDate) {
+  if (isDidNotStartPlacementStatus(placementStatus)) return null;
+  if (tentativeDate == null) return null;
+  const s = String(tentativeDate).trim();
+  return s === "" ? null : tentativeDate;
+}
+
 function isTerminationApiEligiblePlacementStatus(status) {
   const key = normalizePlacementStatusKeyForTermination(status);
   return key !== "" && TERMINATION_API_ELIGIBLE_PLACEMENT_STATUSES.has(key);
@@ -1453,6 +1492,7 @@ const API_OWNED_COLUMNS = new Set([
   "CALL_BACK_RATE",
   "CLIENT_CALL_BACK_RATE",
   "W2_PAY_RATE",
+  "T4_PAY_RATE",
   "FINAL_PAY_RATE",
   "FINAL_BILL_RATE",
   "FINAL_COST",
@@ -1477,9 +1517,11 @@ Object.freeze(API_OWNED_COLUMNS);
  * `ID` is generated per insert, `DATE_AND_TIME` is set at insert time,
  * `IS_REJECTED` is reset by applyIsRejectedResetForChangedUpdate,
  * `MOVE_RUNRATE` is gated by applyMoveRunrateAppendOverride,
- * `TENTATIVE_DATE` is frozen by applyTentativeDateFreeze (release on START_DATE change),
+ * `TENTATIVE_DATE` is cleared when PLACEMENT_STATUS is DID NOT START; otherwise frozen by
+ * applyTentativeDateFreeze (release on START_DATE change),
  * `NEW_HIRE_DATE` is set from job-submittal-notes (earliest BOOKED modified_date) for DEAL rows when baseline is empty;
- * EXTENSION rows are not set from API on enrich; once baseline has a value it is frozen on update-append (DEAL or EXTENSION).
+ * EXTENSION rows are not set from API on enrich; once baseline has a value it is frozen on update-append (DEAL or EXTENSION)
+ * unless `NEW_HIRE_DATE_FREEZE_ENABLED=false` (one-time migration to rewrite legacy insert-time stamps).
  */
 const SYSTEM_CONTROLLED_COLUMNS = new Set([
   "ID",
@@ -1531,6 +1573,8 @@ const MANUAL_COLUMNS = new Set([
   "DELIVERY_POC",
   "DIRECTOR_CLIENT_PARTNERSHIP",
   "DIVERSITY_STATUS",
+  "DT_RATE",
+  "CLIENT_DT_RATE",
   "EDIT_DATE",
   "EDITED_BY",
   "EFFECTIVE_DATE",
@@ -1615,6 +1659,7 @@ module.exports = {
   mapJobSubmittalToBq,
   computeBqEndDateFromSubmittal,
   mapDealSheetRatesListToBq,
+  mapCanadaTypeFromTenNintyNine,
   nexusBinaryFlagToBoolean,
   mapSubmittalCodeToPlacementStatus,
   computeDerivedPlacementFields,
@@ -1622,6 +1667,9 @@ module.exports = {
   effectiveMinFilterDate,
   coerceApiFloatNullsToZero,
   isTerminationApiEligiblePlacementStatus,
+  normalizePlacementStatusKey,
+  isDidNotStartPlacementStatus,
+  resolveTentativeDateForPlacementRow,
   resolveNewHireDateFromSubmittalNotes,
   resolveNewHireDateForDealRow,
   extractTerminationReasonValue,

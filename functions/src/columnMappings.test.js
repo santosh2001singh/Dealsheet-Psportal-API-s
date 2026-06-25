@@ -25,6 +25,8 @@ const {
   isTerminationApiEligiblePlacementStatus,
   resolveNewHireDateFromSubmittalNotes,
   resolveNewHireDateForDealRow,
+  resolveTentativeDateForPlacementRow,
+  isDidNotStartPlacementStatus,
   extractTerminationReasonValue,
   pickLatestTerminationDetailItem,
   mapTerminationReasonLogRowForDealSheet,
@@ -32,6 +34,7 @@ const {
   clientOfferingHasClientTypeText,
   resolveClientOfferingForEnrich,
   mapClientToBq,
+  mapCanadaTypeFromTenNintyNine,
   API_OWNED_COLUMNS,
   SYSTEM_CONTROLLED_COLUMNS,
   MANUAL_COLUMNS,
@@ -48,6 +51,19 @@ function sampleRatesWithBothOtCodes() {
     { bill_rate_code: "BR_REGULAR_BILL_RATE", rate: 110 },
   ];
 }
+
+test("mapCanadaTypeFromTenNintyNine maps Nexus ten_ninty_nine_checked to T4 or T4A", () => {
+  assert.equal(
+    mapCanadaTypeFromTenNintyNine({ ten_ninty_nine_checked: "b'\\x01'" }),
+    "T4A"
+  );
+  assert.equal(
+    mapCanadaTypeFromTenNintyNine({ ten_ninty_nine_checked: "b'\\x00'" }),
+    "T4"
+  );
+  assert.equal(mapCanadaTypeFromTenNintyNine({ ten_ninty_nine_checked: null }), "T4");
+  assert.equal(mapCanadaTypeFromTenNintyNine({}), "T4");
+});
 
 /** Mirrors API_FLOAT_COLUMNS_DEFAULT_ZERO for tests */
 const API_FLOAT_COLUMNS_DEFAULT_ZERO = [
@@ -1269,6 +1285,30 @@ test("resolveNewHireDateForDealRow: DEAL uses notes date, EXTENSION always null"
   assert.equal(resolveNewHireDateForDealRow("extension", notes), null);
   assert.equal(resolveNewHireDateForDealRow("EXTENSION", notes), null);
   assert.equal(resolveNewHireDateForDealRow("deal", []), null);
+});
+
+test("resolveTentativeDateForPlacementRow: DID NOT START clears tentative", () => {
+  assert.equal(
+    resolveTentativeDateForPlacementRow("DID NOT START", "2026-06-01"),
+    null
+  );
+  assert.equal(
+    resolveTentativeDateForPlacementRow("did not start", "2026-08-15"),
+    null
+  );
+  assert.equal(isDidNotStartPlacementStatus("DID NOT START"), true);
+  assert.equal(isDidNotStartPlacementStatus("BOOKED"), false);
+});
+
+test("resolveTentativeDateForPlacementRow: non-DID NOT START keeps tentative", () => {
+  assert.equal(
+    resolveTentativeDateForPlacementRow("BOOKED", "2026-06-01"),
+    "2026-06-01"
+  );
+  assert.equal(
+    resolveTentativeDateForPlacementRow("STARTED", null),
+    null
+  );
 });
 
 test("TERMINATION_REASON is API-owned on deal sheet", () => {

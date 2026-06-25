@@ -18,7 +18,9 @@ const {
   API_OWNED_COLUMNS,
   SYSTEM_CONTROLLED_COLUMNS,
   MANUAL_COLUMNS,
+  isDidNotStartPlacementStatus,
 } = require("./columnMappings");
+const { isCynetHealthCanadaRecruiter, sanitizeCanadaDealSheetRow, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
 
 let bigquery;
 const tableFqn = `${config.projectId}.${config.datasetId}.${config.tableId}`;
@@ -675,11 +677,33 @@ function normalizeForCompare(value) {
 
 function hasBusinessColumnChanges(incomingRow, existingRow, ignoreFieldsSet) {
   if (!existingRow) return true;
+  const isCanada = isCynetHealthCanadaRecruiter(incomingRow?.ASSIGNMENT_RECRUITER_EMAIL);
+  if (isCanada) {
+    if (normalizeForCompare(incomingRow?.TYPE) !== normalizeForCompare(existingRow?.TYPE)) {
+      return true;
+    }
+  }
   for (const key of API_OWNED_COLUMNS) {
     if (ignoreFieldsSet && ignoreFieldsSet.has(key)) continue;
+    if (isCanada && CANADA_EXCLUDED_API_OWNED_COLUMNS.has(key)) continue;
     const incomingVal = normalizeForCompare(incomingRow?.[key]);
     const existingVal = normalizeForCompare(existingRow?.[key]);
     if (incomingVal !== existingVal) return true;
+  }
+  if (!config.newHireDateFreezeEnabled) {
+    const dealType = incomingRow?.DEAL_TYPE == null
+      ? ""
+      : String(incomingRow.DEAL_TYPE).trim().toUpperCase();
+    if (dealType === "DEAL") {
+      const incomingNhd = normalizeForCompare(incomingRow?.NEW_HIRE_DATE);
+      const existingNhd = normalizeForCompare(existingRow?.NEW_HIRE_DATE);
+      if (incomingNhd !== existingNhd) return true;
+    }
+  }
+  if (isDidNotStartPlacementStatus(incomingRow?.PLACEMENT_STATUS)) {
+    const incomingTent = normalizeForCompare(incomingRow?.TENTATIVE_DATE);
+    const existingTent = normalizeForCompare(existingRow?.TENTATIVE_DATE);
+    if (incomingTent !== existingTent) return true;
   }
   return false;
 }
@@ -754,12 +778,15 @@ function applyManualColumnsCarryForward(incomingRow, baselineRow) {
   if (!baselineRow || !incomingRow || typeof incomingRow !== "object") {
     return { row: incomingRow, carriedCount: 0 };
   }
+  const isCanada = isCynetHealthCanadaRecruiter(incomingRow?.ASSIGNMENT_RECRUITER_EMAIL);
   const out = { ...incomingRow };
   for (const key of MANUAL_COLUMNS) {
+    if (isCanada && key === "TYPE") continue;
     delete out[key];
   }
   let carriedCount = 0;
   for (const key of MANUAL_COLUMNS) {
+    if (isCanada && key === "TYPE") continue;
     out[key] = Object.prototype.hasOwnProperty.call(baselineRow, key)
       ? baselineRow[key]
       : null;
@@ -771,10 +798,14 @@ function applyManualColumnsCarryForward(incomingRow, baselineRow) {
 /**
  * Freeze TENTATIVE_DATE from baseline when START_DATE is unchanged; keep incoming
  * API value when START_DATE changed (then freeze again on subsequent same-start runs).
+ * DID NOT START always clears TENTATIVE_DATE (no baseline carry-forward).
  */
 function applyTentativeDateFreeze(incomingRow, baselineRow) {
   if (!baselineRow || !incomingRow || typeof incomingRow !== "object") {
     return { row: incomingRow, frozen: false };
+  }
+  if (isDidNotStartPlacementStatus(incomingRow?.PLACEMENT_STATUS)) {
+    return { row: { ...incomingRow, TENTATIVE_DATE: null }, frozen: false };
   }
   const incomingStart = normalizeForCompare(incomingRow.START_DATE);
   const baselineStart = normalizeForCompare(baselineRow.START_DATE);
@@ -789,8 +820,12 @@ function applyTentativeDateFreeze(incomingRow, baselineRow) {
 
 /**
  * Freeze NEW_HIRE_DATE from baseline when present (immutable once set; DEAL and EXTENSION).
+ * Skipped when config.newHireDateFreezeEnabled is false (migration backfill).
  */
 function applyNewHireDateFreeze(incomingRow, baselineRow) {
+  if (!config.newHireDateFreezeEnabled) {
+    return { row: incomingRow, frozen: false };
+  }
   if (!incomingRow || typeof incomingRow !== "object") {
     return { row: incomingRow, frozen: false };
   }
@@ -925,7 +960,7 @@ function sanitizeRowForBigQueryStreamingInsert(row) {
     const inner = sanitizeValueForStreamingInsert(v);
     if (inner !== undefined) out[k] = inner;
   }
-  return out;
+  return sanitizeCanadaDealSheetRow(out);
 }
 
 function isEmptyDateFieldValue(value) {

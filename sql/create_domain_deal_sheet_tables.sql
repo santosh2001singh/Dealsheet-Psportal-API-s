@@ -186,5 +186,19 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_deal_shee
 CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_canada_deal_sheet`
 LIKE `cynetdatabase.rr_project_data.cynet_health_deal_sheet`;
 
+ALTER TABLE `cynetdatabase.rr_project_data.cynet_health_canada_deal_sheet`
+  DROP COLUMN IF EXISTS W2_PAY_RATE_NEW,
+  DROP COLUMN IF EXISTS FINAL_PAY_RATE_NEW,
+  DROP COLUMN IF EXISTS FINAL_COST_NEW,
+  DROP COLUMN IF EXISTS NEW_MARGIN,
+  DROP COLUMN IF EXISTS FINAL_BILL_RATE_NEW,
+  DROP COLUMN IF EXISTS FIRST_WEEK_HOURS,
+  DROP COLUMN IF EXISTS SECOND_WEEK_HOURS,
+  DROP COLUMN IF EXISTS TOTAL_BONUS_TAXABLE,
+  DROP COLUMN IF EXISTS TOTAL_BONUS_NON_TAXABLE,
+  DROP COLUMN IF EXISTS REGULAR_HOURS_1,
+  DROP COLUMN IF EXISTS REGULAR_HOURS_2,
+  DROP COLUMN IF EXISTS SCHEDULE_HOURS_2;
+
 CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_locums_deal_sheet`
 LIKE `cynetdatabase.rr_project_data.cynet_health_deal_sheet`;

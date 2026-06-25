@@ -43,6 +43,7 @@ const {
 } = require("./bigQueryClient");
 const { startDateOnOrAfterUtcMin, effectiveMinFilterDate, API_OWNED_COLUMNS } = require("./columnMappings");
 const { buildEnrichedRowsFromDealSheetCandidates } = require("./api/dealSheetEnricher");
+const { isCynetHealthCanadaRecruiter, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
 const {
   resolveActiveDealSheetTableId,
   buildActiveDealSheetRoutingSentinel,
@@ -417,7 +418,7 @@ function extractRateSnapshotFields(row, prefix) {
     [`${prefix}ADDITIONAL_BONUS`]: toFloatOrNull(row.ADDITIONAL_BONUS),
     [`${prefix}PAY_RATE`]: toFloatOrNull(row.PAY_RATE),
     [`${prefix}WEEKLY_PER_DIEM`]: toFloatOrNull(row.WEEKLY_PER_DIEM_NON_TAXED),
-    [`${prefix}W2_PAY_RATE`]: toFloatOrNull(row.W2_PAY_RATE),
+    [`${prefix}W2_PAY_RATE`]: toFloatOrNull(row.T4_PAY_RATE ?? row.W2_PAY_RATE),
     [`${prefix}FINAL_PAY_RATE`]: toFloatOrNull(row.FINAL_PAY_RATE),
     [`${prefix}FINAL_COST`]: toFloatOrNull(row.FINAL_COST),
     [`${prefix}BILL_RATE`]: toFloatOrNull(row.BILL_RATE),
@@ -573,8 +574,15 @@ function computeChangedFields(incomingRow, existingRow, ignoreFields) {
   const out = [];
   if (!existingRow) return out;
   const ignore = new Set((ignoreFields || []).map((x) => String(x).trim()).filter(Boolean));
+  const isCanada = isCynetHealthCanadaRecruiter(incomingRow?.ASSIGNMENT_RECRUITER_EMAIL);
+  if (isCanada) {
+    if (normalizeForCompare(incomingRow?.TYPE) !== normalizeForCompare(existingRow?.TYPE)) {
+      out.push("TYPE");
+    }
+  }
   for (const key of API_OWNED_COLUMNS) {
     if (ignore.has(key)) continue;
+    if (isCanada && CANADA_EXCLUDED_API_OWNED_COLUMNS.has(key)) continue;
     const nextVal = normalizeForCompare(incomingRow?.[key]);
     const prevVal = normalizeForCompare(existingRow?.[key]);
     if (nextVal !== prevVal) out.push(key);

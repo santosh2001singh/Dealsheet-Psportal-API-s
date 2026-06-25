@@ -20,8 +20,88 @@ const {
 } = require("./bigQueryClient");
 const { API_OWNED_COLUMNS, MANUAL_COLUMNS } = require("./columnMappings");
 const { resolvePairedActiveTableId } = require("./recruiterDomainTables");
+const config = require("./config");
 
 const IGNORE = new Set(["ID", "DATE_AND_TIME"]);
+
+test("hasBusinessColumnChanges: Canada TYPE change triggers append", () => {
+  const existing = {
+    ASSIGNMENT_RECRUITER_EMAIL: "a@cynethealth.ca",
+    TYPE: "T4",
+    T4_PAY_RATE: 80,
+    PLACEMENT_STATUS: "STARTED",
+  };
+  const incoming = {
+    ASSIGNMENT_RECRUITER_EMAIL: "a@cynethealth.ca",
+    TYPE: "T4A",
+    T4_PAY_RATE: 80,
+    PLACEMENT_STATUS: "STARTED",
+  };
+  assert.equal(hasBusinessColumnChanges(incoming, existing, IGNORE), true);
+});
+
+test("applyManualColumnsCarryForward: Canada keeps API TYPE instead of baseline", () => {
+  const incoming = {
+    ASSIGNMENT_RECRUITER_EMAIL: "a@cynethealth.ca",
+    TYPE: "T4A",
+    PLACEMENT_STATUS: "STARTED",
+  };
+  const baseline = {
+    ASSIGNMENT_RECRUITER_EMAIL: "a@cynethealth.ca",
+    TYPE: "T4",
+    PLACEMENT_STATUS: "ENDED",
+  };
+  const out = applyManualColumnsCarryForward(incoming, baseline);
+  assert.equal(out.row.TYPE, "T4A");
+  assert.equal(out.row.PLACEMENT_STATUS, "STARTED");
+});
+
+test("hasBusinessColumnChanges: Canada rows ignore W2_PAY_RATE diff (use T4_PAY_RATE)", () => {
+  const existing = {
+    ASSIGNMENT_RECRUITER_EMAIL: "a@cynethealth.ca",
+    T4_PAY_RATE: 80,
+    W2_PAY_RATE: 75,
+    PLACEMENT_STATUS: "STARTED",
+  };
+  const incoming = {
+    ASSIGNMENT_RECRUITER_EMAIL: "a@cynethealth.ca",
+    T4_PAY_RATE: 80,
+    W2_PAY_RATE: 99,
+    PLACEMENT_STATUS: "STARTED",
+  };
+  assert.equal(hasBusinessColumnChanges(incoming, existing, IGNORE), false);
+
+  const incomingT4Changed = { ...incoming, T4_PAY_RATE: 81 };
+  assert.equal(hasBusinessColumnChanges(incomingT4Changed, existing, IGNORE), true);
+});
+
+test("hasBusinessColumnChanges: Canada rows ignore legacy NEW-rate family on baseline", () => {
+  const existing = {
+    ASSIGNMENT_RECRUITER_EMAIL: "a@cynethealth.ca",
+    T4_PAY_RATE: 80,
+    SCHEDULE_HOURS_1: 40,
+    W2_PAY_RATE_NEW: 70,
+    FINAL_PAY_RATE_NEW: 69,
+    FINAL_COST_NEW: 68,
+    NEW_MARGIN: 23.5,
+    FINAL_BILL_RATE_NEW: 90,
+    FIRST_WEEK_HOURS: 7,
+    SECOND_WEEK_HOURS: 6,
+    TOTAL_BONUS_TAXABLE: 500,
+    TOTAL_BONUS_NON_TAXABLE: 1000,
+    REGULAR_HOURS_1: 36,
+    REGULAR_HOURS_2: 40,
+    SCHEDULE_HOURS_2: 48,
+    PLACEMENT_STATUS: "STARTED",
+  };
+  const incoming = {
+    ASSIGNMENT_RECRUITER_EMAIL: "a@cynethealth.ca",
+    T4_PAY_RATE: 80,
+    SCHEDULE_HOURS_1: 40,
+    PLACEMENT_STATUS: "STARTED",
+  };
+  assert.equal(hasBusinessColumnChanges(incoming, existing, IGNORE), false);
+});
 
 test("hasBusinessColumnChanges: ENDED vs ENDED<30 is a business change", () => {
   const existing = { PLACEMENT_STATUS: "ENDED", DEAL_SHEET_ID: 1, FOO: "a" };
@@ -411,6 +491,40 @@ test("applyTentativeDateFreeze: null baseline keeps incoming unchanged", () => {
   assert.equal(out.frozen, false);
 });
 
+test("applyTentativeDateFreeze: DID NOT START clears tentative over baseline", () => {
+  const incoming = {
+    PLACEMENT_STATUS: "DID NOT START",
+    START_DATE: "2026-01-05",
+    TENTATIVE_DATE: null,
+  };
+  const baseline = {
+    PLACEMENT_STATUS: "BOOKED",
+    START_DATE: "2026-01-05",
+    TENTATIVE_DATE: "2026-06-01",
+  };
+  const out = applyTentativeDateFreeze(incoming, baseline);
+  assert.equal(out.row.TENTATIVE_DATE, null);
+  assert.equal(out.frozen, false);
+});
+
+test("hasBusinessColumnChanges: DID NOT START tentative clear triggers append", () => {
+  const existing = {
+    DEAL_SHEET_ID: 1,
+    PLACEMENT_ID: 2,
+    PLACEMENT_STATUS: "DID NOT START",
+    START_DATE: "2026-01-05",
+    TENTATIVE_DATE: "2026-06-01",
+  };
+  const incoming = {
+    DEAL_SHEET_ID: 1,
+    PLACEMENT_ID: 2,
+    PLACEMENT_STATUS: "DID NOT START",
+    START_DATE: "2026-01-05",
+    TENTATIVE_DATE: null,
+  };
+  assert.equal(hasBusinessColumnChanges(incoming, existing, IGNORE), true);
+});
+
 test("applyManualColumnsCarryForward: does not carry TENTATIVE_DATE from baseline", () => {
   const incoming = {
     PLACEMENT_STATUS: "ENDED",
@@ -493,6 +607,86 @@ test("applyNewHireDateFreeze: EXTENSION baseline freezes manual date over incomi
   const out = applyNewHireDateFreeze(incoming, baseline);
   assert.equal(out.row.NEW_HIRE_DATE, "2026-05-31T00:13:22.094Z");
   assert.equal(out.frozen, true);
+});
+
+test("applyNewHireDateFreeze: migration mode keeps incoming over baseline", () => {
+  const prev = config.newHireDateFreezeEnabled;
+  config.newHireDateFreezeEnabled = false;
+  try {
+    const incoming = {
+      DEAL_TYPE: "deal",
+      NEW_HIRE_DATE: "2026-04-02T13:08:30Z",
+    };
+    const baseline = {
+      DEAL_TYPE: "deal",
+      NEW_HIRE_DATE: "2026-06-03T10:16:08.247Z",
+    };
+    const out = applyNewHireDateFreeze(incoming, baseline);
+    assert.equal(out.row.NEW_HIRE_DATE, "2026-04-02T13:08:30Z");
+    assert.equal(out.frozen, false);
+  } finally {
+    config.newHireDateFreezeEnabled = prev;
+  }
+});
+
+test("hasBusinessColumnChanges: migration mode DEAL NEW_HIRE_DATE diff triggers append", () => {
+  const prev = config.newHireDateFreezeEnabled;
+  config.newHireDateFreezeEnabled = false;
+  try {
+    const incoming = {
+      DEAL_TYPE: "deal",
+      PLACEMENT_STATUS: "ENDED<30",
+      NEW_HIRE_DATE: "2026-04-02T13:08:30Z",
+    };
+    const existing = {
+      DEAL_TYPE: "deal",
+      PLACEMENT_STATUS: "ENDED<30",
+      NEW_HIRE_DATE: "2026-06-03T10:16:08.247Z",
+    };
+    assert.equal(hasBusinessColumnChanges(incoming, existing, IGNORE), true);
+  } finally {
+    config.newHireDateFreezeEnabled = prev;
+  }
+});
+
+test("hasBusinessColumnChanges: migration mode ignores EXTENSION NEW_HIRE_DATE-only diff", () => {
+  const prev = config.newHireDateFreezeEnabled;
+  config.newHireDateFreezeEnabled = false;
+  try {
+    const incoming = {
+      DEAL_TYPE: "extension",
+      PLACEMENT_STATUS: "ENDED<30",
+      NEW_HIRE_DATE: null,
+    };
+    const existing = {
+      DEAL_TYPE: "extension",
+      PLACEMENT_STATUS: "ENDED<30",
+      NEW_HIRE_DATE: "2026-05-31T00:13:22.094Z",
+    };
+    assert.equal(hasBusinessColumnChanges(incoming, existing, IGNORE), false);
+  } finally {
+    config.newHireDateFreezeEnabled = prev;
+  }
+});
+
+test("hasBusinessColumnChanges: freeze enabled ignores NEW_HIRE_DATE-only diff", () => {
+  const prev = config.newHireDateFreezeEnabled;
+  config.newHireDateFreezeEnabled = true;
+  try {
+    const incoming = {
+      DEAL_TYPE: "deal",
+      PLACEMENT_STATUS: "ENDED<30",
+      NEW_HIRE_DATE: "2026-04-02T13:08:30Z",
+    };
+    const existing = {
+      DEAL_TYPE: "deal",
+      PLACEMENT_STATUS: "ENDED<30",
+      NEW_HIRE_DATE: "2026-06-03T10:16:08.247Z",
+    };
+    assert.equal(hasBusinessColumnChanges(incoming, existing, IGNORE), false);
+  } finally {
+    config.newHireDateFreezeEnabled = prev;
+  }
 });
 
 test("applyManualColumnsCarryForward: does not carry NEW_HIRE_DATE from baseline", () => {

@@ -1,5 +1,5 @@
 const { logLine } = require("./logger");
-const { startDateOnOrAfterUtcMin } = require("./columnMappings");
+const { startDateOnOrAfterUtcMin, effectiveMinFilterDate } = require("./columnMappings");
 
 /** Offer-rejected (`dealSheetSyncOfferRejected`) only: ended rows must have TENTATIVE_DATE on or after this day (UTC). */
 const OFFER_REJECTED_MIN_TENTATIVE_DATE_MS = Date.UTC(2026, 4, 1); // 2026-05-01 UTC
@@ -18,9 +18,16 @@ function filterOfferRejectedEndedPlacementStatuses(rows) {
 }
 
 function filterOfferRejectedRowsByMinTentativeDate(rows) {
-  return rows.filter((row) =>
-    startDateOnOrAfterUtcMin(row?.TENTATIVE_DATE, OFFER_REJECTED_MIN_TENTATIVE_DATE_MS)
-  );
+  return rows.filter((row) => {
+    const status = String(row?.PLACEMENT_STATUS || "").trim().toUpperCase();
+    if (status === "DID NOT START") {
+      return startDateOnOrAfterUtcMin(
+        effectiveMinFilterDate(row),
+        OFFER_REJECTED_MIN_TENTATIVE_DATE_MS
+      );
+    }
+    return startDateOnOrAfterUtcMin(row?.TENTATIVE_DATE, OFFER_REJECTED_MIN_TENTATIVE_DATE_MS);
+  });
 }
 
 /** Logs per-batch transform stages for `dealSheetSyncOfferRejected` (filter in Cloud Logging: `[offer-rejected-transform]`). */

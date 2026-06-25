@@ -45,12 +45,15 @@ const {
   pickClientOfferingRowForJob,
   computeDerivedPlacementFields,
   coerceApiFloatNullsToZero,
+  mapCanadaTypeFromTenNintyNine,
   resolveNewHireDateFromSubmittalNotes,
   resolveNewHireDateForDealRow,
+  resolveTentativeDateForPlacementRow,
 } = require("../columnMappings");
 const { computeBonusTotals } = require("../bonusTotals");
 const { computeWeekSplit } = require("../weekSplit");
 const { computeNewRateFamily } = require("../w2PayRateNew");
+const { sanitizeCanadaDealSheetRow, isCynetHealthCanadaRecruiter, pickCanadaDealSheetHoursPart } = require("../canadaDerivedPlacementFields");
 const { shouldExcludeRowFromBigQuery } = require("../bqRowExclusions");
 const { resolveContractIdsForRows } = require("../contractIdResolver");
 const { allocateContractIds } = require("../contractIdSequence");
@@ -918,12 +921,6 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
         (travelBonusPart.ADDITIONAL_BONUS || 0) +
         (clientCostBonusPart.ADDITIONAL_BONUS || 0),
     };
-    const bonusTotalsPart = computeBonusTotals(addCostRows, travelRows, hoursRow, clientCostRows);
-    const weekSplitPart = computeWeekSplit({
-      scheduleHours1: hoursPart.SCHEDULE_HOURS_1,
-      scheduleHours2: hoursPart.SCHEDULE_HOURS_2,
-      initialWeeks: dealSheetPart.INITIAL_PROJECT_DURATION_IN_WEEKS,
-    });
 
     const rateChangePart = mapDealSheetRateChangeToBq(
       rateChangesByDs.get(String(dealSheetId)) ?? [], jobId
@@ -957,6 +954,19 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       ? null : userById.get(String(salesRepId)) ?? null;
     const userPart = mapDealSheetUsersToBq(detail, recruiterUser, salesRepUser, submittalRow);
 
+    const isCanadaRecruiter = isCynetHealthCanadaRecruiter(userPart?.ASSIGNMENT_RECRUITER_EMAIL);
+    const hoursPartForRow = isCanadaRecruiter ? pickCanadaDealSheetHoursPart(hoursPart) : hoursPart;
+    const bonusTotalsPart = isCanadaRecruiter
+      ? {}
+      : computeBonusTotals(addCostRows, travelRows, hoursRow, clientCostRows);
+    const weekSplitPart = isCanadaRecruiter
+      ? {}
+      : computeWeekSplit({
+        scheduleHours1: hoursPart.SCHEDULE_HOURS_1,
+        scheduleHours2: hoursPart.SCHEDULE_HOURS_2,
+        initialWeeks: dealSheetPart.INITIAL_PROJECT_DURATION_IN_WEEKS,
+      });
+
     const candidateObj = !candId
       ? null : candidateById.get(String(candId)) ?? null;
     const candidateDetailPart = mapCandidateToBq(candidateObj);
@@ -989,11 +999,15 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       : [];
     const newHireDate = resolveNewHireDateForDealRow(dealSheetPart?.DEAL_TYPE, notesForPlacement);
 
+    const canadaTypePart = isCynetHealthCanadaRecruiter(userPart?.ASSIGNMENT_RECRUITER_EMAIL)
+      ? { TYPE: mapCanadaTypeFromTenNintyNine(detail) }
+      : {};
+
     const row = {
       ...candidatePart,
       ...clientPart,
       ...dealSheetPart,
-      ...hoursPart,
+      ...hoursPartForRow,
       ...revenuePart,
       ...addCostPart,
       ...bonusTotalsPart,
@@ -1007,20 +1021,26 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       ...userPart,
       ...candidateDetailPart,
       ...providerTypePart,
+      ...canadaTypePart,
       CLIENT_TYPE: mspPart?.CLIENT_TYPE ?? null,
       LINE_OF_BUSINESS: lineOfBusiness,
       START_DATE: submittalPart?.START_DATE ?? null,
-      TENTATIVE_DATE: submittalPart?.TENTATIVE_DATE ?? jobPart?.TENTATIVE_DATE ?? null,
+      TENTATIVE_DATE: resolveTentativeDateForPlacementRow(
+        submittalPart?.PLACEMENT_STATUS,
+        submittalPart?.TENTATIVE_DATE ?? jobPart?.TENTATIVE_DATE ?? null
+      ),
       TERMINATION_REASON: terminationReason,
       NEW_HIRE_DATE: newHireDate,
     };
-    const newRateFamilyPart = computeNewRateFamily(row);
+    const newRateFamilyPart = isCynetHealthCanadaRecruiter(row?.ASSIGNMENT_RECRUITER_EMAIL)
+      ? {}
+      : computeNewRateFamily(row);
     const derivedPart = computeDerivedPlacementFields(row);
-    const finalRow = coerceApiFloatNullsToZero({
+    const finalRow = sanitizeCanadaDealSheetRow(coerceApiFloatNullsToZero({
       ...row,
       ...newRateFamilyPart,
       ...derivedPart,
-    });
+    }));
     if (shouldExcludeRowFromBigQuery(finalRow)) {
       excludedDummyOrTraining++;
       continue;
