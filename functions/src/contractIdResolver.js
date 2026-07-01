@@ -7,31 +7,30 @@
  *     existing BigQuery rows or in-batch DEAL rows. DEAL rows that would
  *     otherwise need a fresh Firestore allocation are left with
  *     CONTRACT_ID = null.
- *   Phase B — `allocateContractIdsForInsertableRows(rowsToInsert)`
+ *   Phase B — `allocateContractIdsForInsertableRows(rowsToInsert, { tableId })`
  *     Called AFTER append-on-change filtering. Allocates Firestore IDs only
  *     for the DEAL rows that will actually be inserted, then propagates the
  *     freshly-allocated id onto any EXTENSION rows that share the same match
- *     key in the same insert batch. This stops "ID burning" caused by
- *     allocating during enrichment for rows that later get filtered out.
+ *     key in the same insert batch.
  *
- * Backward-compatible single call: `resolveContractIdsForRows(rows)` (no
- * skipAllocation) keeps the old A+B-in-one behavior for callers that have
- * not adopted the deferred pattern.
+ * IDs are prefixed strings per table: CHC1000, CAC1000, LOC1000.
  *
  * EXTENSION rules: reuse CONTRACT_ID from matching DEAL via in-batch map or
- * BigQuery lookup; never allocate a brand-new id for an EXTENSION row.
- *
- * Resilience: every external dependency (BigQuery lookups, Firestore
- * allocation) is wrapped in try/catch — failures are logged and treated as
- * "no result" so the enrichment + insert flow keeps running.
+ * table-scoped BigQuery lookup; never allocate a brand-new id for EXTENSION.
  */
 
 const { logLine } = require("./logger");
 const { allocateContractIds } = require("./contractIdSequence");
 const {
+  normalizeContractIdOrNull,
+  compareContractIds,
+  buildSequenceOptionsForTable,
+} = require("./contractIdFormat");
+const {
   fetchContractIdsByDealSheetIds,
   fetchContractIdsForExtensions,
 } = require("./bigQueryClient");
+const { resolveActiveDealSheetTableId } = require("./recruiterDomainTables");
 
 function toInt64OrNull(value) {
   if (value == null || value === "") return null;
@@ -78,9 +77,9 @@ function buildContractMatchKey(row) {
 
 /**
  * Pick latest DEAL contract id on or before extension start (in-batch).
- * @param {Array<{contractId: number, startDateMs: number|null}>|undefined} deals
+ * @param {Array<{contractId: string, startDateMs: number|null}>|undefined} deals
  * @param {number|null} extensionStartMs
- * @returns {number|null}
+ * @returns {string|null}
  */
 function pickDealContractIdFromBatch(deals, extensionStartMs) {
   if (!deals || deals.length === 0) return null;
@@ -95,16 +94,17 @@ function pickDealContractIdFromBatch(deals, extensionStartMs) {
     const sa = a.startDateMs ?? Number.NEGATIVE_INFINITY;
     const sb = b.startDateMs ?? Number.NEGATIVE_INFINITY;
     if (sb !== sa) return sb - sa;
-    return (b.contractId ?? 0) - (a.contractId ?? 0);
+    return compareContractIds(a.contractId, b.contractId);
   });
   return candidates[0].contractId;
 }
 
 function recordDealInBatchMap(dealMap, row, contractId) {
   const key = buildContractMatchKey(row);
-  if (!key || contractId == null) return;
+  const normalized = normalizeContractIdOrNull(contractId);
+  if (!key || normalized == null) return;
   const entry = {
-    contractId,
+    contractId: normalized,
     startDateMs: parseStartDateMs(row?.START_DATE),
   };
   if (!dealMap.has(key)) dealMap.set(key, []);
@@ -112,20 +112,61 @@ function recordDealInBatchMap(dealMap, row, contractId) {
 }
 
 /**
+ * @param {object[]} unresolvedExtensions
+ * @param {Function} fetchContractIdsForExtensionsFn
+ * @param {object} bqOptions
+ * @returns {Promise<Map<string, string|null>>}
+ */
+async function fetchExtensionContractIdsByTable(unresolvedExtensions, fetchContractIdsForExtensionsFn, bqOptions) {
+  const out = new Map();
+  if (!unresolvedExtensions.length) return out;
+
+  /** @type {Map<string, object[]>} */
+  const byTable = new Map();
+  for (const item of unresolvedExtensions) {
+    const tableId = item.tableId || "";
+    if (!byTable.has(tableId)) byTable.set(tableId, []);
+    byTable.get(tableId).push(item);
+  }
+
+  for (const [tableId, items] of byTable) {
+    const lookupInput = items.map(({ _row, tableId: _tid, ...rest }) => rest);
+    let lookedUp = new Map();
+    try {
+      const result = await fetchContractIdsForExtensionsFn(lookupInput, {
+        ...bqOptions,
+        tableId: tableId || undefined,
+      });
+      if (result instanceof Map) lookedUp = result;
+      else if (result && typeof result === "object") lookedUp = new Map(Object.entries(result));
+    } catch (err) {
+      logLine(
+        `[contractId resolver] fetchContractIdsForExtensions(${lookupInput.length}, table=${tableId || "union"}) failed: ${String(err?.message || err).slice(0, 200)}`
+      );
+    }
+    for (const [pid, cid] of lookedUp) {
+      out.set(String(pid), normalizeContractIdOrNull(cid));
+    }
+  }
+
+  return out;
+}
+
+/**
  * Resolve CONTRACT_IDs for an enriched batch.
  *
  * @param {object[]} rows
  * @param {object} [deps]
- * @param {boolean} [deps.skipAllocation] If true, DEAL rows that would need a
- *   fresh Firestore id are left with CONTRACT_ID = null. Use this in the
- *   enricher and call `allocateContractIdsForInsertableRows` from the insert
- *   pipeline once the final post-filter row set is known.
  * @returns {Promise<object[]>}
  */
 async function resolveContractIdsForRows(rows, deps = {}) {
   if (!rows || rows.length === 0) return rows;
 
   const skipAllocation = deps.skipAllocation === true;
+  const resolveTableIdFn =
+    typeof deps.resolveTableIdFn === "function"
+      ? deps.resolveTableIdFn
+      : (row) => resolveActiveDealSheetTableId(row?.ASSIGNMENT_RECRUITER_EMAIL);
 
   const allocateContractIdsFn =
     deps.allocateContractIdsFn ?? allocateContractIds;
@@ -164,10 +205,10 @@ async function resolveContractIdsForRows(rows, deps = {}) {
   let extensionOrphanCount = 0;
   let deferredAllocationCount = 0;
 
-  /** @type {Map<string, Array<{contractId: number, startDateMs: number|null}>>} */
+  /** @type {Map<string, Array<{contractId: string, startDateMs: number|null}>>} */
   const dealMap = new Map();
 
-  /** @type {Map<string, object[]>} matchKey or sentinel -> rows needing new contract id */
+  /** @type {Map<string, object[]>} */
   const needsAllocationByKey = new Map();
   const noKeyAllocationRows = [];
 
@@ -209,37 +250,46 @@ async function resolveContractIdsForRows(rows, deps = {}) {
       [...needsAllocationByKey.values()].reduce((acc, list) => acc + list.length, 0) +
       noKeyAllocationRows.length;
   } else {
+    const tableId = deps.tableId;
+    const sequenceOptions =
+      deps.sequenceOptions ?? (tableId ? buildSequenceOptionsForTable(tableId) : null);
     const allocationKeys = [...needsAllocationByKey.keys()];
     const totalToAllocate = allocationKeys.length + noKeyAllocationRows.length;
     if (totalToAllocate > 0) {
-      let ids = [];
-      try {
-        const result = await allocateContractIdsFn(totalToAllocate, deps.sequenceOptions);
-        if (Array.isArray(result)) ids = result;
-      } catch (err) {
+      if (!sequenceOptions) {
         logLine(
-          `[contractId resolver] allocateContractIds(${totalToAllocate}) failed (DEAL rows will have null CONTRACT_ID): ${String(err?.message || err).slice(0, 200)}`
+          `[contractId resolver] allocateContractIds skipped: missing tableId/sequenceOptions for ${totalToAllocate} DEAL row(s)`
         );
-      }
-      let idIndex = 0;
-      for (const key of allocationKeys) {
-        const contractId = ids[idIndex] ?? null;
-        idIndex++;
-        for (const row of needsAllocationByKey.get(key) || []) {
+      } else {
+        let ids = [];
+        try {
+          const result = await allocateContractIdsFn(totalToAllocate, sequenceOptions);
+          if (Array.isArray(result)) ids = result;
+        } catch (err) {
+          logLine(
+            `[contractId resolver] allocateContractIds(${totalToAllocate}) failed (DEAL rows will have null CONTRACT_ID): ${String(err?.message || err).slice(0, 200)}`
+          );
+        }
+        let idIndex = 0;
+        for (const key of allocationKeys) {
+          const contractId = normalizeContractIdOrNull(ids[idIndex] ?? null);
+          idIndex++;
+          for (const row of needsAllocationByKey.get(key) || []) {
+            row.CONTRACT_ID = contractId;
+            if (contractId != null) {
+              recordDealInBatchMap(dealMap, row, contractId);
+              allocatedCount++;
+            }
+          }
+        }
+        for (const row of noKeyAllocationRows) {
+          const contractId = normalizeContractIdOrNull(ids[idIndex] ?? null);
+          idIndex++;
           row.CONTRACT_ID = contractId;
           if (contractId != null) {
             recordDealInBatchMap(dealMap, row, contractId);
             allocatedCount++;
           }
-        }
-      }
-      for (const row of noKeyAllocationRows) {
-        const contractId = ids[idIndex] ?? null;
-        idIndex++;
-        row.CONTRACT_ID = contractId;
-        if (contractId != null) {
-          recordDealInBatchMap(dealMap, row, contractId);
-          allocatedCount++;
         }
       }
     }
@@ -288,27 +338,21 @@ async function resolveContractIdsForRows(rows, deps = {}) {
       phoneNumber: row.PHONE_NUMBER,
       clientId: toInt64OrNull(row.CLIENT_ID),
       startDate: row.START_DATE,
+      tableId: resolveTableIdFn(row),
       _row: row,
     });
     row.CONTRACT_ID = null;
   }
 
   if (unresolvedExtensions.length > 0) {
-    const lookupInput = unresolvedExtensions.map(({ _row, ...rest }) => rest);
-    let lookedUp = new Map();
-    try {
-      const result = await fetchContractIdsForExtensionsFn(lookupInput, deps.bqOptions);
-      if (result instanceof Map) lookedUp = result;
-      else if (result && typeof result === "object") lookedUp = new Map(Object.entries(result));
-    } catch (err) {
-      logLine(
-        `[contractId resolver] fetchContractIdsForExtensions(${lookupInput.length}) failed (EXTENSION rows stay null): ${String(err?.message || err).slice(0, 200)}`
-      );
-    }
+    const lookedUp = await fetchExtensionContractIdsByTable(
+      unresolvedExtensions,
+      fetchContractIdsForExtensionsFn,
+      deps.bqOptions
+    );
     for (const item of unresolvedExtensions) {
       const pidStr = String(item.placementId);
-      const contractId = lookedUp.get(pidStr);
-      const resolved = contractId == null ? null : toInt64OrNull(contractId);
+      const resolved = lookedUp.get(pidStr) ?? null;
       item._row.CONTRACT_ID = resolved;
       if (resolved != null) extensionFromBqCount++;
       else extensionOrphanCount++;
@@ -324,19 +368,19 @@ async function resolveContractIdsForRows(rows, deps = {}) {
 }
 
 /**
- * Phase B — allocate CONTRACT_IDs for DEAL rows in the final post-filter
- * insert batch and propagate the new ids onto EXTENSION rows in the same
- * batch that share a match key. Safe to call on any row set; rows that
- * already have CONTRACT_ID set are left untouched.
+ * Phase B — allocate CONTRACT_IDs for DEAL rows in the final post-filter insert batch.
  *
  * @param {object[]} rowsToInsert
  * @param {object} [deps]
- * @param {(count: number, options?: object) => Promise<number[]>} [deps.allocateContractIdsFn]
- * @param {object} [deps.sequenceOptions]
+ * @param {string} [deps.tableId]
  * @returns {Promise<object[]>}
  */
 async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
   if (!rowsToInsert || rowsToInsert.length === 0) return rowsToInsert;
+
+  const tableId = deps.tableId == null ? "" : String(deps.tableId).trim();
+  const sequenceOptions =
+    deps.sequenceOptions ?? (tableId ? buildSequenceOptionsForTable(tableId) : null);
 
   const allocateContractIdsFn =
     deps.allocateContractIdsFn ?? allocateContractIds;
@@ -365,9 +409,16 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
 
   if (totalToAllocate === 0) return rowsToInsert;
 
+  if (!sequenceOptions) {
+    logLine(
+      `[contractId allocator] skipped: missing tableId sequence config (tableId=${tableId || "none"}, need=${totalToAllocate})`
+    );
+    return rowsToInsert;
+  }
+
   let ids = [];
   try {
-    const result = await allocateContractIdsFn(totalToAllocate, deps.sequenceOptions);
+    const result = await allocateContractIdsFn(totalToAllocate, sequenceOptions);
     if (Array.isArray(result)) ids = result;
   } catch (err) {
     logLine(
@@ -377,11 +428,11 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
 
   let allocatedCount = 0;
   let idIndex = 0;
-  /** @type {Map<string, number>} */
+  /** @type {Map<string, string>} */
   const allocatedByKey = new Map();
 
   for (const key of allocationKeys) {
-    const contractId = ids[idIndex] ?? null;
+    const contractId = normalizeContractIdOrNull(ids[idIndex] ?? null);
     idIndex++;
     if (contractId != null) allocatedByKey.set(key, contractId);
     for (const row of needsAllocationByKey.get(key) || []) {
@@ -390,7 +441,7 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
     }
   }
   for (const row of noKeyAllocationRows) {
-    const contractId = ids[idIndex] ?? null;
+    const contractId = normalizeContractIdOrNull(ids[idIndex] ?? null);
     idIndex++;
     row.CONTRACT_ID = contractId;
     if (contractId != null) allocatedCount++;
@@ -413,7 +464,7 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
   }
 
   logLine(
-    `[contractId allocator] insertable=${rowsToInsert.length} allocated=${allocatedCount} uniqueKeys=${allocationKeys.length} noKey=${noKeyAllocationRows.length} extensionPropagated=${extensionPropagated}`
+    `[contractId allocator] table=${tableId || "none"} insertable=${rowsToInsert.length} allocated=${allocatedCount} uniqueKeys=${allocationKeys.length} noKey=${noKeyAllocationRows.length} extensionPropagated=${extensionPropagated}`
   );
 
   return rowsToInsert;

@@ -11,7 +11,7 @@
 -- =============================================================================
 
 ALTER TABLE `cynetdatabase.rr_project_data.cynet_health_canada_deal_sheet`
-  ADD COLUMN IF NOT EXISTS CONTRACT_ID INT64,
+  ADD COLUMN IF NOT EXISTS CONTRACT_ID STRING,
   ADD COLUMN IF NOT EXISTS DT_RATE FLOAT64,
   ADD COLUMN IF NOT EXISTS CLIENT_DT_RATE FLOAT64,
   ADD COLUMN IF NOT EXISTS BEFORE_EXTENSION_RECRUITER STRING,

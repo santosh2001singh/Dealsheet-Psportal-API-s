@@ -57,6 +57,7 @@ const { sanitizeCanadaDealSheetRow, isCynetHealthCanadaRecruiter, pickCanadaDeal
 const { shouldExcludeRowFromBigQuery } = require("../bqRowExclusions");
 const { resolveContractIdsForRows } = require("../contractIdResolver");
 const { allocateContractIds } = require("../contractIdSequence");
+const { resolveActiveDealSheetTableId } = require("../recruiterDomainTables");
 const {
   fetchContractIdsByDealSheetIds,
   fetchContractIdsForExtensions,
@@ -1073,6 +1074,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       allocateContractIdsFn: allocateContractIds,
       fetchContractIdsByDealSheetIdsFn: fetchContractIdsByDealSheetIds,
       fetchContractIdsForExtensionsFn: fetchContractIdsForExtensions,
+      resolveTableIdFn: (row) => resolveActiveDealSheetTableId(row?.ASSIGNMENT_RECRUITER_EMAIL),
     });
   } else {
     logLine("[enriched sync] STEP 3/4 ENRICH: skip_contract_id — CONTRACT_ID resolution skipped");

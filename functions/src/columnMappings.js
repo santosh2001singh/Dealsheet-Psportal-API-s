@@ -8,6 +8,7 @@ const {
   isCynetHealthCanadaRecruiter,
   computeCanadaDerivedPlacementFields,
 } = require("./canadaDerivedPlacementFields");
+const { normalizeContractIdOrNull } = require("./contractIdFormat");
 
 /**
  * Convert value to number or null
@@ -1409,7 +1410,7 @@ function mapTerminationReasonLogRowForDealSheet(apiItem, contextRow, captureTime
     DATE_AND_TIME: ts,
     DEAL_SHEET_ID: toIntOrNull(contextRow?.DEAL_SHEET_ID),
     PLACEMENT_ID: toIntOrNull(contextRow?.PLACEMENT_ID),
-    CONTRACT_ID: toIntOrNull(contextRow?.CONTRACT_ID),
+    CONTRACT_ID: normalizeContractIdOrNull(contextRow?.CONTRACT_ID),
     TERMINATION_DETAIL_ID: detailId,
     CANCELLED_BY: cancelledBy,
     NOTES: notes,
@@ -1522,6 +1523,8 @@ Object.freeze(API_OWNED_COLUMNS);
  * `NEW_HIRE_DATE` is set from job-submittal-notes (earliest BOOKED modified_date) for DEAL rows when baseline is empty;
  * EXTENSION rows are not set from API on enrich; once baseline has a value it is frozen on update-append (DEAL or EXTENSION)
  * unless `NEW_HIRE_DATE_FREEZE_ENABLED=false` (one-time migration to rewrite legacy insert-time stamps).
+ * `EXTENSION_DATE` is MIN(DATE_AND_TIME) per placement pair for EXTENSION rows (TIMESTAMP), frozen once set.
+ * `EXTENSION_START_DATE` mirrors START_DATE for EXTENSION rows (null for DEAL); updates with START_DATE.
  */
 const SYSTEM_CONTROLLED_COLUMNS = new Set([
   "ID",
@@ -1530,6 +1533,8 @@ const SYSTEM_CONTROLLED_COLUMNS = new Set([
   "MOVE_RUNRATE",
   "TENTATIVE_DATE",
   "NEW_HIRE_DATE",
+  "EXTENSION_DATE",
+  "EXTENSION_START_DATE",
 ]);
 Object.freeze(SYSTEM_CONTROLLED_COLUMNS);
 
@@ -1579,7 +1584,6 @@ const MANUAL_COLUMNS = new Set([
   "EDITED_BY",
   "EFFECTIVE_DATE",
   "ENTITY",
-  "EXTENSION_DATE",
   "FINAL_INVOICE_PENDING",
   "FIFTYTWO_TENURE_CANDIDATE_STATUS",
   "FIFTYTWO_TENURE_RTO_LASTDATE",

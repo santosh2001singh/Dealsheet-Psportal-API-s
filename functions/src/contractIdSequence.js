@@ -1,9 +1,12 @@
 /**
- * Firestore-backed monotonic CONTRACT_ID sequence.
+ * Firestore-backed monotonic CONTRACT_ID sequence (per-table doc + prefixed output).
  */
 
 const admin = require("firebase-admin");
-const config = require("./config");
+const { formatContractId } = require("./contractIdFormat");
+const { getContractIdSequenceRef } = require("./firestoreWorkspace");
+
+const DEFAULT_START_VALUE = parseInt(process.env.CONTRACT_ID_START_VALUE || "1000", 10);
 
 function getFirestore(options = {}) {
   if (options.firestore && typeof options.firestore.runTransaction === "function") {
@@ -13,26 +16,22 @@ function getFirestore(options = {}) {
 }
 
 function getSequenceRef(options = {}) {
-  const collection =
-    typeof options.collection === "string" && options.collection.trim() !== ""
-      ? options.collection.trim()
-      : config.contractIdSequence.collection;
-  const docId =
-    typeof options.docId === "string" && options.docId.trim() !== ""
-      ? options.docId.trim()
-      : config.contractIdSequence.docId;
-  return getFirestore(options).collection(collection).doc(docId);
+  const docId = typeof options.docId === "string" ? options.docId.trim() : "";
+  if (!docId) {
+    throw new Error("contractIdSequence: docId (table id) is required");
+  }
+  return getContractIdSequenceRef(docId, options);
 }
 
 function resolveStartValue(options = {}) {
-  const raw = options.startValue ?? config.contractIdSequence.startValue;
+  const raw = options.startValue ?? DEFAULT_START_VALUE;
   const n = Number(raw);
-  return Number.isFinite(n) ? Math.trunc(n) : 100000;
+  return Number.isFinite(n) ? Math.trunc(n) : DEFAULT_START_VALUE;
 }
 
 /**
- * Peek next value without consuming (for tests/debug).
- * @param {object} [options]
+ * Peek next sequence value without consuming (for tests/debug).
+ * @param {object} options
  * @returns {Promise<number>}
  */
 async function getNextContractId(options = {}) {
@@ -47,9 +46,13 @@ async function getNextContractId(options = {}) {
 
 /**
  * Allocate `count` sequential CONTRACT_ID values atomically.
+ * When `options.prefix` is set, returns formatted strings (e.g. CHC1000).
  * @param {number} count
- * @param {object} [options]
- * @returns {Promise<number[]>}
+ * @param {object} options
+ * @param {string} options.docId BigQuery table id (Firestore doc id)
+ * @param {string} [options.prefix] CHC | CAC | LOC
+ * @param {number} [options.startValue]
+ * @returns {Promise<string[]|number[]>}
  */
 async function allocateContractIds(count, options = {}) {
   const n = Number(count);
@@ -57,6 +60,10 @@ async function allocateContractIds(count, options = {}) {
 
   const ref = getSequenceRef(options);
   const startValue = resolveStartValue(options);
+  const prefix =
+    typeof options.prefix === "string" && options.prefix.trim() !== ""
+      ? options.prefix.trim().toUpperCase()
+      : "";
   const allocated = [];
 
   const firestore = getFirestore(options);
@@ -68,7 +75,8 @@ async function allocateContractIds(count, options = {}) {
       if (Number.isFinite(stored)) nextValue = Math.trunc(stored);
     }
     for (let i = 0; i < n; i++) {
-      allocated.push(nextValue + i);
+      const seq = nextValue + i;
+      allocated.push(prefix ? formatContractId(prefix, seq) : seq);
     }
     tx.set(
       ref,

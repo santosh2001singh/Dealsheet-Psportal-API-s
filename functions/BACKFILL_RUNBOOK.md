@@ -25,7 +25,9 @@ Set function environment variables to at least:
 - `BQ_TABLE=cynet_health_deal_sheet` (default for single-table overrides such as `?bq_table=` omitted elsewhere; domain-routed active sync ignores this for writes)
 - `SUBMITTAL_STATUS_CODES=PERM_STARTS,ACTIVE,BOOKED`
 - `BACKFILL_CURSOR_KEY=active-records-default`
-- `BACKFILL_CHECKPOINT_COLLECTION=dealSheetSyncCheckpoints`
+- `BACKFILL_CHECKPOINT_COLLECTION=dealSheetSyncCheckpoints` (subcollection under `workspaces/run-rate-tool`)
+- `FIRESTORE_WORKSPACE_COLLECTION=workspaces` (optional; default `workspaces`)
+- `FIRESTORE_WORKSPACE_DOC_ID=run-rate-tool` (optional; default `run-rate-tool`)
 
 Recommended stability tuning for Nexus:
 
@@ -37,7 +39,7 @@ Create tables once: see [`sql/create_domain_deal_sheet_tables.sql`](../sql/creat
 
 **Ended (offer-rejected) tables:** [`sql/create_domain_ended_deal_sheet_tables.sql`](../sql/create_domain_ended_deal_sheet_tables.sql) — `cynet_health_ended_deal_sheet`, `cynet_health_canada_ended_deal_sheet`, `cynet_locums_ended_deal_sheet` (domain-routed like active).
 
-**Firestore checkpoint (page cursor):** scheduled `dealSheetSyncTrigger` persists `submittalPageNext`, `submittalPerPage`, and `checkpointCursorMode: "page"`. HTTP **`dealSheetSyncOfferRejected`** uses the same page cursor pattern with default `checkpoint_key=offer-rejected-ended-records` and `clear_checkpoint_on_complete` after a full successful pass. HTTP backfill for active sync can pass `checkpoint_use_submittal_page=true` with `resume=true`.
+**Firestore checkpoint (page cursor):** checkpoints are stored at `workspaces/run-rate-tool/dealSheetSyncCheckpoints/{checkpoint_key}`. Scheduled `dealSheetSyncTrigger` persists `submittalPageNext`, `submittalPerPage`, and `checkpointCursorMode: "page"`. HTTP **`dealSheetSyncOfferRejected`** uses the same page cursor pattern with default `checkpoint_key=offer-rejected-ended-records` and `clear_checkpoint_on_complete` after a full successful pass. HTTP backfill for active sync can pass `checkpoint_use_submittal_page=true` with `resume=true`.
 
 ## 2) Deploy
 

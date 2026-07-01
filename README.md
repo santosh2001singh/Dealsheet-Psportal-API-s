@@ -71,7 +71,7 @@ Runs **hourly at :30** Eastern from **9:30 AM through 7:30 PM** (30 minutes afte
 
 Ended-style stream: submittals `EARLY_TERM,COMPLETED,CANCELLED,CANCELED` (override with `submittal_codes`), deal sheets **FINAL** only, **domain-routed ended** tables. **Placement filter** (after enrich): `DID NOT START`, `ENDED`, `ENDED<30`, `DID NOT ACCEPT`. **Tentative date:** `TENTATIVE_DATE >= 2026-05-01` (UTC). Logs each flush with prefix **`[offer-rejected-transform]`** (`enriched_in`, `after_placement_status_filter`, `after_tentative_date_filter`).
 
-**BigQuery behaviour (aligned with scheduled active sync):** `append_on_change_by_dealsheet`, `generated_uuid_field: ID`, same `compare_ignore_fields`, and **`first_insert_placement_status_allowlist`** = expanded active list (`STARTED`, `BOOKED`, `ENDED`, `ENDED<30`, `DID NOT START`, `DID NOT ACCEPT`). **`CONTRACT_ID` is always null** on ended inserts (`skip_contract_id`); Firestore allocation runs only on active insert (`dealSheetSyncTrigger` / manual `dealSheetSync` HTTP). Defaults: **`dedupe_by_placement_id=false`**, **`skip_did_not_accept_existing=false`** (pass `dedupe_by_placement_id=true` or `skip_did_not_accept_existing=true` if you need the older skip behaviour).
+**BigQuery behaviour (aligned with scheduled active sync):** `append_on_change_by_dealsheet`, `generated_uuid_field: ID`, same `compare_ignore_fields`, and **`first_insert_placement_status_allowlist`** = expanded active list (`STARTED`, `BOOKED`, `ENDED`, `ENDED<30`, `DID NOT START`, `DID NOT ACCEPT`). **`CONTRACT_ID` is always null** on ended inserts (`skip_contract_id`); prefixed Firestore allocation runs only on active insert (`dealSheetSyncTrigger` / manual `dealSheetSync` HTTP). Defaults: **`dedupe_by_placement_id=false`**, **`skip_did_not_accept_existing=false`** (pass `dedupe_by_placement_id=true` or `skip_did_not_accept_existing=true` if you need the older skip behaviour).
 
 **There is no Firebase-managed schedule** for this function. After upgrading from the old scheduled trigger, delete the legacy GCP Scheduler job `firebase-schedule-dealSheetSyncOfferRejectedTrigger-*` if it still appears. To run on a schedule or ad hoc from GCP, create an **HTTP** Scheduler job (or use `curl`) pointing at this function’s URL.
 
@@ -86,6 +86,30 @@ curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
 ```
 
 DDL: [`sql/create_domain_ended_deal_sheet_tables.sql`](sql/create_domain_ended_deal_sheet_tables.sql).
+
+## CONTRACT_ID (prefixed per domain table)
+
+Active deal sheet inserts assign a **STRING** `CONTRACT_ID` per business line (no hyphen):
+
+| BigQuery table | Prefix | First ID example |
+|---|---|---|
+| `cynet_health_deal_sheet` | `CHC` | `CHC1000` |
+| `cynet_health_canada_deal_sheet` | `CAC` | `CAC1000` |
+| `cynet_locums_deal_sheet` | `LOC` | `LOC1000` |
+
+- **DEAL** rows: new id from a per-table Firestore counter (`workspaces/run-rate-tool/contractIdSequences/{table_id}`, sequence starts at **1000**).
+- **EXTENSION** rows: reuse the matching DEAL’s `CONTRACT_ID` (in-batch or table-scoped BigQuery lookup).
+- **Ended** inserts: `CONTRACT_ID` remains null (`skip_contract_id`).
+
+**Firestore layout:** sync state lives under `workspaces/run-rate-tool`:
+- `contractIdSequences/{table_id}` — CONTRACT_ID counters (CHC/CAC/LOC)
+- `dealSheetSyncCheckpoints/{checkpoint_key}` — backfill/update/ended pagination cursors
+
+Override parent path via `FIRESTORE_WORKSPACE_COLLECTION` / `FIRESTORE_WORKSPACE_DOC_ID` (defaults: `workspaces` / `run-rate-tool`).
+
+**BigQuery migration (run before deploying functions):** [`sql/migrate_contract_id_to_string.sql`](sql/migrate_contract_id_to_string.sql) — changes `CONTRACT_ID` from `INT64` to `STRING` on active/ended deal sheet tables and log tables.
+
+**Clear values only (after STRING migration):** [`sql/migrate_contract_id_column.sql`](sql/migrate_contract_id_column.sql).
 
 ## Setup
 

@@ -40,9 +40,12 @@ const {
   buildAdditionalCostLogCompositeKey,
   buildTerminationReasonLogCompositeKey,
   applyManualColumnsCarryForward,
+  applyExtensionDateFreeze,
 } = require("./bigQueryClient");
 const { startDateOnOrAfterUtcMin, effectiveMinFilterDate, API_OWNED_COLUMNS } = require("./columnMappings");
 const { buildEnrichedRowsFromDealSheetCandidates } = require("./api/dealSheetEnricher");
+const { normalizeContractIdOrNull } = require("./contractIdFormat");
+const { getCheckpointRef } = require("./firestoreWorkspace");
 const { isCynetHealthCanadaRecruiter, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
 const {
   resolveActiveDealSheetTableId,
@@ -442,7 +445,7 @@ function buildRateChangeLogRow(latestRow, previousRow = null) {
   return {
     RATE_CHANGE: "YES",
     SKU_NUMBER: latestRow?.SKU_NUMBER ?? null,
-    CONTRACT_ID: toInt64OrNull(latestRow?.CONTRACT_ID),
+    CONTRACT_ID: normalizeContractIdOrNull(latestRow?.CONTRACT_ID),
     CANDIDATE_NAME: latestRow?.CANDIDATE_NAME ?? null,
     RATE_CHANGE_EFFECTIVE_DATE: toRateChangeEffectiveDate(latestRow),
     PLACEMENT_STATUS: latestRow?.PLACEMENT_STATUS ?? null,
@@ -467,11 +470,6 @@ function buildRateChangeLogRow(latestRow, previousRow = null) {
     ONSITE_MANAGER: latestRow?.ONSITE_AM ?? null,
     CLIENT_STATE: latestRow?.CLIENT_STATE ?? null,
   };
-}
-
-function getCheckpointRef(key) {
-  const collection = config.backfill?.checkpointCollection || "dealSheetSyncCheckpoints";
-  return admin.firestore().collection(collection).doc(String(key));
 }
 
 /**
@@ -1043,7 +1041,9 @@ async function backfillPlacementRecordFromNexus(params = {}) {
     const compositeKey = buildDealSheetPlacementCompositeKey(backfillDsid, backfillPid);
     const baseline = baselineMap.get(compositeKey) || null;
     if (baseline) {
-      rowToInsert = applyManualColumnsCarryForward(row, baseline).row;
+      const carried = applyManualColumnsCarryForward(row, baseline);
+      const frozen = applyExtensionDateFreeze(carried.row, baseline);
+      rowToInsert = frozen.row;
     }
   }
 

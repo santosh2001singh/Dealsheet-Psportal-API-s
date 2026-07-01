@@ -841,6 +841,135 @@ function applyNewHireDateFreeze(incomingRow, baselineRow) {
   };
 }
 
+function normalizeDealTypeKey(dealType) {
+  if (dealType == null) return "";
+  return String(dealType).trim().toUpperCase();
+}
+
+/**
+ * EXTENSION_START_DATE mirrors START_DATE for EXTENSION rows; null otherwise.
+ */
+function applyExtensionStartDateForRow(row) {
+  if (!row || typeof row !== "object") return row;
+  if (normalizeDealTypeKey(row.DEAL_TYPE) === "EXTENSION") {
+    return { ...row, EXTENSION_START_DATE: row.START_DATE ?? null };
+  }
+  return { ...row, EXTENSION_START_DATE: null };
+}
+
+/**
+ * Freeze EXTENSION_DATE from baseline when present (immutable once set).
+ */
+function applyExtensionDateFreeze(incomingRow, baselineRow) {
+  if (!incomingRow || typeof incomingRow !== "object") {
+    return { row: incomingRow, frozen: false };
+  }
+  if (!baselineRow || typeof baselineRow !== "object") {
+    return { row: incomingRow, frozen: false };
+  }
+  if (isEmptyDateFieldValue(baselineRow.EXTENSION_DATE)) {
+    return { row: incomingRow, frozen: false };
+  }
+  return {
+    row: { ...incomingRow, EXTENSION_DATE: baselineRow.EXTENSION_DATE },
+    frozen: true,
+  };
+}
+
+/**
+ * Returns Map<"DEAL_SHEET_ID|PLACEMENT_ID", earliest DATE_AND_TIME> from BigQuery.
+ */
+async function fetchEarliestDateAndTimeByDealSheetPlacementPairs(rows, options = {}) {
+  const out = new Map();
+  if (!rows || rows.length === 0) return out;
+
+  const { datasetId, tableId } = resolveBqDatasetTable(options);
+  const pairMap = new Map();
+  for (const row of rows) {
+    const dsid = row?.DEAL_SHEET_ID == null ? "" : String(row.DEAL_SHEET_ID).trim();
+    const pid = row?.PLACEMENT_ID == null ? "" : String(row.PLACEMENT_ID).trim();
+    const key = buildDealSheetPlacementCompositeKey(dsid, pid);
+    if (!key || pairMap.has(key)) continue;
+    pairMap.set(key, { dsid, pid });
+  }
+  const pairs = Array.from(pairMap.values());
+  if (!pairs.length) return out;
+
+  const chunkSize = 300;
+  for (let i = 0; i < pairs.length; i += chunkSize) {
+    const chunk = pairs.slice(i, i + chunkSize);
+    const wherePairs = chunk
+      .map(
+        ({ dsid, pid }) =>
+          `(CAST(DEAL_SHEET_ID AS STRING) = '${escapeSqlString(dsid)}' AND CAST(PLACEMENT_ID AS STRING) = '${escapeSqlString(pid)}')`
+      )
+      .join(" OR ");
+    const sql = `
+      SELECT
+        CAST(DEAL_SHEET_ID AS STRING) AS deal_sheet_id,
+        CAST(PLACEMENT_ID AS STRING) AS placement_id,
+        MIN(DATE_AND_TIME) AS earliest_date_and_time
+      FROM \`${config.projectId}.${datasetId}.${tableId}\`
+      WHERE ${wherePairs}
+      GROUP BY deal_sheet_id, placement_id`;
+    const dbRows = await queryObjects(sql, chunk.length * 2);
+    for (const row of dbRows) {
+      const key = buildDealSheetPlacementCompositeKey(row?.deal_sheet_id, row?.placement_id);
+      if (!key) continue;
+      const ts = row?.earliest_date_and_time;
+      if (ts == null || String(ts).trim() === "") continue;
+      out.set(key, ts);
+    }
+  }
+  return out;
+}
+
+/**
+ * Set EXTENSION_DATE from MIN(DATE_AND_TIME) in BigQuery when still empty on EXTENSION rows.
+ * @param {object} [deps]
+ * @param {typeof fetchEarliestDateAndTimeByDealSheetPlacementPairs} [deps.fetchEarliestFn]
+ */
+async function resolveExtensionDatesForInsertRows(rows, options = {}, deps = {}) {
+  if (!rows || rows.length === 0) return rows;
+
+  const fetchEarliestFn = deps.fetchEarliestFn ?? fetchEarliestDateAndTimeByDealSheetPlacementPairs;
+  const needsResolution = rows.filter(
+    (row) =>
+      normalizeDealTypeKey(row?.DEAL_TYPE) === "EXTENSION"
+      && isEmptyDateFieldValue(row?.EXTENSION_DATE)
+  );
+  if (needsResolution.length === 0) {
+    return rows.map((row) => applyExtensionStartDateForRow(row));
+  }
+
+  const earliestByKey = await fetchEarliestFn(needsResolution, options);
+  let resolvedCount = 0;
+  const out = rows.map((row) => {
+    let next = applyExtensionStartDateForRow(row);
+    if (
+      normalizeDealTypeKey(next?.DEAL_TYPE) !== "EXTENSION"
+      || !isEmptyDateFieldValue(next?.EXTENSION_DATE)
+    ) {
+      return next;
+    }
+    const key = buildDealSheetPlacementCompositeKey(next?.DEAL_SHEET_ID, next?.PLACEMENT_ID);
+    const earliest = key ? earliestByKey.get(key) : undefined;
+    if (earliest == null || String(earliest).trim() === "") return next;
+    resolvedCount++;
+    return {
+      ...next,
+      EXTENSION_DATE: normalizeTimestampForStreamingInsert(earliest),
+    };
+  });
+
+  if (resolvedCount > 0) {
+    logLine(
+      `[enriched sync] [BigQuery insertAll] EXTENSION_DATE from MIN(DATE_AND_TIME): resolved=${resolvedCount}`
+    );
+  }
+  return out;
+}
+
 /**
  * Latest NEW_HIRE_DATE per DEAL_SHEET_ID+PLACEMENT_ID from paired active table.
  * @param {object[]} rows
@@ -978,6 +1107,16 @@ function formatDateInTimeZone(dateTime, timeZone) {
   }).format(new Date(dateTime));
 }
 
+function normalizeTimestampForStreamingInsert(value) {
+  if (value == null) return null;
+  if (value instanceof Date) return value.toISOString();
+  const trimmed = String(value).trim();
+  if (trimmed === "") return null;
+  const parsedMs = Date.parse(trimmed);
+  if (!Number.isNaN(parsedMs)) return new Date(parsedMs).toISOString();
+  return trimmed;
+}
+
 /**
  * Stamp EXTENSION_DATE on first insert only (when row field is empty).
  * NEW_HIRE_DATE is sourced from job-submittal-notes during enrich (not stamped here).
@@ -988,17 +1127,10 @@ function computeDealSheetFirstInsertDateStamps(row, dateTime) {
   if (!row || typeof row !== "object") return out;
   if (dateTime == null || String(dateTime).trim() === "") return out;
 
-  const dealType = row?.DEAL_TYPE == null ? "" : String(row.DEAL_TYPE).trim().toUpperCase();
-  const placementStatus = row?.PLACEMENT_STATUS == null
-    ? ""
-    : String(row.PLACEMENT_STATUS).trim().toUpperCase();
+  const dealType = normalizeDealTypeKey(row?.DEAL_TYPE);
 
-  if (
-    dealType === "EXTENSION"
-    && placementStatus === "BOOKED"
-    && isEmptyDateFieldValue(row.EXTENSION_DATE)
-  ) {
-    out.EXTENSION_DATE = formatDateInTimeZone(dateTime, "America/New_York");
+  if (dealType === "EXTENSION" && isEmptyDateFieldValue(row.EXTENSION_DATE)) {
+    out.EXTENSION_DATE = normalizeTimestampForStreamingInsert(dateTime);
   }
 
   return out;
@@ -1269,6 +1401,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     let manualColumnsCarriedTotal = 0;
     let tentativeFrozenCount = 0;
     let newHireFrozenCount = 0;
+    let extensionFrozenCount = 0;
     for (const row of rowsToInsert) {
       const dsid = row?.DEAL_SHEET_ID == null ? "" : String(row.DEAL_SHEET_ID).trim();
       if (!dsid) {
@@ -1306,7 +1439,9 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
         if (tentativeAdjusted.frozen) tentativeFrozenCount++;
         const newHireAdjusted = applyNewHireDateFreeze(tentativeAdjusted.row, existing);
         if (newHireAdjusted.frozen) newHireFrozenCount++;
-        const moveRunrateAdjusted = applyMoveRunrateAppendOverride(newHireAdjusted.row, existing);
+        const extensionAdjusted = applyExtensionDateFreeze(newHireAdjusted.row, existing);
+        if (extensionAdjusted.frozen) extensionFrozenCount++;
+        const moveRunrateAdjusted = applyMoveRunrateAppendOverride(extensionAdjusted.row, existing);
         const withRejectedReset = applyIsRejectedResetForChangedUpdate(moveRunrateAdjusted.row, existing);
         if (moveRunrateAdjusted.forcedFalse) moveRunrateForcedFalse++;
         if (moveRunrateAdjusted.keptNull) moveRunrateKeptNull++;
@@ -1322,6 +1457,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
       + ` isRejectedResetCount=${isRejectedResetCount} manualColumnsCarriedTotal=${manualColumnsCarriedTotal}`
       + ` tentativeFrozenCount=${tentativeFrozenCount}`
       + ` newHireFrozenCount=${newHireFrozenCount}`
+      + ` extensionFrozenCount=${extensionFrozenCount}`
     );
   }
 
@@ -1355,7 +1491,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     // CONTRACT_ID from Phase A (resolveContractIdsForRows) are left untouched.
     // Lazy require to avoid module-load circular dependency with contractIdResolver.
     const { allocateContractIdsForInsertableRows } = require("./contractIdResolver");
-    await allocateContractIdsForInsertableRows(rowsToInsert);
+    await allocateContractIdsForInsertableRows(rowsToInsert, { tableId: options.tableId });
   }
 
   const generatedUuidField =
@@ -1373,6 +1509,11 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
   }
 
   rowsToInsert = await resolveNewHireDatesForEndedRows(rowsToInsert, {
+    datasetId: options.datasetId,
+    tableId: options.tableId,
+  });
+
+  rowsToInsert = await resolveExtensionDatesForInsertRows(rowsToInsert, {
     datasetId: options.datasetId,
     tableId: options.tableId,
   });
@@ -1988,12 +2129,17 @@ function formatDateOnlyForSql(value) {
 /**
  * Build UNION ALL SQL over all active domain deal sheet tables.
  * @param {string} datasetId
+ * @param {string} [tableId] When set, single-table SQL instead of union
  * @returns {string}
  */
-function buildActiveDealSheetsUnionSql(datasetId) {
-  return ACTIVE_DEAL_SHEET_TABLE_IDS.map(
-    (tableId) =>
-      `SELECT DEAL_SHEET_ID, PLACEMENT_ID, CONTRACT_ID, START_DATE, ORIGINAL_START_DATE, EDIT_DATE, CANDIDATE_NEXUS_ID, CANDIDATE_EMAIL, PHONE_NUMBER, NEXUS_INTERNAL_JOB_ID, CLIENT_ID, DEAL_TYPE FROM \`${config.projectId}.${datasetId}.${tableId}\``
+function buildActiveDealSheetsUnionSql(datasetId, tableId) {
+  const tableIds =
+    typeof tableId === "string" && tableId.trim() !== ""
+      ? [tableId.trim()]
+      : ACTIVE_DEAL_SHEET_TABLE_IDS;
+  return tableIds.map(
+    (tid) =>
+      `SELECT DEAL_SHEET_ID, PLACEMENT_ID, CONTRACT_ID, START_DATE, ORIGINAL_START_DATE, EDIT_DATE, CANDIDATE_NEXUS_ID, CANDIDATE_EMAIL, PHONE_NUMBER, NEXUS_INTERNAL_JOB_ID, CLIENT_ID, DEAL_TYPE FROM \`${config.projectId}.${datasetId}.${tid}\``
   ).join(" UNION ALL ");
 }
 
@@ -2001,7 +2147,7 @@ function buildActiveDealSheetsUnionSql(datasetId) {
  * Latest non-null CONTRACT_ID per DEAL_SHEET_ID across active domain tables.
  * @param {Array<string|number>} dealSheetIds
  * @param {object} [options]
- * @returns {Promise<Map<string, number>>} dealSheetId string -> contract id
+ * @returns {Promise<Map<string, string>>} dealSheetId string -> contract id
  */
 async function fetchContractIdsByDealSheetIds(dealSheetIds, options = {}) {
   const out = new Map();
@@ -2053,8 +2199,9 @@ async function fetchContractIdsByDealSheetIds(dealSheetIds, options = {}) {
       const dsid = row?.deal_sheet_id;
       const cid = row?.contract_id;
       if (dsid == null || String(dsid).trim() === "") continue;
-      if (cid == null || !Number.isFinite(Number(cid))) continue;
-      out.set(String(dsid).trim(), Math.trunc(Number(cid)));
+      if (cid == null || String(cid).trim() === "") continue;
+      const normalized = String(cid).trim().toUpperCase();
+      out.set(String(dsid).trim(), normalized);
     }
   }
 
@@ -2065,7 +2212,7 @@ async function fetchContractIdsByDealSheetIds(dealSheetIds, options = {}) {
  * For EXTENSION rows, find original DEAL CONTRACT_ID across active tables.
  * @param {Array<{placementId: number, candidateNexusId: number, candidateEmail?: string|null, phoneNumber?: string|null, clientId: number, startDate?: *}>} extensionRows
  * @param {object} [options]
- * @returns {Promise<Map<string, number|null>>} placementId string -> contract id or null
+ * @returns {Promise<Map<string, string|null>>} placementId string -> contract id or null
  */
 async function fetchContractIdsForExtensions(extensionRows, options = {}) {
   const out = new Map();
@@ -2075,7 +2222,11 @@ async function fetchContractIdsForExtensions(extensionRows, options = {}) {
     typeof options.datasetId === "string" && options.datasetId.trim() !== ""
       ? options.datasetId.trim()
       : config.datasetId;
-  const unionSql = buildActiveDealSheetsUnionSql(datasetId);
+  const tableId =
+    typeof options.tableId === "string" && options.tableId.trim() !== ""
+      ? options.tableId.trim()
+      : "";
+  const unionSql = buildActiveDealSheetsUnionSql(datasetId, tableId || undefined);
   const chunkSize = 100;
 
   for (let i = 0; i < extensionRows.length; i += chunkSize) {
@@ -2160,9 +2311,9 @@ async function fetchContractIdsForExtensions(extensionRows, options = {}) {
       const cid = row?.contract_id;
       out.set(
         String(pid).trim(),
-        cid == null || cid === "" || !Number.isFinite(Number(cid))
+        cid == null || String(cid).trim() === ""
           ? null
-          : Math.trunc(Number(cid))
+          : String(cid).trim().toUpperCase()
       );
     }
   }
@@ -2214,6 +2365,10 @@ module.exports = {
   applyManualColumnsCarryForward,
   applyTentativeDateFreeze,
   applyNewHireDateFreeze,
+  applyExtensionDateFreeze,
+  applyExtensionStartDateForRow,
+  fetchEarliestDateAndTimeByDealSheetPlacementPairs,
+  resolveExtensionDatesForInsertRows,
   fetchNewHireDatesFromActiveTable,
   resolveNewHireDatesForEndedRows,
   computeDealSheetFirstInsertDateStamps,

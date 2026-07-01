@@ -1,68 +1,102 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const mockState = {
-  nextValue: null,
-  writes: [],
-};
+const { allocateContractIds, getNextContractId } = require("./contractIdSequence");
 
-function createMockFirestore() {
-  const docRef = {
-    get: async () => ({
-      exists: mockState.nextValue != null,
-      data: () => (mockState.nextValue != null ? { nextValue: mockState.nextValue } : {}),
-    }),
-    set: async (data, opts) => {
-      mockState.writes.push({ data, opts });
-      if (data.nextValue != null) mockState.nextValue = data.nextValue;
+function createMockFirestore(initialNextValue) {
+  let nextValue = initialNextValue;
+  const leafDocRef = {
+    id: "mock-seq-doc",
+    async get() {
+      return {
+        exists: nextValue != null,
+        data() {
+          return { nextValue };
+        },
+      };
+    },
+  };
+  const sequenceSubcollection = {
+    doc() {
+      return leafDocRef;
+    },
+  };
+  const workspaceDoc = {
+    collection() {
+      return sequenceSubcollection;
     },
   };
   return {
-    collection: () => ({
-      doc: () => docRef,
-    }),
-    runTransaction: async (fn) => {
+    runTransaction(fn) {
       const tx = {
-        get: async (ref) => ref.get(),
-        set: async (ref, data, opts) => ref.set(data, opts),
+        async get() {
+          return {
+            exists: nextValue != null,
+            data() {
+              return { nextValue };
+            },
+          };
+        },
+        set(_ref, data) {
+          nextValue = data.nextValue;
+        },
       };
       return fn(tx);
+    },
+    collection() {
+      return {
+        doc() {
+          return workspaceDoc;
+        },
+      };
     },
   };
 }
 
-const { allocateContractIds, resolveStartValue } = require("./contractIdSequence");
-
-test("resolveStartValue defaults to 100000", () => {
-  assert.equal(resolveStartValue({}), 100000);
-  assert.equal(resolveStartValue({ startValue: 200000 }), 200000);
-});
-
-test("allocateContractIds returns empty array for count 0", async () => {
-  mockState.nextValue = null;
-  mockState.writes = [];
-  const result = await allocateContractIds(0, {
-    startValue: 100000,
-    firestore: createMockFirestore(),
+test("allocateContractIds returns prefixed strings from startValue", async () => {
+  const firestore = createMockFirestore(null);
+  const ids = await allocateContractIds(2, {
+    firestore,
+    docId: "cynet_health_deal_sheet",
+    prefix: "CHC",
+    startValue: 1000,
+    collection: "contractIdSequences",
   });
-  assert.deepEqual(result, []);
-  assert.equal(mockState.writes.length, 0);
-});
-
-test("allocateContractIds first batch starts at 100000", async () => {
-  mockState.nextValue = null;
-  mockState.writes = [];
-  const firestore = createMockFirestore();
-  const result = await allocateContractIds(3, { startValue: 100000, firestore });
-  assert.deepEqual(result, [100000, 100001, 100002]);
-  assert.equal(mockState.nextValue, 100003);
+  assert.deepEqual(ids, ["CHC1000", "CHC1001"]);
 });
 
 test("allocateContractIds continues from stored nextValue", async () => {
-  mockState.nextValue = 100003;
-  mockState.writes = [];
-  const firestore = createMockFirestore();
-  const result = await allocateContractIds(2, { startValue: 100000, firestore });
-  assert.deepEqual(result, [100003, 100004]);
-  assert.equal(mockState.nextValue, 100005);
+  const firestore = createMockFirestore(1005);
+  const ids = await allocateContractIds(1, {
+    firestore,
+    docId: "cynet_locums_deal_sheet",
+    prefix: "LOC",
+    startValue: 1000,
+    collection: "contractIdSequences",
+  });
+  assert.deepEqual(ids, ["LOC1005"]);
+});
+
+test("getNextContractId peeks without consuming", async () => {
+  const firestore = createMockFirestore(1010);
+  const peek = await getNextContractId({
+    firestore,
+    docId: "cynet_health_canada_deal_sheet",
+    startValue: 1000,
+    collection: "contractIdSequences",
+  });
+  assert.equal(peek, 1010);
+});
+
+test("allocateContractIds returns empty for non-positive count", async () => {
+  const firestore = createMockFirestore(1000);
+  assert.deepEqual(
+    await allocateContractIds(0, {
+      firestore,
+      docId: "cynet_health_deal_sheet",
+      prefix: "CHC",
+      startValue: 1000,
+    }),
+    []
+  );
 });

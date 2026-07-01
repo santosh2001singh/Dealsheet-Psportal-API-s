@@ -63,6 +63,12 @@ const config = {
    */
   newHireDateFreezeEnabled: process.env.NEW_HIRE_DATE_FREEZE_ENABLED !== "false",
 
+  /** Parent Firestore document for deal-sheet sync state (subcollections below) */
+  firestoreWorkspace: {
+    collection: process.env.FIRESTORE_WORKSPACE_COLLECTION || "workspaces",
+    docId: process.env.FIRESTORE_WORKSPACE_DOC_ID || "run-rate-tool",
+  },
+
   backfill: {
     /** Default pages per resume invocation (0 = no cap unless max_pages query is passed) */
     pageLimitPerRun: parseInt(process.env.BACKFILL_PAGE_LIMIT_PER_RUN || "0", 10),
@@ -71,11 +77,16 @@ const config = {
     checkpointKey: process.env.BACKFILL_CURSOR_KEY || "active-records-default",
   },
 
-  /** Firestore-backed monotonic CONTRACT_ID sequence (starts at 100000) */
+  /** Per-table prefixed CONTRACT_ID config (CHC/CAC/LOC + sequence from 1000) */
+  contractIdByTable: {
+    cynet_health_deal_sheet: { prefix: "CHC", startValue: 1000 },
+    cynet_health_canada_deal_sheet: { prefix: "CAC", startValue: 1000 },
+    cynet_locums_deal_sheet: { prefix: "LOC", startValue: 1000 },
+  },
+
+  /** Firestore collection for per-table CONTRACT_ID sequences (doc id = table id) */
   contractIdSequence: {
     collection: process.env.CONTRACT_ID_SEQUENCE_COLLECTION || "contractIdSequences",
-    docId: process.env.CONTRACT_ID_SEQUENCE_DOC || "default",
-    startValue: parseInt(process.env.CONTRACT_ID_START_VALUE || "100000", 10),
   },
 
   peoplestrong: {

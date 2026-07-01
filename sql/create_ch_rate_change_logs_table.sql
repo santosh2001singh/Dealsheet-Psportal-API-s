@@ -11,7 +11,7 @@ CREATE TABLE `cynetdatabase.rr_project_data.ch_rate_change_logs` (
 
   -- Identification / metadata
   SKU_NUMBER STRING,
-  CONTRACT_ID INT64,
+  CONTRACT_ID STRING,
   CANDIDATE_NAME STRING,
   RATE_CHANGE_EFFECTIVE_DATE DATE,
   PLACEMENT_STATUS STRING,
