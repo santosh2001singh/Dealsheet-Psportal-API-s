@@ -1362,6 +1362,21 @@ function resolveNewHireDateForDealRow(dealType, notes) {
 }
 
 /**
+ * EXTENSION_DATE from job-submittal created_date for EXTENSION rows only.
+ * @param {string|null|undefined} dealType
+ * @param {object|null|undefined} submittalRow
+ * @returns {string|null}
+ */
+function resolveExtensionDateForExtensionRow(dealType, submittalRow) {
+  const key = dealType == null ? "" : String(dealType).trim().toUpperCase();
+  if (key !== "EXTENSION") return null;
+  const raw = submittalRow?.created_date;
+  if (raw == null || String(raw).trim() === "") return null;
+  const ms = Date.parse(String(raw).trim());
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : String(raw).trim();
+}
+
+/**
  * Pick display VALUE from cancellation/termination API item (priority order).
  */
 function extractTerminationReasonValue(apiItem) {
@@ -1449,6 +1464,7 @@ const API_OWNED_COLUMNS = new Set([
   "PHONE_NUMBER",
   "PROVIDER_TYPE",
   "RECRUITER_ID",
+  "RECRUITER_EMP_NO",
   "ASSIGNMENT_RECRUITER",
   "ASSIGNMENT_RECRUITER_EMAIL",
   "CLIENT_SALES_REP",
@@ -1523,7 +1539,7 @@ Object.freeze(API_OWNED_COLUMNS);
  * `NEW_HIRE_DATE` is set from job-submittal-notes (earliest BOOKED modified_date) for DEAL rows when baseline is empty;
  * EXTENSION rows are not set from API on enrich; once baseline has a value it is frozen on update-append (DEAL or EXTENSION)
  * unless `NEW_HIRE_DATE_FREEZE_ENABLED=false` (one-time migration to rewrite legacy insert-time stamps).
- * `EXTENSION_DATE` is MIN(DATE_AND_TIME) per placement pair for EXTENSION rows (TIMESTAMP), frozen once set.
+ * `EXTENSION_DATE` is submittal created_date for EXTENSION rows (TIMESTAMP); frozen once set.
  * `EXTENSION_START_DATE` mirrors START_DATE for EXTENSION rows (null for DEAL); updates with START_DATE.
  */
 const SYSTEM_CONTROLLED_COLUMNS = new Set([
@@ -1541,6 +1557,9 @@ Object.freeze(SYSTEM_CONTROLLED_COLUMNS);
 /**
  * Manual BigQuery-edited columns (see sql/create_domain_deal_sheet_tables.sql).
  * Carried forward from baseline on update-append; never overwritten by Nexus enrich.
+ * LEVEL_2_CSM/LEVEL_3_CSM/LEVEL_4_CSM are intentionally NOT here even though they used to be
+ * manual — they're now recomputed on every insert from ONSITE_AM_EMAIL's manager chain (see
+ * applyOnsiteAmCsmHierarchyForRows in bigQueryClient.js), so they must never be carried forward.
  */
 const MANUAL_COLUMNS = new Set([
   "ACC_DIR_OR_VERT_HEAD",
@@ -1592,9 +1611,6 @@ const MANUAL_COLUMNS = new Set([
   "GRP_DIR_ASSOC_GRP_DIR_EMP_NO",
   "HOURLY_GP",
   "INV_CYC_TO_CLT",
-  "LEVEL_2_CSM",
-  "LEVEL_3_CSM",
-  "LEVEL_4_CSM",
   "IS_DELETED",
   "ONB_CAND_DOB",
   "ONB_E_VERIFY",
@@ -1630,6 +1646,11 @@ const MANUAL_COLUMNS = new Set([
   "VP_SRVP",
   "VP_SRVP_EMP_NO",
   "WEEKLY_WALLET_MONEY",
+  // Set only on a recruiter reassignment (applyPreviousRecruiterOnRecruiterChange, bigQueryClient.js);
+  // otherwise carried forward from baseline like any manual column so the value persists.
+  "PREVIOUS_RECRUITER_NAME",
+  "PREVIOUS_RECRUITER_EMAIL",
+  "PREVIOUS_RECRUITER_EMP_NO",
 ]);
 Object.freeze(MANUAL_COLUMNS);
 
@@ -1669,6 +1690,7 @@ module.exports = {
   computeDerivedPlacementFields,
   startDateOnOrAfterUtcMin,
   effectiveMinFilterDate,
+  formatDateStringForBq,
   coerceApiFloatNullsToZero,
   isTerminationApiEligiblePlacementStatus,
   normalizePlacementStatusKey,
@@ -1676,6 +1698,7 @@ module.exports = {
   resolveTentativeDateForPlacementRow,
   resolveNewHireDateFromSubmittalNotes,
   resolveNewHireDateForDealRow,
+  resolveExtensionDateForExtensionRow,
   extractTerminationReasonValue,
   pickLatestTerminationDetailItem,
   mapTerminationReasonLogRowForDealSheet,

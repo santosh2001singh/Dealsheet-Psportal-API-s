@@ -2,6 +2,8 @@
  * Map assignment recruiter email domain to active / ended deal sheet BigQuery table ids.
  */
 
+const config = require("./config");
+
 const TABLE_CYNET_HEALTH = "cynet_health_deal_sheet";
 const TABLE_CYNET_HEALTH_CANADA = "cynet_health_canada_deal_sheet";
 const TABLE_CYNET_LOCUMS = "cynet_locums_deal_sheet";
@@ -90,6 +92,20 @@ function resolvePairedActiveTableId(endedTableId) {
   return ENDED_TO_ACTIVE_TABLE.get(key) ?? null;
 }
 
+/**
+ * Domain-specific all_CH_data_runrate-equivalent table id for a given deal sheet table
+ * (active or ended — ended is normalized to its paired active domain first).
+ * @param {unknown} tableId - any of the 6 domain deal sheet table ids
+ * @returns {string}
+ */
+function resolveRunrateTableIdForDealSheetTable(tableId) {
+  const key = tableId == null ? "" : String(tableId).trim();
+  const activeKey = resolvePairedActiveTableId(key) ?? key;
+  if (activeKey === TABLE_CYNET_HEALTH_CANADA) return config.runrateCanadaTableId;
+  if (activeKey === TABLE_CYNET_LOCUMS) return config.runrateLocumsTableId;
+  return config.runrateTableId;
+}
+
 module.exports = {
   ACTIVE_DEAL_SHEET_TABLE_IDS,
   resolveActiveDealSheetTableId,
@@ -104,4 +120,5 @@ module.exports = {
   TABLE_ENDED_CYNET_HEALTH_CANADA,
   TABLE_ENDED_CYNET_LOCUMS,
   resolvePairedActiveTableId,
+  resolveRunrateTableIdForDealSheetTable,
 };

@@ -8,6 +8,14 @@ const config = {
   datasetId: process.env.BQ_DATASET || "rr_project_data",
   /** Default single-table target; domain-routed sync omits bq_table and ignores this for writes */
   tableId: process.env.BQ_TABLE || "cynet_health_deal_sheet",
+  /**
+   * Historical run-rate source tables used to backfill ORIGINAL_START_DATE/NEW_HIRE_DATE/hierarchy
+   * on brand-new EXTENSION rows, one per domain (see recruiterDomainTables.resolveRunrateTableIdForDealSheetTable).
+   */
+  runrateTableId: process.env.RUNRATE_TABLE_ID || "all_CH_data_runrate",
+  runrateCanadaTableId: process.env.RUNRATE_CANADA_TABLE_ID || "all_Health_Canada_data_Runrate",
+  /** TODO: placeholder — swap once the real Locums run-rate table exists */
+  runrateLocumsTableId: process.env.RUNRATE_LOCUMS_TABLE_ID || "all_Locums_data_Runrate",
   rateChangeLogDatasetId: process.env.BQ_RATE_CHANGE_LOG_DATASET || "rr_project_data",
   rateChangeLogTableId: process.env.BQ_RATE_CHANGE_LOG_TABLE || "ch_rate_change_logs",
   additionalCostLogDatasetId: process.env.BQ_ADDITIONAL_COST_LOG_DATASET || "rr_project_data",
@@ -16,6 +24,16 @@ const config = {
     process.env.BQ_TERMINATION_REASON_LOG_DATASET || "rr_project_data",
   terminationReasonLogTableId:
     process.env.BQ_TERMINATION_REASON_LOG_TABLE || "ch_termination_reason_logs",
+  /** Audit log of recruiter-reassignment events: new recruiter's hierarchy at time of change */
+  inorganicHierarchyLogDatasetId:
+    process.env.BQ_INORGANIC_HIERARCHY_LOG_DATASET || "rr_project_data",
+  inorganicHierarchyLogTableId:
+    process.env.BQ_INORGANIC_HIERARCHY_LOG_TABLE || "inorganic_hierarchy_logs",
+  /** Per-role ownership-change audit log (recruiter / onsite AM / CSM level handovers) */
+  ownershipChangeLogDatasetId:
+    process.env.BQ_OWNERSHIP_CHANGE_LOG_DATASET || "rr_project_data",
+  ownershipChangeLogTableId:
+    process.env.BQ_OWNERSHIP_CHANGE_LOG_TABLE || "ownership_change_logs",
 
   batchSize: parseInt(process.env.BATCH_SIZE || "300", 10),
   /** Nexus job-submittals per_page (deal-sheet sync paths); override via PER_PAGE */
@@ -87,6 +105,19 @@ const config = {
   /** Firestore collection for per-table CONTRACT_ID sequences (doc id = table id) */
   contractIdSequence: {
     collection: process.env.CONTRACT_ID_SEQUENCE_COLLECTION || "contractIdSequences",
+  },
+
+  /** Employee directory used to resolve recruiter/hierarchy emp numbers by email */
+  directoryEmployees: {
+    datasetId: process.env.DIRECTORY_EMPLOYEES_DATASET || "MISC",
+    tableId: process.env.DIRECTORY_EMPLOYEES_TABLE || "directory_employees",
+  },
+
+  /** Employee org-chart hierarchy snapshots, keyed by employee external_id, used to backfill
+   * recruiter hierarchy (TEAM_LEAD, ATL, RM, etc.) on brand-new DEAL_TYPE=DEAL rows */
+  directoryEmployeeHierarchy: {
+    datasetId: process.env.DIRECTORY_EMPLOYEE_HIERARCHY_DATASET || "MISC",
+    tableId: process.env.DIRECTORY_EMPLOYEE_HIERARCHY_TABLE || "directory_employee_hierarchy",
   },
 
   peoplestrong: {

@@ -13,6 +13,7 @@ const {
   ENDED_DEAL_SHEET_TABLE_IDS,
   resolveActiveDealSheetTableId,
   resolvePairedActiveTableId,
+  resolveRunrateTableIdForDealSheetTable,
 } = require("./recruiterDomainTables");
 const {
   API_OWNED_COLUMNS,
@@ -21,6 +22,18 @@ const {
   isDidNotStartPlacementStatus,
 } = require("./columnMappings");
 const { isCynetHealthCanadaRecruiter, sanitizeCanadaDealSheetRow, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
+const { normalizeContractIdOrNull, buildSequenceOptionsForTable } = require("./contractIdFormat");
+const { allocateContractIds } = require("./contractIdSequence");
+const {
+  DEAL_RECRUITER_HIERARCHY_TARGETS,
+  HIERARCHY_DESIGNATION_SYNONYMS,
+  DESIGNATION_TO_INORGANIC_LOG_COLUMN,
+  CSM_LEVEL_TARGETS,
+  CSM_LEVEL_TO_INORGANIC_COLUMN,
+  resolveCsmLevelsFromChain,
+  resolveHierarchyColumnForTitle,
+  OWNERSHIP_CHANGE_DIFF_ROLES,
+} = require("./recruiterHierarchyDesignations");
 
 let bigquery;
 const tableFqn = `${config.projectId}.${config.datasetId}.${config.tableId}`;
@@ -42,10 +55,21 @@ if (config.serviceAccount.client_email && config.serviceAccount.private_key) {
 }
 
 /**
- * Escape single quotes for SQL string literals
+ * Escape a value for embedding inside a single-quoted BigQuery string literal.
+ * BigQuery uses BACKSLASH escaping, not SQL-standard doubled quotes — `'O''Brien'` is read as two
+ * adjacent literals ("concatenated string literals must be separated by whitespace"), so a value
+ * like "St. Mary's" must become 'St. Mary\'s'. Backslash is escaped first so a literal backslash
+ * in the value can't form an unintended escape sequence; newline/carriage-return/tab are escaped
+ * because an unescaped one would terminate a single-quoted literal. Values with none of these
+ * characters (e.g. numeric IDs) pass through unchanged.
  */
 function escapeSqlString(value) {
-  return String(value).replace(/'/g, "''");
+  return String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r")
+    .replace(/\t/g, "\\t");
 }
 
 /**
@@ -819,6 +843,30 @@ function applyTentativeDateFreeze(incomingRow, baselineRow) {
 }
 
 /**
+ * On an update-append where ASSIGNMENT_RECRUITER_EMAIL changed vs baseline, stamp the OUTGOING
+ * recruiter's identity onto PREVIOUS_RECRUITER_NAME/EMAIL/EMP_NO from the baseline row. When the
+ * recruiter is unchanged these columns are left as-is (they are MANUAL_COLUMNS, so already carried
+ * forward from baseline by applyManualColumnsCarryForward before this runs).
+ */
+function applyPreviousRecruiterOnRecruiterChange(incomingRow, baselineRow) {
+  if (!incomingRow || typeof incomingRow !== "object") return { row: incomingRow, changed: false };
+  if (!baselineRow || typeof baselineRow !== "object") return { row: incomingRow, changed: false };
+  const normEmail = (v) => (v == null ? "" : String(v).trim().toLowerCase());
+  const incEmail = normEmail(incomingRow.ASSIGNMENT_RECRUITER_EMAIL);
+  const baseEmail = normEmail(baselineRow.ASSIGNMENT_RECRUITER_EMAIL);
+  if (baseEmail === "" || incEmail === baseEmail) return { row: incomingRow, changed: false };
+  return {
+    row: {
+      ...incomingRow,
+      PREVIOUS_RECRUITER_NAME: baselineRow.ASSIGNMENT_RECRUITER ?? null,
+      PREVIOUS_RECRUITER_EMAIL: baselineRow.ASSIGNMENT_RECRUITER_EMAIL ?? null,
+      PREVIOUS_RECRUITER_EMP_NO: baselineRow.RECRUITER_EMP_NO ?? null,
+    },
+    changed: true,
+  };
+}
+
+/**
  * Freeze NEW_HIRE_DATE from baseline when present (immutable once set; DEAL and EXTENSION).
  * Skipped when config.newHireDateFreezeEnabled is false (migration backfill).
  */
@@ -877,97 +925,11 @@ function applyExtensionDateFreeze(incomingRow, baselineRow) {
 }
 
 /**
- * Returns Map<"DEAL_SHEET_ID|PLACEMENT_ID", earliest DATE_AND_TIME> from BigQuery.
+ * Apply EXTENSION_START_DATE from START_DATE on rows about to insert.
  */
-async function fetchEarliestDateAndTimeByDealSheetPlacementPairs(rows, options = {}) {
-  const out = new Map();
-  if (!rows || rows.length === 0) return out;
-
-  const { datasetId, tableId } = resolveBqDatasetTable(options);
-  const pairMap = new Map();
-  for (const row of rows) {
-    const dsid = row?.DEAL_SHEET_ID == null ? "" : String(row.DEAL_SHEET_ID).trim();
-    const pid = row?.PLACEMENT_ID == null ? "" : String(row.PLACEMENT_ID).trim();
-    const key = buildDealSheetPlacementCompositeKey(dsid, pid);
-    if (!key || pairMap.has(key)) continue;
-    pairMap.set(key, { dsid, pid });
-  }
-  const pairs = Array.from(pairMap.values());
-  if (!pairs.length) return out;
-
-  const chunkSize = 300;
-  for (let i = 0; i < pairs.length; i += chunkSize) {
-    const chunk = pairs.slice(i, i + chunkSize);
-    const wherePairs = chunk
-      .map(
-        ({ dsid, pid }) =>
-          `(CAST(DEAL_SHEET_ID AS STRING) = '${escapeSqlString(dsid)}' AND CAST(PLACEMENT_ID AS STRING) = '${escapeSqlString(pid)}')`
-      )
-      .join(" OR ");
-    const sql = `
-      SELECT
-        CAST(DEAL_SHEET_ID AS STRING) AS deal_sheet_id,
-        CAST(PLACEMENT_ID AS STRING) AS placement_id,
-        MIN(DATE_AND_TIME) AS earliest_date_and_time
-      FROM \`${config.projectId}.${datasetId}.${tableId}\`
-      WHERE ${wherePairs}
-      GROUP BY deal_sheet_id, placement_id`;
-    const dbRows = await queryObjects(sql, chunk.length * 2);
-    for (const row of dbRows) {
-      const key = buildDealSheetPlacementCompositeKey(row?.deal_sheet_id, row?.placement_id);
-      if (!key) continue;
-      const ts = row?.earliest_date_and_time;
-      if (ts == null || String(ts).trim() === "") continue;
-      out.set(key, ts);
-    }
-  }
-  return out;
-}
-
-/**
- * Set EXTENSION_DATE from MIN(DATE_AND_TIME) in BigQuery when still empty on EXTENSION rows.
- * @param {object} [deps]
- * @param {typeof fetchEarliestDateAndTimeByDealSheetPlacementPairs} [deps.fetchEarliestFn]
- */
-async function resolveExtensionDatesForInsertRows(rows, options = {}, deps = {}) {
+function applyExtensionStartDatesForInsertRows(rows) {
   if (!rows || rows.length === 0) return rows;
-
-  const fetchEarliestFn = deps.fetchEarliestFn ?? fetchEarliestDateAndTimeByDealSheetPlacementPairs;
-  const needsResolution = rows.filter(
-    (row) =>
-      normalizeDealTypeKey(row?.DEAL_TYPE) === "EXTENSION"
-      && isEmptyDateFieldValue(row?.EXTENSION_DATE)
-  );
-  if (needsResolution.length === 0) {
-    return rows.map((row) => applyExtensionStartDateForRow(row));
-  }
-
-  const earliestByKey = await fetchEarliestFn(needsResolution, options);
-  let resolvedCount = 0;
-  const out = rows.map((row) => {
-    let next = applyExtensionStartDateForRow(row);
-    if (
-      normalizeDealTypeKey(next?.DEAL_TYPE) !== "EXTENSION"
-      || !isEmptyDateFieldValue(next?.EXTENSION_DATE)
-    ) {
-      return next;
-    }
-    const key = buildDealSheetPlacementCompositeKey(next?.DEAL_SHEET_ID, next?.PLACEMENT_ID);
-    const earliest = key ? earliestByKey.get(key) : undefined;
-    if (earliest == null || String(earliest).trim() === "") return next;
-    resolvedCount++;
-    return {
-      ...next,
-      EXTENSION_DATE: normalizeTimestampForStreamingInsert(earliest),
-    };
-  });
-
-  if (resolvedCount > 0) {
-    logLine(
-      `[enriched sync] [BigQuery insertAll] EXTENSION_DATE from MIN(DATE_AND_TIME): resolved=${resolvedCount}`
-    );
-  }
-  return out;
+  return rows.map((row) => applyExtensionStartDateForRow(row));
 }
 
 /**
@@ -1107,33 +1069,13 @@ function formatDateInTimeZone(dateTime, timeZone) {
   }).format(new Date(dateTime));
 }
 
-function normalizeTimestampForStreamingInsert(value) {
-  if (value == null) return null;
-  if (value instanceof Date) return value.toISOString();
-  const trimmed = String(value).trim();
-  if (trimmed === "") return null;
-  const parsedMs = Date.parse(trimmed);
-  if (!Number.isNaN(parsedMs)) return new Date(parsedMs).toISOString();
-  return trimmed;
-}
-
 /**
- * Stamp EXTENSION_DATE on first insert only (when row field is empty).
+ * Reserved for insert-time date stamps. EXTENSION_DATE is set during enrich from submittal created_date.
  * NEW_HIRE_DATE is sourced from job-submittal-notes during enrich (not stamped here).
  * @returns {Record<string, string>} fields to merge into insert json (may be empty)
  */
-function computeDealSheetFirstInsertDateStamps(row, dateTime) {
-  const out = {};
-  if (!row || typeof row !== "object") return out;
-  if (dateTime == null || String(dateTime).trim() === "") return out;
-
-  const dealType = normalizeDealTypeKey(row?.DEAL_TYPE);
-
-  if (dealType === "EXTENSION" && isEmptyDateFieldValue(row.EXTENSION_DATE)) {
-    out.EXTENSION_DATE = normalizeTimestampForStreamingInsert(dateTime);
-  }
-
-  return out;
+function computeDealSheetFirstInsertDateStamps() {
+  return {};
 }
 
 /**
@@ -1435,7 +1377,8 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
         changedIncluded++;
         const carryForward = applyManualColumnsCarryForward(row, existing);
         manualColumnsCarriedTotal += carryForward.carriedCount;
-        const tentativeAdjusted = applyTentativeDateFreeze(carryForward.row, existing);
+        const previousRecruiterAdjusted = applyPreviousRecruiterOnRecruiterChange(carryForward.row, existing);
+        const tentativeAdjusted = applyTentativeDateFreeze(previousRecruiterAdjusted.row, existing);
         if (tentativeAdjusted.frozen) tentativeFrozenCount++;
         const newHireAdjusted = applyNewHireDateFreeze(tentativeAdjusted.row, existing);
         if (newHireAdjusted.frozen) newHireFrozenCount++;
@@ -1460,6 +1403,16 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
       + ` extensionFrozenCount=${extensionFrozenCount}`
     );
   }
+
+  rowsToInsert = await applyExtensionInheritForInsertRows(
+    rowsToInsert,
+    resolveBqDatasetTable(options)
+  );
+
+  rowsToInsert = await applyDealRecruiterHierarchyForInsertRows(
+    rowsToInsert,
+    resolveBqDatasetTable(options)
+  );
 
   if (!rowsToInsert || rowsToInsert.length === 0) {
     logLine(`[enriched sync] [BigQuery insertAll] SKIP: all rows filtered by dedupe rules`);
@@ -1513,10 +1466,9 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     tableId: options.tableId,
   });
 
-  rowsToInsert = await resolveExtensionDatesForInsertRows(rowsToInsert, {
-    datasetId: options.datasetId,
-    tableId: options.tableId,
-  });
+  rowsToInsert = applyExtensionStartDatesForInsertRows(rowsToInsert);
+
+  rowsToInsert = await applyOnsiteAmCsmHierarchyForRows(rowsToInsert, resolveBqDatasetTable(options));
 
   const result = await insertAll(rowsToInsert, {
     insertIdBase,
@@ -2132,15 +2084,99 @@ function formatDateOnlyForSql(value) {
  * @param {string} [tableId] When set, single-table SQL instead of union
  * @returns {string}
  */
-function buildActiveDealSheetsUnionSql(datasetId, tableId) {
+const ACTIVE_DEAL_SHEET_UNION_BASE_COLUMNS = [
+  "DEAL_SHEET_ID",
+  "PLACEMENT_ID",
+  "CONTRACT_ID",
+  "START_DATE",
+  "ORIGINAL_START_DATE",
+  "EDIT_DATE",
+  "CANDIDATE_NEXUS_ID",
+  "CANDIDATE_EMAIL",
+  "PHONE_NUMBER",
+  "NEXUS_INTERNAL_JOB_ID",
+  "CLIENT_ID",
+  "DEAL_TYPE",
+];
+
+/**
+ * UNION ALL over active domain deal-sheet tables, projecting a fixed base column set. Callers that
+ * need additional columns (e.g. the EXTENSION parent-deal inherit query, which reads NEW_HIRE_DATE
+ * and the hierarchy columns) pass them via `extraColumns`; they are de-duped against the base set.
+ * Every column listed must exist in all unioned tables or BigQuery rejects the query.
+ */
+function buildActiveDealSheetsUnionSql(datasetId, tableId, extraColumns = []) {
   const tableIds =
     typeof tableId === "string" && tableId.trim() !== ""
       ? [tableId.trim()]
       : ACTIVE_DEAL_SHEET_TABLE_IDS;
+  const seen = new Set(ACTIVE_DEAL_SHEET_UNION_BASE_COLUMNS);
+  const columns = [...ACTIVE_DEAL_SHEET_UNION_BASE_COLUMNS];
+  for (const col of Array.isArray(extraColumns) ? extraColumns : []) {
+    if (col == null || String(col).trim() === "" || seen.has(col)) continue;
+    seen.add(col);
+    columns.push(col);
+  }
+  const columnList = columns.join(", ");
   return tableIds.map(
     (tid) =>
-      `SELECT DEAL_SHEET_ID, PLACEMENT_ID, CONTRACT_ID, START_DATE, ORIGINAL_START_DATE, EDIT_DATE, CANDIDATE_NEXUS_ID, CANDIDATE_EMAIL, PHONE_NUMBER, NEXUS_INTERNAL_JOB_ID, CLIENT_ID, DEAL_TYPE FROM \`${config.projectId}.${datasetId}.${tid}\``
+      `SELECT ${columnList} FROM \`${config.projectId}.${datasetId}.${tid}\``
   ).join(" UNION ALL ");
+}
+
+/**
+ * Explicit column set for the recruiter-change / ownership-change latest-vs-previous scans. These
+ * scans CANNOT use `SELECT *` in their UNION ALL: the Canada active table drops several columns
+ * (W2_PAY_RATE_NEW, REGULAR_HOURS_*, etc.), so `SELECT *` across domains has mismatched column
+ * counts and BigQuery rejects the union. This list contains only columns that exist in ALL active
+ * tables and that buildInorganicHierarchyLogCandidate / buildOwnershipChangeLogRows actually read.
+ */
+const ACTIVE_CHANGE_SCAN_COLUMNS = [
+  "DEAL_SHEET_ID",
+  "PLACEMENT_ID",
+  "DATE_AND_TIME",
+  "DEAL_TYPE",
+  "PLACEMENT_STATUS",
+  "CANDIDATE_NAME",
+  "CANDIDATE_EMAIL",
+  "CANDIDATE_NEXUS_ID",
+  "CONTRACT_ID",
+  "START_DATE",
+  "TENTATIVE_DATE",
+  "NEW_HIRE_DATE",
+  "EXTENSION_DATE",
+  "ASSIGNMENT_RECRUITER",
+  "ASSIGNMENT_RECRUITER_EMAIL",
+  "RECRUITER_EMP_NO",
+  "ONSITE_AM",
+  "ONSITE_AM_EMAIL",
+  "LEVEL_2_CSM",
+  "LEVEL_3_CSM",
+  "LEVEL_4_CSM",
+  "ATL", "ATL_EMP_NO",
+  "SECONDARY_RECRUITER", "SECONDARY_RECRUITER_EMP_NO",
+  "TEAM_LEAD", "TEAM_LEAD_EMP_NO",
+  "RM", "RM_EMP_NO",
+  "SECONDARY_AM", "SECONDARY_AM_EMP_NO",
+  "ASSOCIATE_AM", "ASSOCIATE_AM_EMP_NO",
+  "ACCOUNT_MANAGER", "ACCOUNT_MANAGER_EMP_NO",
+  "DELIVERY_DIRECTOR", "DELIVERY_DIRECTOR_EMP_NO",
+  "GRP_DIR_ASSOC_GRP_DIR", "GRP_DIR_ASSOC_GRP_DIR_EMP_NO",
+  "VP_SRVP", "VP_SRVP_EMP_NO",
+];
+Object.freeze(ACTIVE_CHANGE_SCAN_COLUMNS);
+
+/**
+ * Per-table SELECTs (explicit columns) for the change-detection scans, UNION ALL'd. Each row is
+ * tagged with `_src` (source table id). Safe across domains with differing full schemas.
+ */
+function buildActiveChangeScanUnionParts(datasetId) {
+  const columnList = ACTIVE_CHANGE_SCAN_COLUMNS.join(", ");
+  return ACTIVE_DEAL_SHEET_TABLE_IDS.map((tableId) => {
+    const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
+    const src = escapeSqlString(tableId);
+    return `SELECT ${columnList}, '${src}' AS _src FROM ${fqn} WHERE DEAL_SHEET_ID IS NOT NULL AND PLACEMENT_ID IS NOT NULL`;
+  });
 }
 
 /**
@@ -2209,9 +2245,87 @@ async function fetchContractIdsByDealSheetIds(dealSheetIds, options = {}) {
 }
 
 /**
+ * Resolve employee_id (emp no) + external_id by recruiter/hierarchy email from the shared
+ * employee directory. external_id is the join key into directory_employee_hierarchy.
+ * @param {string[]} emails
+ * @returns {Promise<Map<string, {employeeId: string, externalId: string}>>} lowercased/trimmed
+ *   email -> directory identity
+ */
+async function fetchEmployeeDirectoryByEmails(emails, options = {}) {
+  const out = new Map();
+  if (!emails || emails.length === 0) return out;
+
+  // Fixed MISC.directory_employees. Deliberately does NOT read options.datasetId/tableId — callers
+  // routinely pass a deal-sheet-scoped options object, and honoring it here would query the wrong
+  // table (this class of bug recurred repeatedly). Tests override via the directoryFetchFn dep.
+  const datasetId = config.directoryEmployees.datasetId;
+  const tableId = config.directoryEmployees.tableId;
+
+  const uniq = [];
+  const seen = new Set();
+  for (const email of emails) {
+    if (email == null) continue;
+    const norm = String(email).trim().toLowerCase();
+    if (!norm || seen.has(norm)) continue;
+    seen.add(norm);
+    uniq.push(norm);
+  }
+  if (uniq.length === 0) return out;
+
+  const chunkSize = 500;
+  for (let i = 0; i < uniq.length; i += chunkSize) {
+    const chunk = uniq.slice(i, i + chunkSize);
+    const inList = chunk.map((v) => `'${escapeSqlString(v)}'`).join(", ");
+    const sql = `
+      WITH ranked AS (
+        SELECT
+          LOWER(TRIM(email)) AS email_norm,
+          employee_id,
+          external_id,
+          name_full,
+          ROW_NUMBER() OVER (
+            PARTITION BY LOWER(TRIM(email))
+            ORDER BY (status = 'ACTIVE') DESC, updated_at DESC
+          ) AS rn
+        FROM \`${config.projectId}.${datasetId}.${tableId}\`
+        WHERE LOWER(TRIM(email)) IN (${inList})
+          AND employee_id IS NOT NULL
+      )
+      SELECT email_norm, employee_id, external_id, name_full
+      FROM ranked
+      WHERE rn = 1
+    `;
+    const rows = await queryObjects(sql, chunk.length);
+    for (const row of rows) {
+      const emailNorm = row?.email_norm;
+      const empId = row?.employee_id;
+      if (emailNorm == null || String(emailNorm).trim() === "") continue;
+      if (empId == null || String(empId).trim() === "") continue;
+      const externalId = row?.external_id;
+      const nameFull = row?.name_full;
+      out.set(String(emailNorm).trim(), {
+        employeeId: String(empId).trim(),
+        externalId: externalId == null || String(externalId).trim() === ""
+          ? null
+          : String(externalId).trim(),
+        nameFull: nameFull == null || String(nameFull).trim() === ""
+          ? null
+          : String(nameFull).trim(),
+      });
+    }
+  }
+
+  return out;
+}
+
+/**
  * For EXTENSION rows, find original DEAL CONTRACT_ID across active tables.
  * @param {Array<{placementId: number, candidateNexusId: number, candidateEmail?: string|null, phoneNumber?: string|null, clientId: number, startDate?: *}>} extensionRows
  * @param {object} [options]
+ * @param {boolean} [options.includeExtensionSource] - when true, also treat prior EXTENSION rows
+ *   (not just DEAL rows) with a non-null CONTRACT_ID as a valid source. Used so a runrate-only
+ *   placement chain (no DEAL row ever inserted) still reuses the same CONTRACT_ID across repeat
+ *   extensions instead of minting a new one each time (see applyExtensionRunrateBackfillForInsertRows).
  * @returns {Promise<Map<string, string|null>>} placementId string -> contract id or null
  */
 async function fetchContractIdsForExtensions(extensionRows, options = {}) {
@@ -2278,7 +2392,9 @@ async function fetchContractIdsForExtensions(extensionRows, options = {}) {
           START_DATE,
           EDIT_DATE
         FROM (${unionSql})
-        WHERE UPPER(TRIM(DEAL_TYPE)) = 'DEAL'
+        WHERE ${options.includeExtensionSource === true
+          ? "UPPER(TRIM(DEAL_TYPE)) IN ('DEAL', 'EXTENSION')"
+          : "UPPER(TRIM(DEAL_TYPE)) = 'DEAL'"}
           AND CONTRACT_ID IS NOT NULL
       ),
       joined AS (
@@ -2319,6 +2435,1979 @@ async function fetchContractIdsForExtensions(extensionRows, options = {}) {
   }
 
   return out;
+}
+
+/**
+ * Non-recruiter hierarchy columns backfilled from all_CH_data_runrate for brand-new EXTENSION
+ * rows. Recruiter identity (ASSIGNMENT_RECRUITER*, SECONDARY_RECRUITER, RECRUITER_ID/EMP_NO,
+ * PREVIOUS_RECRUITER_*) is intentionally excluded per business rule — the current sync's own
+ * recruiter assignment must win, not the historical one. CLIENT_RECRUITER, PRIMARY_SALES_PERSON,
+ * SECONDARY_SALES_PERSON, and RECRUITER_CLUSTER are manual BigQuery-edited columns (see
+ * MANUAL_COLUMNS) and are excluded for the same reason — a fuzzy runrate match must never
+ * auto-fill a manually maintained field.
+ * This list itself has no *_EMP_NO entries because all_CH_data_runrate (and the canada/locums
+ * equivalents) never stored emp-no data, only names — there is nothing to SELECT from runrate
+ * for those columns. Their EMP_NO companions are instead filled by a separate lookup, in
+ * fillHierarchyEmpNosFromDirectoryByName: once a name is matched from runrate (e.g. TEAM_LEAD =
+ * "Ajay Kumar"), that name + the column's known designations (recruiterHierarchyDesignations.js)
+ * are matched against cynetdatabase.MISC.directory_employees (name_full + title) to resolve the
+ * employee_id — see fetchExtensionRunrateBackfillByPlacementId and the runrateFields list in
+ * applyExtensionInheritForInsertRows, which merges both the name and its `${col}_EMP_NO`.
+ */
+const EXTENSION_RUNRATE_HIERARCHY_COLUMNS = [
+  "TEAM_LEAD",
+  "ATL",
+  "RM",
+  "ACCOUNT_MANAGER",
+  "SECONDARY_AM",
+  "ASSOCIATE_AM",
+  "GRP_DIR_ASSOC_GRP_DIR",
+  "VP_SRVP",
+];
+Object.freeze(EXTENSION_RUNRATE_HIERARCHY_COLUMNS);
+
+/** Placement statuses eligible as runrate backfill sources for EXTENSION insert rows. */
+const EXTENSION_RUNRATE_ELIGIBLE_PLACEMENT_STATUSES = Object.freeze([
+  "STARTED",
+  "BOOKED",
+  "ENDED",
+  "ENDED<30",
+]);
+const EXTENSION_RUNRATE_ELIGIBLE_PLACEMENT_STATUS_SET = new Set(
+  EXTENSION_RUNRATE_ELIGIBLE_PLACEMENT_STATUSES
+);
+
+function isExtensionRunrateEligiblePlacementStatus(status) {
+  if (status == null) return false;
+  const key = String(status).trim().toUpperCase().replace(/\s+/g, " ");
+  return key !== "" && EXTENSION_RUNRATE_ELIGIBLE_PLACEMENT_STATUS_SET.has(key);
+}
+
+function buildRunrateEligiblePlacementStatusSqlPredicate(columnRef = "PLACEMENT_STATUS") {
+  const list = EXTENSION_RUNRATE_ELIGIBLE_PLACEMENT_STATUSES.map((s) => `'${s}'`).join(", ");
+  return `UPPER(TRIM(CAST(${columnRef} AS STRING))) IN (${list})`;
+}
+
+/**
+ * Snapshot fields inherited from the earliest matching parent DEAL row already in the
+ * destination deal sheet table. ASSIGNMENT_RECRUITER* / RECRUITER_ID / PREVIOUS_RECRUITER_*
+ * are excluded — the current Nexus assignment wins. CLIENT_RECRUITER, PRIMARY_SALES_PERSON,
+ * SECONDARY_SALES_PERSON, and RECRUITER_CLUSTER are manual BigQuery-edited columns (see
+ * MANUAL_COLUMNS) and are excluded for the same reason — no automated path should overwrite them.
+ */
+const EXTENSION_PARENT_DEAL_INHERIT_COLUMNS = [
+  "NEW_HIRE_DATE",
+  "TEAM_LEAD",
+  "TEAM_LEAD_EMP_NO",
+  "ATL",
+  "ATL_EMP_NO",
+  "RM",
+  "RM_EMP_NO",
+  "ACCOUNT_MANAGER",
+  "ACCOUNT_MANAGER_EMP_NO",
+  "SECONDARY_AM",
+  "SECONDARY_AM_EMP_NO",
+  "ASSOCIATE_AM",
+  "ASSOCIATE_AM_EMP_NO",
+  "GRP_DIR_ASSOC_GRP_DIR",
+  "GRP_DIR_ASSOC_GRP_DIR_EMP_NO",
+  "VP_SRVP",
+  "VP_SRVP_EMP_NO",
+  "SECONDARY_RECRUITER",
+  "SECONDARY_RECRUITER_EMP_NO",
+  "DELIVERY_DIRECTOR",
+  "DELIVERY_DIRECTOR_EMP_NO",
+  "DELIVERY_POC",
+  "ACC_DIR_OR_VERT_HEAD",
+  "CREDENTIALING_SPECIALIST",
+  "CREDENTIALING_LEAD",
+];
+Object.freeze(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS);
+
+function runrateAliasForColumn(col) {
+  return `runrate_${col.toLowerCase()}`;
+}
+
+function proposedAliasForColumn(col) {
+  return `proposed_${col.toLowerCase()}`;
+}
+
+function parentDealAliasForColumn(col) {
+  return `parent_${col.toLowerCase()}`;
+}
+
+/**
+ * True for brand-new EXTENSION rows eligible for insert-time backfill (parent DEAL inherit
+ * and/or run-rate fallback). CONTRACT_ID may already be resolved from a parent DEAL.
+ */
+function rowNeedsExtensionInsertBackfill(row) {
+  if (!row || typeof row !== "object") return false;
+  if (String(row.DEAL_TYPE || "").trim().toUpperCase() !== "EXTENSION") return false;
+  if (row.CANDIDATE_NEXUS_ID == null || String(row.CANDIDATE_NEXUS_ID).trim() === "") return false;
+  if (row.PLACEMENT_ID == null || String(row.PLACEMENT_ID).trim() === "") return false;
+  return true;
+}
+
+/** @deprecated Use rowNeedsExtensionInsertBackfill — kept for existing tests/callers. */
+function rowNeedsExtensionRunrateBackfill(row) {
+  return rowNeedsExtensionInsertBackfill(row);
+}
+
+/**
+ * @param {object[]} rows
+ * @returns {string[]}
+ */
+function buildExtensionContractMatchStructLiterals(rows) {
+  const structLiterals = [];
+
+  for (const row of rows) {
+    const pid = Number(row.PLACEMENT_ID);
+    const cand = Number(row.CANDIDATE_NEXUS_ID);
+    const client = Number(row.CLIENT_ID);
+    if (!Number.isFinite(pid) || !Number.isFinite(cand) || !Number.isFinite(client)) continue;
+
+    const email = escapeSqlString(
+      row.CANDIDATE_EMAIL == null ? "" : String(row.CANDIDATE_EMAIL).trim().toLowerCase()
+    );
+    const phone = escapeSqlString(
+      row.PHONE_NUMBER == null ? "" : String(row.PHONE_NUMBER).trim()
+    );
+
+    structLiterals.push(
+      `STRUCT(${Math.trunc(pid)} AS placement_id, ${Math.trunc(cand)} AS candidate_nexus_id, `
+      + `'${email}' AS candidate_email, '${phone}' AS phone_number, ${Math.trunc(client)} AS client_id)`
+    );
+  }
+
+  return structLiterals;
+}
+
+function mergeExtensionBackfillFields(row, backfill, fieldsToFill) {
+  if (!backfill) return { row, changed: false };
+
+  let next = row;
+  let changed = false;
+  for (const field of fieldsToFill) {
+    if (!isEmptyDateFieldValue(next[field])) continue;
+    const value = backfill[field];
+    if (value == null || (typeof value === "string" && value.trim() === "")) continue;
+    if (!changed) {
+      next = { ...row };
+      changed = true;
+    }
+    next[field] = value;
+  }
+  return { row: next, changed };
+}
+
+function extensionBackfillEntryHasValues(entry, fieldsToFill) {
+  if (!entry) return false;
+  return fieldsToFill.some((field) => {
+    const value = entry[field];
+    return value != null && !(typeof value === "string" && value.trim() === "");
+  });
+}
+
+/** Unwrap BigQuery {value} wrappers/Date instances and blank-trim strings to null. */
+function normalizeExtensionRunrateBackfillValue(value) {
+  const sanitized = sanitizeValueForStreamingInsert(value);
+  if (sanitized == null) return null;
+  if (typeof sanitized === "string") {
+    const trimmed = sanitized.trim();
+    return trimmed === "" ? null : trimmed;
+  }
+  return sanitized;
+}
+
+/**
+ * Earliest matching parent DEAL row in the destination active deal sheet table (same 4-field
+ * match key as fetchContractIdsForExtensions). ORIGINAL_START_DATE uses
+ * COALESCE(parent.ORIGINAL_START_DATE, parent.START_DATE).
+ * @param {object[]} rows
+ * @param {object} [options]
+ * @param {string} [options.tableId]
+ * @returns {Promise<Map<string, object>>}
+ */
+async function fetchExtensionParentDealInheritByPlacementId(rows, options = {}) {
+  const out = new Map();
+  if (!rows || rows.length === 0) return out;
+
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+  const tableId =
+    typeof options.tableId === "string" && options.tableId.trim() !== ""
+      ? options.tableId.trim()
+      : "";
+  // The inner union must project the hierarchy columns this query reads (NEW_HIRE_DATE + the
+  // EXTENSION_PARENT_DEAL_INHERIT_COLUMNS); the base union column set does not include them.
+  const unionSql = buildActiveDealSheetsUnionSql(
+    datasetId,
+    tableId || undefined,
+    EXTENSION_PARENT_DEAL_INHERIT_COLUMNS
+  );
+
+  const parentDealSelectColumns = EXTENSION_PARENT_DEAL_INHERIT_COLUMNS
+    .map((col) => `          ${col}`)
+    .join(",\n");
+  const parentDealJoinedSelect = EXTENSION_PARENT_DEAL_INHERIT_COLUMNS
+    .map((col) => `          d.${col}`)
+    .join(",\n");
+  const parentDealOuterSelect = EXTENSION_PARENT_DEAL_INHERIT_COLUMNS
+    .map((col) => `        ${col}`)
+    .join(",\n");
+
+  const chunkSize = 100;
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    const chunk = rows.slice(i, i + chunkSize);
+    const structLiterals = buildExtensionContractMatchStructLiterals(chunk);
+    if (structLiterals.length === 0) continue;
+
+    const sql = `
+      WITH extensions AS (
+        SELECT * FROM UNNEST([${structLiterals.join(", ")}])
+      ),
+      deals AS (
+        SELECT
+          CANDIDATE_NEXUS_ID,
+          LOWER(IFNULL(CANDIDATE_EMAIL, '')) AS candidate_email_norm,
+          IFNULL(PHONE_NUMBER, '') AS phone_norm,
+          CLIENT_ID,
+          START_DATE,
+          PLACEMENT_ID,
+          COALESCE(ORIGINAL_START_DATE, START_DATE) AS proposed_original_start_date,
+${parentDealSelectColumns}
+        FROM (${unionSql})
+        WHERE UPPER(TRIM(DEAL_TYPE)) = 'DEAL'
+      ),
+      joined AS (
+        SELECT
+          ext.placement_id,
+          d.proposed_original_start_date,
+${parentDealJoinedSelect},
+          ROW_NUMBER() OVER (
+            PARTITION BY ext.placement_id
+            ORDER BY d.START_DATE ASC NULLS LAST, d.PLACEMENT_ID ASC NULLS LAST
+          ) AS rn
+        FROM extensions ext
+        INNER JOIN deals d
+          ON d.CANDIDATE_NEXUS_ID = ext.candidate_nexus_id
+         AND d.candidate_email_norm = ext.candidate_email
+         AND d.phone_norm = ext.phone_number
+         AND d.CLIENT_ID = ext.client_id
+      )
+      SELECT
+        CAST(placement_id AS STRING) AS placement_id,
+        proposed_original_start_date,
+${parentDealOuterSelect}
+      FROM joined
+      WHERE rn = 1
+    `;
+
+    const bqRows = await queryObjects(sql, structLiterals.length);
+    const parentFields = ["ORIGINAL_START_DATE", ...EXTENSION_PARENT_DEAL_INHERIT_COLUMNS];
+
+    for (const bqRow of bqRows) {
+      const pid = bqRow?.placement_id;
+      if (pid == null || String(pid).trim() === "") continue;
+
+      const entry = {
+        ORIGINAL_START_DATE: normalizeExtensionRunrateBackfillValue(bqRow?.proposed_original_start_date),
+      };
+      for (const col of EXTENSION_PARENT_DEAL_INHERIT_COLUMNS) {
+        entry[col] = normalizeExtensionRunrateBackfillValue(bqRow?.[col]);
+      }
+      if (!extensionBackfillEntryHasValues(entry, parentFields)) continue;
+
+      out.set(String(pid).trim(), entry);
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Query the domain-appropriate run-rate table (see resolveRunrateTableIdForDealSheetTable —
+ * all_CH_data_runrate for cynet_health, a separate table per domain for canada/locums) for a
+ * batch of brand-new EXTENSION rows, porting the tiered match (exact nexus+tentative ->
+ * nexus+parent+facility -> nexus+parent -> email+vms_job_id -> latest nexus before extension)
+ * used to find "this candidate's prior stint at this same client". Does NOT resolve CONTRACT_ID —
+ * the run-rate table's own CONTRACT_ID column is always null; see
+ * applyExtensionRunrateBackfillForInsertRows for how CONTRACT_ID is resolved instead.
+ * @param {object[]} rows - enriched rows eligible per rowNeedsExtensionInsertBackfill
+ * @param {object} [options]
+ * @param {string} [options.tableId] - destination deal sheet table, used to pick the domain's run-rate table
+ * @returns {Promise<Map<string, object>>} PLACEMENT_ID string -> { ORIGINAL_START_DATE, NEW_HIRE_DATE, ...hierarchy }
+ */
+async function fetchExtensionRunrateBackfillByPlacementId(rows, options = {}) {
+  const out = new Map();
+  if (!rows || rows.length === 0) return out;
+
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+  const runrateTableId =
+    typeof options.runrateTableId === "string" && options.runrateTableId.trim() !== ""
+      ? options.runrateTableId.trim()
+      : resolveRunrateTableIdForDealSheetTable(options.tableId);
+  const runrateFqn = `\`${config.projectId}.${datasetId}.${runrateTableId}\``;
+
+  const runrateSelectHierarchy = EXTENSION_RUNRATE_HIERARCHY_COLUMNS
+    .map((col) => `      ${col} AS ${runrateAliasForColumn(col)}`)
+    .join(",\n");
+  const bestMatchHierarchySelect = EXTENSION_RUNRATE_HIERARCHY_COLUMNS
+    .map((col) => `        b.${runrateAliasForColumn(col)} AS ${proposedAliasForColumn(col)}`)
+    .join(",\n");
+
+  const chunkSize = 100;
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    const chunk = rows.slice(i, i + chunkSize);
+    const structLiterals = [];
+
+    for (const row of chunk) {
+      const pid = Number(row.PLACEMENT_ID);
+      const cand = Number(row.CANDIDATE_NEXUS_ID);
+      if (!Number.isFinite(pid) || !Number.isFinite(cand)) continue;
+
+      const email = escapeSqlString(
+        row.CANDIDATE_EMAIL == null ? "" : String(row.CANDIDATE_EMAIL).trim().toLowerCase()
+      );
+      const parentClient = escapeSqlString(
+        row.PARENT_CLIENT_NAME == null ? "" : String(row.PARENT_CLIENT_NAME).trim()
+      );
+      const facility = escapeSqlString(
+        row.END_CLIENT_DEPT_FACILITY == null ? "" : String(row.END_CLIENT_DEPT_FACILITY).trim()
+      );
+      const vmsJobId = escapeSqlString(
+        row.VMS_JOB_ID == null ? "" : String(row.VMS_JOB_ID).trim()
+      );
+      const startDateSql = (() => {
+        const d = formatDateOnlyForSql(row.START_DATE);
+        return d == null ? "CAST(NULL AS DATE)" : `DATE '${escapeSqlString(d)}'`;
+      })();
+      const tentativeDateSql = (() => {
+        const d = formatDateOnlyForSql(row.TENTATIVE_DATE);
+        return d == null ? "CAST(NULL AS DATE)" : `DATE '${escapeSqlString(d)}'`;
+      })();
+
+      structLiterals.push(
+        `STRUCT(${Math.trunc(pid)} AS placement_id, ${Math.trunc(cand)} AS candidate_nexus_id, `
+        + `'${email}' AS candidate_email, '${parentClient}' AS deal_parent_client, `
+        + `'${facility}' AS deal_facility, ${startDateSql} AS extension_start_date, `
+        + `${tentativeDateSql} AS extension_tentative_date, '${vmsJobId}' AS deal_vms_job_id)`
+      );
+    }
+
+    if (structLiterals.length === 0) continue;
+
+    const placementStatusPredicate = buildRunrateEligiblePlacementStatusSqlPredicate();
+
+    // Ported from the analyst-authored matching query: same tiered match priority, same
+    // client_first_assignment/sku_first_assignment fallback chain for ORIGINAL_START_DATE
+    // and NEW_HIRE_DATE, and the same fixed runrate.START_DATE < 2026-05-01 cutoff (this
+    // marks the boundary of the historical runrate snapshot; do not change to CURRENT_DATE()).
+    // Only delta from the original one-off analysis query: `extensions` is this batch's
+    // UNNEST(...) literal instead of a table scan (CONTRACT_ID IS NULL / DEAL_TYPE = EXTENSION
+    // already enforced in JS).
+    const sql = `
+      WITH extensions AS (
+        SELECT * FROM UNNEST([${structLiterals.join(", ")}])
+      ),
+      runrate AS (
+        SELECT
+          ID AS runrate_id,
+          CANDIDATE_NEXUS_ID AS nexus_id,
+          LOWER(TRIM(CANDIDATE_EMAIL)) AS email,
+          TRIM(CAST(VMS_JOB_ID AS STRING)) AS vms_job_id,
+          PARENT_CLIENT_NAME AS runrate_parent_client,
+          END_CLIENT_DEPT_FACILITY AS runrate_facility,
+          START_DATE AS runrate_start_date,
+          TENTATIVE_DATE AS runrate_tentative_date,
+          SKU_NUMBER AS runrate_sku,
+          NEW_HIRE_DATE AS runrate_new_hire_date,
+${runrateSelectHierarchy}
+        FROM ${runrateFqn}
+        WHERE START_DATE < DATE '2026-05-01'
+          AND ${placementStatusPredicate}
+      ),
+      client_first_assignment AS (
+        SELECT
+          CANDIDATE_NEXUS_ID,
+          LOWER(TRIM(PARENT_CLIENT_NAME)) AS parent_client_key,
+          START_DATE AS client_original_start_date,
+          NEW_HIRE_DATE AS client_new_hire_date,
+          ROW_NUMBER() OVER (
+            PARTITION BY CANDIDATE_NEXUS_ID, LOWER(TRIM(PARENT_CLIENT_NAME))
+            ORDER BY START_DATE ASC, PLACEMENT_ID ASC, ID
+          ) AS rn
+        FROM ${runrateFqn}
+        WHERE CANDIDATE_NEXUS_ID IS NOT NULL
+          AND TRIM(IFNULL(PARENT_CLIENT_NAME, '')) != ''
+          AND START_DATE IS NOT NULL
+          AND ${placementStatusPredicate}
+      ),
+      sku_first_assignment AS (
+        SELECT
+          TRIM(SKU_NUMBER) AS sku_key,
+          MIN(START_DATE) AS sku_original_start_date,
+          ARRAY_AGG(NEW_HIRE_DATE IGNORE NULLS ORDER BY START_DATE ASC LIMIT 1)[SAFE_OFFSET(0)] AS sku_new_hire_date
+        FROM ${runrateFqn}
+        WHERE SKU_NUMBER IS NOT NULL AND TRIM(SKU_NUMBER) != '' AND START_DATE IS NOT NULL
+          AND ${placementStatusPredicate}
+        GROUP BY sku_key
+      ),
+      joined AS (
+        SELECT
+          e.placement_id,
+          r.*,
+          CASE
+            WHEN e.candidate_nexus_id = r.nexus_id
+             AND e.extension_tentative_date = r.runrate_tentative_date
+              THEN 'EXACT_NEXUS_TENTATIVE'
+            WHEN e.candidate_nexus_id = r.nexus_id
+             AND LOWER(IFNULL(e.deal_parent_client, '')) = LOWER(IFNULL(r.runrate_parent_client, ''))
+             AND (
+               LOWER(IFNULL(e.deal_facility, '')) = LOWER(IFNULL(r.runrate_facility, ''))
+               OR STRPOS(LOWER(IFNULL(r.runrate_facility, '')), LOWER(IFNULL(e.deal_facility, ''))) > 0
+               OR STRPOS(LOWER(IFNULL(e.deal_facility, '')), LOWER(IFNULL(r.runrate_facility, ''))) > 0
+             )
+             AND (e.extension_start_date IS NULL OR r.runrate_start_date < e.extension_start_date)
+              THEN 'NEXUS_PARENT_FACILITY'
+            WHEN e.candidate_nexus_id = r.nexus_id
+             AND LOWER(IFNULL(e.deal_parent_client, '')) = LOWER(IFNULL(r.runrate_parent_client, ''))
+             AND (e.extension_start_date IS NULL OR r.runrate_start_date < e.extension_start_date)
+              THEN 'NEXUS_PARENT_CLIENT'
+            WHEN NULLIF(e.candidate_email, '') IS NOT NULL
+             AND e.candidate_email = r.email
+             AND NULLIF(e.deal_vms_job_id, '') IS NOT NULL
+             AND e.deal_vms_job_id = NULLIF(r.vms_job_id, '')
+              THEN 'EMAIL_VMS_JOB_ID'
+            WHEN e.candidate_nexus_id = r.nexus_id
+             AND (e.extension_start_date IS NULL OR r.runrate_start_date < e.extension_start_date)
+              THEN 'NEXUS_LATEST_BEFORE_EXT'
+            ELSE NULL
+          END AS match_method
+        FROM extensions e
+        JOIN runrate r
+          ON e.candidate_nexus_id = r.nexus_id
+          OR (
+            NULLIF(e.candidate_email, '') IS NOT NULL
+            AND e.candidate_email = r.email
+            AND NULLIF(e.deal_vms_job_id, '') IS NOT NULL
+            AND e.deal_vms_job_id = NULLIF(r.vms_job_id, '')
+          )
+      ),
+      ranked AS (
+        SELECT
+          j.*,
+          CASE j.match_method
+            WHEN 'EXACT_NEXUS_TENTATIVE' THEN 1
+            WHEN 'NEXUS_PARENT_FACILITY' THEN 2
+            WHEN 'NEXUS_PARENT_CLIENT' THEN 3
+            WHEN 'EMAIL_VMS_JOB_ID' THEN 4
+            WHEN 'NEXUS_LATEST_BEFORE_EXT' THEN 5
+            ELSE 99
+          END AS match_priority,
+          ROW_NUMBER() OVER (
+            PARTITION BY j.placement_id
+            ORDER BY
+              CASE j.match_method
+                WHEN 'EXACT_NEXUS_TENTATIVE' THEN 1
+                WHEN 'NEXUS_PARENT_FACILITY' THEN 2
+                WHEN 'NEXUS_PARENT_CLIENT' THEN 3
+                WHEN 'EMAIL_VMS_JOB_ID' THEN 4
+                WHEN 'NEXUS_LATEST_BEFORE_EXT' THEN 5
+                ELSE 99
+              END,
+              j.runrate_start_date DESC NULLS LAST,
+              j.runrate_id
+          ) AS rn
+        FROM joined j
+        WHERE j.match_method IS NOT NULL
+      ),
+      best_match AS (
+        SELECT * FROM ranked WHERE rn = 1
+      )
+      SELECT
+        CAST(e.placement_id AS STRING) AS placement_id,
+        COALESCE(c.client_original_start_date, s.sku_original_start_date) AS proposed_original_start_date,
+        COALESCE(c.client_new_hire_date, s.sku_new_hire_date, b.runrate_new_hire_date) AS proposed_new_hire_date,
+${bestMatchHierarchySelect}
+      FROM extensions e
+      JOIN best_match b ON e.placement_id = b.placement_id
+      LEFT JOIN client_first_assignment c
+        ON e.candidate_nexus_id = c.CANDIDATE_NEXUS_ID
+       AND LOWER(TRIM(IFNULL(e.deal_parent_client, ''))) = c.parent_client_key
+       AND c.rn = 1
+      LEFT JOIN sku_first_assignment s
+        ON NULLIF(TRIM(b.runrate_sku), '') = s.sku_key
+    `;
+
+    const bqRows = await queryObjects(sql, structLiterals.length);
+    for (const bqRow of bqRows) {
+      const pid = bqRow?.placement_id;
+      if (pid == null || String(pid).trim() === "") continue;
+      const key = String(pid).trim();
+      const entry = {
+        ORIGINAL_START_DATE: normalizeExtensionRunrateBackfillValue(bqRow?.proposed_original_start_date),
+        NEW_HIRE_DATE: normalizeExtensionRunrateBackfillValue(bqRow?.proposed_new_hire_date),
+      };
+      for (const col of EXTENSION_RUNRATE_HIERARCHY_COLUMNS) {
+        entry[col] = normalizeExtensionRunrateBackfillValue(bqRow?.[proposedAliasForColumn(col)]);
+      }
+      out.set(key, entry);
+    }
+  }
+
+  await fillHierarchyEmpNosFromDirectoryByName(out, options);
+
+  return out;
+}
+
+/**
+ * Backfill *_EMP_NO for runrate-matched hierarchy names. all_CH_data_runrate (and the
+ * canada/locums equivalents) only ever stored the manager's NAME, never an emp no — so the emp
+ * no is found separately, by looking up cynetdatabase.MISC.directory_employees for a row whose
+ * name_full matches the runrate name (case/whitespace-insensitive) AND whose title is one of the
+ * known designations for that hierarchy column (see recruiterHierarchyDesignations.js). When a
+ * name+designation pair has multiple directory rows (duplicate names), prefers status='ACTIVE'
+ * then the most recently updated_at row — same tie-break already used for RECRUITER_EMP_NO.
+ * @param {Map<string, object>} entriesByPlacementId - mutated in place, adding `${col}_EMP_NO`
+ */
+async function fillHierarchyEmpNosFromDirectoryByName(entriesByPlacementId, options = {}) {
+  if (!entriesByPlacementId || entriesByPlacementId.size === 0) return;
+
+  const namesByColumn = new Map();
+  for (const entry of entriesByPlacementId.values()) {
+    for (const col of EXTENSION_RUNRATE_HIERARCHY_COLUMNS) {
+      const name = entry[col];
+      if (name == null || String(name).trim() === "") continue;
+      const norm = String(name).trim().toLowerCase();
+      if (!namesByColumn.has(col)) namesByColumn.set(col, new Set());
+      namesByColumn.get(col).add(norm);
+    }
+  }
+  if (namesByColumn.size === 0) return;
+
+  // Always the fixed directory_employees table — never `options`, which here carries the
+  // destination deal-sheet dataset/table (from fetchExtensionRunrateBackfillByPlacementId) and
+  // would make this look up name_full/title on the deal sheet ("Unrecognized name: name_full").
+  const employeesFqn = `\`${config.projectId}.${config.directoryEmployees.datasetId}.${config.directoryEmployees.tableId}\``;
+
+  const empIdByColumnAndName = new Map();
+
+  for (const [col, nameSet] of namesByColumn) {
+    const titles = HIERARCHY_DESIGNATION_SYNONYMS[col];
+    if (!titles || titles.length === 0) continue;
+    const names = [...nameSet];
+    const nameInList = names.map((n) => `'${escapeSqlString(n)}'`).join(", ");
+    const titleInList = titles.map((t) => `'${escapeSqlString(t)}'`).join(", ");
+
+    const sql = `
+      WITH ranked AS (
+        SELECT
+          LOWER(TRIM(name_full)) AS name_norm,
+          employee_id,
+          ROW_NUMBER() OVER (
+            PARTITION BY LOWER(TRIM(name_full))
+            ORDER BY (status = 'ACTIVE') DESC, updated_at DESC
+          ) AS rn
+        FROM ${employeesFqn}
+        WHERE LOWER(TRIM(name_full)) IN (${nameInList})
+          AND LOWER(TRIM(title)) IN (${titleInList})
+          AND employee_id IS NOT NULL
+      )
+      SELECT name_norm, employee_id
+      FROM ranked
+      WHERE rn = 1
+    `;
+    const bqRows = await queryObjects(sql, names.length);
+    for (const row of bqRows) {
+      const nameNorm = row?.name_norm;
+      const empId = row?.employee_id;
+      if (nameNorm == null || String(nameNorm).trim() === "") continue;
+      if (empId == null || String(empId).trim() === "") continue;
+      empIdByColumnAndName.set(`${col}::${String(nameNorm).trim()}`, String(empId).trim());
+    }
+  }
+  if (empIdByColumnAndName.size === 0) return;
+
+  for (const entry of entriesByPlacementId.values()) {
+    for (const col of EXTENSION_RUNRATE_HIERARCHY_COLUMNS) {
+      const name = entry[col];
+      if (name == null || String(name).trim() === "") continue;
+      const norm = String(name).trim().toLowerCase();
+      const empId = empIdByColumnAndName.get(`${col}::${norm}`);
+      if (empId != null) entry[`${col}_EMP_NO`] = empId;
+    }
+  }
+}
+
+/**
+ * Resolve CONTRACT_ID for EXTENSION rows that matched in the run-rate table but still have no
+ * CONTRACT_ID. The run-rate table's own CONTRACT_ID column is always null, so it can't be copied
+ * (see fetchExtensionRunrateBackfillByPlacementId) — instead this mirrors the DEAL-row contract
+ * resolution in contractIdResolver.js in two steps:
+ *   1. Reuse — look for a CONTRACT_ID already on ANY prior row (DEAL or EXTENSION) for the same
+ *      candidate+client identity in the destination table (fetchContractIdsForExtensions with
+ *      includeExtensionSource: true). Keeps repeat extensions of the same run-rate-only placement
+ *      on one CONTRACT_ID instead of minting a new one every time.
+ *   2. Allocate — for rows still unresolved, mint a fresh CONTRACT_ID from the same
+ *      Firestore-backed per-table sequence used for DEAL rows (one per unique candidate+client
+ *      identity, so multiple rows in this same insert batch for the same underlying placement
+ *      share one id).
+ * @param {object[]} rows - eligible rows that had a run-rate match
+ * @param {object} [options]
+ * @param {string} [options.tableId] - destination deal sheet table (selects the CHC/CAC/LOC sequence)
+ * @param {object} [deps]
+ * @param {typeof fetchContractIdsForExtensions} [deps.fetchContractIdsForExtensionsFn]
+ * @param {typeof allocateContractIds} [deps.allocateContractIdsFn]
+ * @param {typeof buildSequenceOptionsForTable} [deps.buildSequenceOptionsForTableFn]
+ * @returns {Promise<Map<string, string>>} PLACEMENT_ID string -> CONTRACT_ID
+ */
+async function resolveContractIdsForRunrateMatchedExtensions(rows, options = {}, deps = {}) {
+  const out = new Map();
+  if (!rows || rows.length === 0) return out;
+
+  // Lazy require: contractIdResolver.js requires bigQueryClient.js, so a top-level require here
+  // would create a circular dependency (same pattern already used for allocateContractIdsForInsertableRows).
+  const { buildContractMatchKey } = require("./contractIdResolver");
+  const fetchContractIdsForExtensionsFn = deps.fetchContractIdsForExtensionsFn ?? fetchContractIdsForExtensions;
+  const allocateContractIdsFn = deps.allocateContractIdsFn ?? allocateContractIds;
+  const buildSequenceOptionsForTableFn = deps.buildSequenceOptionsForTableFn ?? buildSequenceOptionsForTable;
+
+  const tableId =
+    typeof options.tableId === "string" && options.tableId.trim() !== ""
+      ? options.tableId.trim()
+      : "";
+
+  const lookupInput = [];
+  for (const row of rows) {
+    const pid = Number(row.PLACEMENT_ID);
+    const cand = Number(row.CANDIDATE_NEXUS_ID);
+    const client = Number(row.CLIENT_ID);
+    if (!Number.isFinite(pid) || !Number.isFinite(cand) || !Number.isFinite(client)) continue;
+    lookupInput.push({
+      placementId: pid,
+      candidateNexusId: cand,
+      candidateEmail: row.CANDIDATE_EMAIL,
+      phoneNumber: row.PHONE_NUMBER,
+      clientId: client,
+      startDate: row.START_DATE,
+    });
+  }
+
+  let reusedCount = 0;
+  if (lookupInput.length > 0) {
+    const reused = await fetchContractIdsForExtensionsFn(lookupInput, {
+      datasetId: options.datasetId,
+      tableId: tableId || undefined,
+      includeExtensionSource: true,
+    });
+    for (const [pid, cid] of reused) {
+      const normalized = normalizeContractIdOrNull(cid);
+      if (normalized != null) {
+        out.set(String(pid), normalized);
+        reusedCount++;
+      }
+    }
+  }
+
+  const stillUnresolved = rows.filter((row) => !out.has(String(row.PLACEMENT_ID).trim()));
+  if (stillUnresolved.length === 0) return out;
+
+  const sequenceOptions = tableId ? buildSequenceOptionsForTableFn(tableId) : null;
+  if (!sequenceOptions) {
+    logLine(
+      `[enriched sync] [BigQuery insertAll] EXTENSION runrate CONTRACT_ID allocation skipped: missing tableId sequence config (tableId=${tableId || "none"}, need=${stillUnresolved.length})`
+    );
+    return out;
+  }
+
+  const rowsByKey = new Map();
+  const noKeyRows = [];
+  for (const row of stillUnresolved) {
+    const key = buildContractMatchKey(row);
+    if (!key) {
+      noKeyRows.push(row);
+      continue;
+    }
+    if (!rowsByKey.has(key)) rowsByKey.set(key, []);
+    rowsByKey.get(key).push(row);
+  }
+
+  const keys = [...rowsByKey.keys()];
+  const totalToAllocate = keys.length + noKeyRows.length;
+
+  let ids = [];
+  try {
+    ids = await allocateContractIdsFn(totalToAllocate, sequenceOptions);
+  } catch (err) {
+    logLine(
+      `[enriched sync] [BigQuery insertAll] EXTENSION runrate CONTRACT_ID allocateContractIds(${totalToAllocate}) failed: ${String(err?.message || err).slice(0, 200)}`
+    );
+    return out;
+  }
+
+  let idx = 0;
+  let allocatedCount = 0;
+  for (const key of keys) {
+    const contractId = normalizeContractIdOrNull(ids[idx] ?? null);
+    idx++;
+    if (contractId == null) continue;
+    for (const row of rowsByKey.get(key) || []) {
+      out.set(String(row.PLACEMENT_ID).trim(), contractId);
+      allocatedCount++;
+    }
+  }
+  for (const row of noKeyRows) {
+    const contractId = normalizeContractIdOrNull(ids[idx] ?? null);
+    idx++;
+    if (contractId != null) {
+      out.set(String(row.PLACEMENT_ID).trim(), contractId);
+      allocatedCount++;
+    }
+  }
+
+  logLine(
+    `[enriched sync] [BigQuery insertAll] EXTENSION runrate CONTRACT_ID resolution: reused=${reusedCount} freshlyAllocated=${allocatedCount} unresolved=${stillUnresolved.length - allocatedCount}`
+  );
+
+  return out;
+}
+
+/**
+ * Insert-time backfill for brand-new EXTENSION rows:
+ *   1. Earliest parent DEAL row in the destination deal sheet (dates, hierarchy, *_EMP_NO)
+ *   2. Run-rate table fallback for any still-empty fields
+ *   3. CONTRACT_ID resolution for run-rate-matched rows still lacking an id
+ * Fills only empty fields — never overwrites existing values.
+ * @param {object[]} rows
+ * @param {object} [options]
+ * @param {object} [deps]
+ * @param {typeof fetchExtensionParentDealInheritByPlacementId} [deps.parentFetchFn]
+ * @param {typeof fetchExtensionRunrateBackfillByPlacementId} [deps.runrateFetchFn]
+ * @param {typeof fetchExtensionRunrateBackfillByPlacementId} [deps.fetchFn]
+ * @param {typeof resolveContractIdsForRunrateMatchedExtensions} [deps.resolveContractIdsFn]
+ */
+async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {}) {
+  if (!rows || rows.length === 0) return rows;
+
+  const eligible = rows.filter(rowNeedsExtensionInsertBackfill);
+  if (eligible.length === 0) return rows;
+
+  const parentFetchFn = deps.parentFetchFn ?? fetchExtensionParentDealInheritByPlacementId;
+  const runrateFetchFn = deps.runrateFetchFn ?? deps.fetchFn ?? fetchExtensionRunrateBackfillByPlacementId;
+  const resolveContractIdsFn = deps.resolveContractIdsFn ?? resolveContractIdsForRunrateMatchedExtensions;
+
+  const parentByPlacementId = await parentFetchFn(eligible, options);
+  const runrateByPlacementId = await runrateFetchFn(eligible, options);
+
+  const matchedRunrateRows = eligible.filter((row) =>
+    runrateByPlacementId.has(String(row.PLACEMENT_ID).trim())
+  );
+  const contractIdByPlacementId =
+    matchedRunrateRows.length > 0
+      ? await resolveContractIdsFn(matchedRunrateRows, options, deps)
+      : new Map();
+
+  const parentFields = ["ORIGINAL_START_DATE", ...EXTENSION_PARENT_DEAL_INHERIT_COLUMNS];
+  const runrateFields = [
+    "ORIGINAL_START_DATE",
+    "NEW_HIRE_DATE",
+    ...EXTENSION_RUNRATE_HIERARCHY_COLUMNS,
+    ...EXTENSION_RUNRATE_HIERARCHY_COLUMNS.map((col) => `${col}_EMP_NO`),
+  ];
+
+  const eligibleSet = new Set(eligible.map((row) => String(row.PLACEMENT_ID).trim()));
+  let parentBackfilledCount = 0;
+  let runrateBackfilledCount = 0;
+
+  const out = rows.map((row) => {
+    const key = String(row.PLACEMENT_ID).trim();
+    if (!eligibleSet.has(key)) return row;
+
+    let current = row;
+    let rowChanged = false;
+
+    const parentMerged = mergeExtensionBackfillFields(
+      current,
+      parentByPlacementId.get(key),
+      parentFields
+    );
+    if (parentMerged.changed) {
+      current = parentMerged.row;
+      rowChanged = true;
+      parentBackfilledCount++;
+    }
+
+    const runrateMerged = mergeExtensionBackfillFields(
+      current,
+      runrateByPlacementId.get(key),
+      runrateFields
+    );
+    if (runrateMerged.changed) {
+      current = runrateMerged.row;
+      rowChanged = true;
+      runrateBackfilledCount++;
+    }
+
+    if (isEmptyDateFieldValue(current.CONTRACT_ID)) {
+      const contractId = contractIdByPlacementId.get(key);
+      if (contractId != null && String(contractId).trim() !== "") {
+        current = { ...current, CONTRACT_ID: contractId };
+        rowChanged = true;
+      }
+    }
+
+    return rowChanged ? current : row;
+  });
+
+  if (parentByPlacementId.size > 0) {
+    logLine(
+      `[enriched sync] [BigQuery insertAll] EXTENSION parent-deal inherit: eligible=${eligible.length} matched=${parentByPlacementId.size} backfilled=${parentBackfilledCount}`
+    );
+  }
+  if (runrateByPlacementId.size > 0) {
+    logLine(
+      `[enriched sync] [BigQuery insertAll] EXTENSION runrate backfill: eligible=${eligible.length} matched=${runrateByPlacementId.size} backfilled=${runrateBackfilledCount}`
+    );
+  }
+
+  return out;
+}
+
+/** @deprecated Use applyExtensionInheritForInsertRows */
+async function applyExtensionRunrateBackfillForInsertRows(rows, options = {}, deps = {}) {
+  return applyExtensionInheritForInsertRows(rows, options, deps);
+}
+
+/** All name + emp-no fields filled by the DEAL recruiter-hierarchy backfill. */
+const DEAL_RECRUITER_HIERARCHY_FIELDS = DEAL_RECRUITER_HIERARCHY_TARGETS.flatMap(
+  ({ column, empNoColumn }) => [column, empNoColumn]
+);
+
+/**
+ * True for brand-new DEAL rows eligible for insert-time recruiter-hierarchy backfill from the
+ * employee directory. Mirrors rowNeedsExtensionInsertBackfill's shape for the DEAL side.
+ */
+function rowNeedsDealRecruiterHierarchyBackfill(row) {
+  if (!row || typeof row !== "object") return false;
+  if (normalizeDealTypeKey(row.DEAL_TYPE) !== "DEAL") return false;
+  if (row.ASSIGNMENT_RECRUITER_EMAIL == null || String(row.ASSIGNMENT_RECRUITER_EMAIL).trim() === "") {
+    return false;
+  }
+  if (row.PLACEMENT_ID == null || String(row.PLACEMENT_ID).trim() === "") return false;
+  return DEAL_RECRUITER_HIERARCHY_FIELDS.some((field) => isEmptyDateFieldValue(row[field]));
+}
+
+/**
+ * Format a JS date-like value as a BigQuery TIMESTAMP literal, or CAST(NULL AS TIMESTAMP).
+ */
+function formatTimestampLiteralForSql(value) {
+  if (value == null || value === "") return "CAST(NULL AS TIMESTAMP)";
+  const d = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(d.getTime())) return "CAST(NULL AS TIMESTAMP)";
+  return `TIMESTAMP '${escapeSqlString(d.toISOString())}'`;
+}
+
+/**
+ * Shared snapshot resolver: for each {key, externalId, anchorDate} target, finds the employee's
+ * hierarchy chain (all hierarchy_level rows from directory_employee_hierarchy) as of one chosen
+ * synced_at snapshot.
+ * direction "on_or_after" (default): earliest snapshot on/after anchorDate, else (no anchorDate,
+ *   or anchorDate after every snapshot) the most recent snapshot available. Used for "what was
+ *   the hierarchy as of this future-facing date" (recruiter hierarchy on hire, log-time lookups).
+ * direction "on_or_before": latest snapshot on/before anchorDate, else (no anchorDate, or
+ *   anchorDate before every snapshot) the earliest snapshot available. Used for "what was the
+ *   hierarchy already true by this date" (CSM hierarchy on hire) — passing anchorDate=null with
+ *   this direction still resolves to the earliest snapshot, not the latest, so callers that want
+ *   the *current* chain regardless of direction should use direction "on_or_after" with a null
+ *   anchorDate (falls back to most recent).
+ * @param {Array<{key: string, externalId: string, anchorDate: *}>} targets
+ * @param {object} [options]
+ * @param {"on_or_after"|"on_or_before"} [options.direction]
+ * @returns {Promise<Map<string, object[]>>} target key -> hierarchy_level rows (unsorted keys,
+ *   rows ordered by hierarchy_level ascending)
+ */
+async function fetchHierarchyLevelChainsByKey(targets, options = {}) {
+  const out = new Map();
+  if (!targets || targets.length === 0) return out;
+  const direction = options.direction === "on_or_before" ? "on_or_before" : "on_or_after";
+
+  // Fixed MISC.directory_employee_hierarchy. Deliberately does NOT read options.datasetId/tableId
+  // (only options.direction) — callers pass deal-sheet-scoped options, and honoring a table
+  // override here would query the wrong table (this class of bug recurred repeatedly).
+  const datasetId = config.directoryEmployeeHierarchy.datasetId;
+  const tableId = config.directoryEmployeeHierarchy.tableId;
+  const hierarchyFqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
+
+  const chunkSize = 100;
+  for (let i = 0; i < targets.length; i += chunkSize) {
+    const chunk = targets.slice(i, i + chunkSize);
+    const structLiterals = chunk.map(
+      (t) =>
+        `STRUCT('${escapeSqlString(t.key)}' AS target_key, `
+        + `'${escapeSqlString(t.externalId)}' AS external_id, `
+        + `${formatTimestampLiteralForSql(t.anchorDate)} AS anchor_date)`
+    );
+
+    const sql = `
+      WITH targets AS (
+        SELECT * FROM UNNEST([${structLiterals.join(", ")}])
+      ),
+      hierarchy AS (
+        SELECT
+          employee_external_id,
+          hierarchy_level,
+          manager_name,
+          manager_employee_id,
+          manager_title,
+          synced_at
+        FROM ${hierarchyFqn}
+        WHERE employee_external_id IN (SELECT DISTINCT external_id FROM targets)
+      ),
+      distinct_snapshots AS (
+        SELECT DISTINCT employee_external_id, synced_at FROM hierarchy
+      ),
+      ranked_snapshots AS (
+        SELECT
+          t.target_key,
+          s.synced_at,
+          ROW_NUMBER() OVER (
+            PARTITION BY t.target_key
+            ORDER BY
+              ${direction === "on_or_before"
+                ? `CASE WHEN s.synced_at <= t.anchor_date THEN 0 ELSE 1 END,
+              CASE WHEN s.synced_at <= t.anchor_date THEN s.synced_at END DESC,
+              s.synced_at ASC`
+                : `CASE WHEN s.synced_at >= t.anchor_date THEN 0 ELSE 1 END,
+              CASE WHEN s.synced_at >= t.anchor_date THEN s.synced_at END ASC,
+              s.synced_at DESC`}
+          ) AS rn
+        FROM targets t
+        JOIN distinct_snapshots s ON s.employee_external_id = t.external_id
+      ),
+      chosen_snapshot AS (
+        SELECT target_key, synced_at FROM ranked_snapshots WHERE rn = 1
+      )
+      SELECT
+        cs.target_key,
+        h.hierarchy_level,
+        h.manager_name,
+        h.manager_employee_id,
+        h.manager_title
+      FROM chosen_snapshot cs
+      JOIN targets t ON t.target_key = cs.target_key
+      JOIN hierarchy h ON h.employee_external_id = t.external_id AND h.synced_at = cs.synced_at
+      ORDER BY cs.target_key, SAFE_CAST(h.hierarchy_level AS INT64)
+    `;
+
+    const bqRows = await queryObjects(sql, chunk.length * 10);
+    for (const bqRow of bqRows) {
+      const key = bqRow?.target_key;
+      if (key == null || String(key).trim() === "") continue;
+      const trimmedKey = String(key).trim();
+      if (!out.has(trimmedKey)) out.set(trimmedKey, []);
+      out.get(trimmedKey).push(bqRow);
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Resolve recruiter hierarchy (TEAM_LEAD, ATL, RM, ACCOUNT_MANAGER, SECONDARY_AM, ASSOCIATE_AM,
+ * GRP_DIR_ASSOC_GRP_DIR, VP_SRVP, DELIVERY_DIRECTOR, SECONDARY_RECRUITER + their *_EMP_NO
+ * companions) for brand-new DEAL rows, from cynetdatabase.MISC.directory_employee_hierarchy.
+ *
+ * Per recruiter (employee external_id), the hierarchy table holds one full org-chart snapshot
+ * (all hierarchy_level rows) per synced_at. The snapshot used is the earliest one whose
+ * synced_at is on/after the row's NEW_HIRE_DATE (the hierarchy as it stood when this candidate
+ * was hired); if none qualifies (no NEW_HIRE_DATE, or hire date is after every snapshot), the
+ * most recent snapshot available is used instead. Each snapshot's manager_title values are then
+ * matched against known designations (see recruiterHierarchyDesignations.js) to pick the column.
+ *
+ * @param {object[]} rows - enriched rows eligible per rowNeedsDealRecruiterHierarchyBackfill
+ * @param {object} [options]
+ * @returns {Promise<Map<string, object>>} PLACEMENT_ID string -> partial row of matched columns
+ */
+async function fetchDealRecruiterHierarchyByPlacementId(rows, options = {}, deps = {}) {
+  const out = new Map();
+  if (!rows || rows.length === 0) return out;
+
+  const directoryFetchFn = deps.directoryFetchFn ?? fetchEmployeeDirectoryByEmails;
+  const emails = [];
+  const emailSeen = new Set();
+  for (const row of rows) {
+    const email = row?.ASSIGNMENT_RECRUITER_EMAIL;
+    if (email == null) continue;
+    const norm = String(email).trim().toLowerCase();
+    if (!norm || emailSeen.has(norm)) continue;
+    emailSeen.add(norm);
+    emails.push(norm);
+  }
+  if (emails.length === 0) return out;
+
+  const directoryByEmail = await directoryFetchFn(emails);
+
+  const targets = [];
+  for (const row of rows) {
+    const pid = row?.PLACEMENT_ID;
+    if (pid == null || String(pid).trim() === "") continue;
+    const email = row?.ASSIGNMENT_RECRUITER_EMAIL;
+    const norm = email == null ? "" : String(email).trim().toLowerCase();
+    const externalId = norm ? directoryByEmail.get(norm)?.externalId : null;
+    if (!externalId) continue;
+    targets.push({
+      key: String(pid).trim(),
+      externalId,
+      anchorDate: row?.NEW_HIRE_DATE ?? null,
+    });
+  }
+  if (targets.length === 0) return out;
+
+  // Never forward `options` here: it carries the destination deal-sheet table's datasetId/tableId
+  // (from insertEnrichedDealSheetBatch), which would make this query the wrong table entirely —
+  // the hierarchy lookup always targets the fixed directory_employee_hierarchy table.
+  const levelsByKey = await fetchHierarchyLevelChainsByKey(targets);
+
+  for (const [placementId, levelRows] of levelsByKey) {
+    const entry = {};
+    const filledColumns = new Set();
+    for (const levelRow of levelRows) {
+      const column = resolveHierarchyColumnForTitle(levelRow?.manager_title);
+      if (!column || filledColumns.has(column)) continue;
+      const target = DEAL_RECRUITER_HIERARCHY_TARGETS.find((t) => t.column === column);
+      if (!target) continue;
+      const name = normalizeExtensionRunrateBackfillValue(levelRow?.manager_name);
+      const empNo = normalizeExtensionRunrateBackfillValue(levelRow?.manager_employee_id);
+      if (name == null && empNo == null) continue;
+      filledColumns.add(column);
+      entry[target.column] = name;
+      entry[target.empNoColumn] = empNo;
+    }
+    if (Object.keys(entry).length > 0) out.set(placementId, entry);
+  }
+
+  return out;
+}
+
+/**
+ * Backfill recruiter hierarchy (see fetchDealRecruiterHierarchyByPlacementId) onto brand-new
+ * DEAL_TYPE=DEAL rows only. Only ever fills a column that is currently empty — a row whose
+ * hierarchy columns were already carried forward from a baseline (an update-append, not a
+ * first insert) is left untouched, and a manual BigQuery edit is never overwritten.
+ */
+async function applyDealRecruiterHierarchyForInsertRows(rows, options = {}, deps = {}) {
+  if (!rows || rows.length === 0) return rows;
+
+  const eligible = rows.filter(rowNeedsDealRecruiterHierarchyBackfill);
+  if (eligible.length === 0) return rows;
+
+  const fetchFn = deps.fetchFn ?? fetchDealRecruiterHierarchyByPlacementId;
+  const hierarchyByPlacementId = await fetchFn(eligible, options, deps);
+
+  const eligibleSet = new Set(eligible.map((row) => String(row.PLACEMENT_ID).trim()));
+  let backfilledCount = 0;
+
+  const out = rows.map((row) => {
+    const key = String(row.PLACEMENT_ID).trim();
+    if (!eligibleSet.has(key)) return row;
+
+    const merged = mergeExtensionBackfillFields(
+      row,
+      hierarchyByPlacementId.get(key),
+      DEAL_RECRUITER_HIERARCHY_FIELDS
+    );
+    if (merged.changed) backfilledCount++;
+    return merged.row;
+  });
+
+  if (hierarchyByPlacementId.size > 0) {
+    logLine(
+      `[enriched sync] [BigQuery insertAll] DEAL recruiter-hierarchy backfill: eligible=${eligible.length} matched=${hierarchyByPlacementId.size} backfilled=${backfilledCount}`
+    );
+  }
+
+  return out;
+}
+
+/**
+ * Resolve LEVEL_2_CSM/LEVEL_3_CSM/LEVEL_4_CSM (ONSITE_AM's manager chain, hire-date-anchored) for
+ * a batch of rows. Unlike the DEAL recruiter hierarchy, this always uses ONSITE_AM_EMAIL (never
+ * recruiter email) and picks the LATEST snapshot on/before NEW_HIRE_DATE (falls back to the
+ * EARLIEST snapshot if none is before hire date) — the opposite direction from recruiter
+ * hierarchy, because this represents "who was already in place when this candidate was hired."
+ * @param {object[]} rows - each needs ONSITE_AM_EMAIL and (optionally) NEW_HIRE_DATE
+ * @returns {Promise<Map<string, {LEVEL_2_CSM, LEVEL_3_CSM, LEVEL_4_CSM}>>} row index (as string) -> levels
+ */
+async function fetchOnsiteAmCsmHierarchyByKey(rows, options = {}, deps = {}) {
+  const out = new Map();
+  if (!rows || rows.length === 0) return out;
+
+  const directoryFetchFn = deps.directoryFetchFn ?? fetchEmployeeDirectoryByEmails;
+  const emails = [];
+  const emailSeen = new Set();
+  for (const row of rows) {
+    const email = row?.ONSITE_AM_EMAIL;
+    if (email == null) continue;
+    const norm = String(email).trim().toLowerCase();
+    if (!norm || emailSeen.has(norm)) continue;
+    emailSeen.add(norm);
+    emails.push(norm);
+  }
+  if (emails.length === 0) return out;
+
+  // Never forward `options` to the directory/hierarchy lookups — see the same note in
+  // fetchDealRecruiterHierarchyByPlacementId; these always target the fixed MISC.directory_*
+  // tables, never the caller's destination deal-sheet table/dataset.
+  const directoryByEmail = await directoryFetchFn(emails);
+
+  const targets = [];
+  rows.forEach((row, index) => {
+    const email = row?.ONSITE_AM_EMAIL;
+    const norm = email == null ? "" : String(email).trim().toLowerCase();
+    const externalId = norm ? directoryByEmail.get(norm)?.externalId : null;
+    if (!externalId) return;
+    targets.push({ key: String(index), externalId, anchorDate: row?.NEW_HIRE_DATE ?? null });
+  });
+  if (targets.length === 0) return out;
+
+  const hierarchyFetchFn = deps.hierarchyFetchFn ?? fetchHierarchyLevelChainsByKey;
+  const levelsByKey = await hierarchyFetchFn(targets, { direction: "on_or_before" });
+
+  for (const [key, levelRows] of levelsByKey) {
+    out.set(key, resolveCsmLevelsFromChain(levelRows));
+  }
+  return out;
+}
+
+/**
+ * Recomputes LEVEL_2_CSM/LEVEL_3_CSM/LEVEL_4_CSM on every row from the CURRENT ONSITE_AM_EMAIL
+ * (unlike the recruiter hierarchy backfill, this is never frozen — it always tracks whoever the
+ * current onsite AM is, same as ONSITE_AM_EMAIL itself). Rows with no ONSITE_AM_EMAIL get all
+ * three columns cleared to null.
+ */
+async function applyOnsiteAmCsmHierarchyForRows(rows, options = {}, deps = {}) {
+  if (!rows || rows.length === 0) return rows;
+
+  const fetchFn = deps.fetchFn ?? fetchOnsiteAmCsmHierarchyByKey;
+  const levelsByIndex = await fetchFn(rows, options, deps);
+
+  let updatedCount = 0;
+  const out = rows.map((row, index) => {
+    const levels = levelsByIndex.get(String(index)) ?? { LEVEL_2_CSM: null, LEVEL_3_CSM: null, LEVEL_4_CSM: null };
+    const changed =
+      normalizeForCompare(row.LEVEL_2_CSM) !== normalizeForCompare(levels.LEVEL_2_CSM) ||
+      normalizeForCompare(row.LEVEL_3_CSM) !== normalizeForCompare(levels.LEVEL_3_CSM) ||
+      normalizeForCompare(row.LEVEL_4_CSM) !== normalizeForCompare(levels.LEVEL_4_CSM);
+    if (!changed) return row;
+    updatedCount++;
+    return { ...row, ...levels };
+  });
+
+  if (updatedCount > 0) {
+    logLine(`[enriched sync] [BigQuery insertAll] ONSITE_AM CSM hierarchy: updated=${updatedCount}/${rows.length}`);
+  }
+  return out;
+}
+
+/**
+ * Scans active deal-sheet tables' latest row per placement for a CSM hierarchy divergence: the
+ * ONSITE_AM's CURRENT (live, most-recent-snapshot) manager chain differs from what's frozen on
+ * the row as LEVEL_2_CSM/LEVEL_3_CSM/LEVEL_4_CSM. Independent of any recruiter change — a
+ * placement can surface here even when its recruiter never changed.
+ * @returns {Promise<object[]>} candidates: {DEAL_SHEET_ID, PLACEMENT_ID, PLACEMENT_STATUS,
+ *   CANDIDATE_NAME, CANDIDATE_NEXUS_ID, csmDivergedLevels: {LEVEL_2_CSM?, LEVEL_3_CSM?, LEVEL_4_CSM?}}
+ */
+async function fetchCsmHierarchyDivergenceCandidates(options = {}, deps = {}) {
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+
+  const unionParts = ACTIVE_DEAL_SHEET_TABLE_IDS.map((tableId) => {
+    const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
+    return `SELECT DEAL_SHEET_ID, PLACEMENT_ID, PLACEMENT_STATUS, CANDIDATE_NAME, CANDIDATE_NEXUS_ID,
+                   ONSITE_AM_EMAIL, LEVEL_2_CSM, LEVEL_3_CSM, LEVEL_4_CSM, DATE_AND_TIME
+            FROM ${fqn}
+            WHERE DEAL_SHEET_ID IS NOT NULL AND PLACEMENT_ID IS NOT NULL
+              AND TRIM(IFNULL(ONSITE_AM_EMAIL, '')) != ''
+              AND (LEVEL_2_CSM IS NOT NULL OR LEVEL_3_CSM IS NOT NULL OR LEVEL_4_CSM IS NOT NULL)`;
+  });
+
+  const sql = `WITH all_rows AS (
+                 ${unionParts.join("\n                 UNION ALL\n                 ")}
+               )
+               SELECT * EXCEPT(rn) FROM (
+                 SELECT
+                   *,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY CAST(DEAL_SHEET_ID AS STRING), CAST(PLACEMENT_ID AS STRING)
+                     ORDER BY DATE_AND_TIME DESC NULLS LAST
+                   ) AS rn
+                 FROM all_rows
+               )
+               WHERE rn = 1`;
+
+  const rows = await queryObjects(sql, 100000);
+  logLine(`[inorganic hierarchy logs] fetchCsmHierarchyDivergenceCandidates latest rows scanned=${rows.length}`);
+  if (rows.length === 0) return [];
+
+  const directoryFetchFn = deps.directoryFetchFn ?? fetchEmployeeDirectoryByEmails;
+  const emails = [];
+  const emailSeen = new Set();
+  for (const row of rows) {
+    const norm = String(row.ONSITE_AM_EMAIL).trim().toLowerCase();
+    if (!norm || emailSeen.has(norm)) continue;
+    emailSeen.add(norm);
+    emails.push(norm);
+  }
+  // Never forward `options` — see the same note in fetchDealRecruiterHierarchyByPlacementId.
+  const directoryByEmail = await directoryFetchFn(emails);
+
+  const targets = [];
+  rows.forEach((row, index) => {
+    const norm = String(row.ONSITE_AM_EMAIL).trim().toLowerCase();
+    const externalId = directoryByEmail.get(norm)?.externalId;
+    if (!externalId) return;
+    targets.push({ key: String(index), externalId, anchorDate: null });
+  });
+
+  const hierarchyFetchFn = deps.hierarchyFetchFn ?? fetchHierarchyLevelChainsByKey;
+  const currentLevelsByKey =
+    targets.length > 0 ? await hierarchyFetchFn(targets, { direction: "on_or_after" }) : new Map();
+
+  const candidates = [];
+  rows.forEach((row, index) => {
+    const currentLevels = resolveCsmLevelsFromChain(currentLevelsByKey.get(String(index)));
+    const diverged = {};
+    for (const target of CSM_LEVEL_TARGETS) {
+      const col = target.column;
+      if (normalizeForCompare(row[col]) !== normalizeForCompare(currentLevels[col])) {
+        diverged[col] = currentLevels[col];
+      }
+    }
+    if (Object.keys(diverged).length === 0) return;
+    candidates.push({
+      DEAL_SHEET_ID: row.DEAL_SHEET_ID,
+      PLACEMENT_ID: row.PLACEMENT_ID,
+      PLACEMENT_STATUS: row.PLACEMENT_STATUS,
+      CANDIDATE_NAME: row.CANDIDATE_NAME,
+      CANDIDATE_NEXUS_ID: row.CANDIDATE_NEXUS_ID,
+      csmDivergedLevels: diverged,
+    });
+  });
+
+  logLine(`[inorganic hierarchy logs] fetchCsmHierarchyDivergenceCandidates diverged=${candidates.length}`);
+  return candidates;
+}
+
+/**
+ * Merges recruiter-change candidates and CSM-divergence candidates by DEAL_SHEET_ID+PLACEMENT_ID
+ * so a placement with both signals in the same scan produces exactly one log row.
+ */
+function mergeInorganicHierarchyLogCandidates(recruiterCandidates, csmCandidates) {
+  const byKey = new Map();
+  const keyOf = (c) => buildDealSheetPlacementCompositeKey(c.DEAL_SHEET_ID, c.PLACEMENT_ID);
+
+  for (const c of recruiterCandidates || []) {
+    const key = keyOf(c);
+    if (!key) continue;
+    byKey.set(key, { ...c });
+  }
+  for (const c of csmCandidates || []) {
+    const key = keyOf(c);
+    if (!key) continue;
+    const existing = byKey.get(key);
+    if (existing) {
+      byKey.set(key, { ...existing, csmDivergedLevels: c.csmDivergedLevels });
+    } else {
+      byKey.set(key, { ...c });
+    }
+  }
+  return [...byKey.values()];
+}
+
+/**
+ * Returns Map<"DEAL_SHEET_ID|PLACEMENT_ID", { latest, previous }> for placements whose latest
+ * row's ASSIGNMENT_RECRUITER_EMAIL differs from the row before it (a recruiter reassignment).
+ * Scans all active domain deal sheet tables, mirroring fetchContractRateChangePairsFromActive's
+ * shape but partitioned by DEAL_SHEET_ID+PLACEMENT_ID instead of CONTRACT_ID.
+ */
+async function fetchDealSheetRecruiterChangePairsFromActive(options = {}) {
+  const out = new Map();
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+
+  const unionParts = buildActiveChangeScanUnionParts(datasetId);
+
+  const sql = `WITH all_rows AS (
+                 ${unionParts.join("\n                 UNION ALL\n                 ")}
+               ),
+               ranked AS (
+                 SELECT
+                   *,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY CAST(DEAL_SHEET_ID AS STRING), CAST(PLACEMENT_ID AS STRING)
+                     ORDER BY DATE_AND_TIME DESC NULLS LAST
+                   ) AS rn
+                 FROM all_rows
+               ),
+               latest AS (SELECT * FROM ranked WHERE rn = 1),
+               previous AS (SELECT * FROM ranked WHERE rn = 2),
+               changed_keys AS (
+                 SELECT DISTINCT
+                   CAST(l.DEAL_SHEET_ID AS STRING) AS deal_sheet_id,
+                   CAST(l.PLACEMENT_ID AS STRING) AS placement_id
+                 FROM latest l
+                 JOIN previous p
+                   ON CAST(l.DEAL_SHEET_ID AS STRING) = CAST(p.DEAL_SHEET_ID AS STRING)
+                  AND CAST(l.PLACEMENT_ID AS STRING) = CAST(p.PLACEMENT_ID AS STRING)
+                 WHERE TRIM(IFNULL(l.ASSIGNMENT_RECRUITER_EMAIL, '')) != ''
+                   AND LOWER(TRIM(IFNULL(l.ASSIGNMENT_RECRUITER_EMAIL, ''))) !=
+                       LOWER(TRIM(IFNULL(p.ASSIGNMENT_RECRUITER_EMAIL, '')))
+               )
+               SELECT * FROM ranked
+               WHERE rn <= 2
+                 AND CAST(DEAL_SHEET_ID AS STRING) IN (SELECT deal_sheet_id FROM changed_keys)
+                 AND CAST(PLACEMENT_ID AS STRING) IN (SELECT placement_id FROM changed_keys)`;
+
+  const rows = await queryObjects(sql, 100000);
+  for (const raw of rows) {
+    const key = buildDealSheetPlacementCompositeKey(raw?.DEAL_SHEET_ID, raw?.PLACEMENT_ID);
+    if (!key) continue;
+    const rn = Number(raw.rn);
+    const cleaned = stripRateChangeHistoryMetaFields(raw);
+    if (!out.has(key)) out.set(key, { latest: null, previous: null });
+    const slot = out.get(key);
+    if (rn === 1) slot.latest = cleaned;
+    else if (rn === 2) slot.previous = cleaned;
+  }
+
+  for (const [key, pair] of [...out.entries()]) {
+    if (!pair.latest || !pair.previous) out.delete(key);
+  }
+
+  logLine(
+    `[inorganic hierarchy logs] fetchDealSheetRecruiterChangePairsFromActive dataset=${datasetId} pairs=${out.size}`
+  );
+  return out;
+}
+
+/**
+ * Pure candidate extraction from a recruiter-change pair. Returns null when the pair doesn't
+ * actually represent a recruiter change (defensive re-check; callers normally already filtered).
+ */
+function buildInorganicHierarchyLogCandidate(latestRow, previousRow) {
+  if (!latestRow || !previousRow) return null;
+  const newEmail = latestRow.ASSIGNMENT_RECRUITER_EMAIL == null
+    ? ""
+    : String(latestRow.ASSIGNMENT_RECRUITER_EMAIL).trim();
+  const oldEmailNorm = previousRow.ASSIGNMENT_RECRUITER_EMAIL == null
+    ? ""
+    : String(previousRow.ASSIGNMENT_RECRUITER_EMAIL).trim().toLowerCase();
+  if (!newEmail || newEmail.toLowerCase() === oldEmailNorm) return null;
+
+  const dealType = normalizeDealTypeKey(latestRow.DEAL_TYPE);
+  return {
+    DEAL_SHEET_ID: latestRow.DEAL_SHEET_ID ?? null,
+    PLACEMENT_ID: latestRow.PLACEMENT_ID ?? null,
+    PLACEMENT_STATUS: latestRow.PLACEMENT_STATUS ?? null,
+    CANDIDATE_NAME: latestRow.CANDIDATE_NAME ?? null,
+    CANDIDATE_NEXUS_ID: latestRow.CANDIDATE_NEXUS_ID ?? null,
+    DEAL_TYPE: dealType,
+    anchorDate: dealType === "EXTENSION" ? (latestRow.EXTENSION_DATE ?? null) : (latestRow.NEW_HIRE_DATE ?? null),
+    newRecruiterEmail: newEmail,
+  };
+}
+
+/** Dedupe key for the inorganic hierarchy log: same placement + same new recruiter never logged twice. */
+function buildInorganicHierarchyLogDedupeKey(row) {
+  const dsid = row?.DEAL_SHEET_ID == null ? "" : String(row.DEAL_SHEET_ID).trim();
+  const pid = row?.PLACEMENT_ID == null ? "" : String(row.PLACEMENT_ID).trim();
+  if (!dsid || !pid) return "";
+  const email = row?.RECRUITER_EMAIL_ID == null ? "" : String(row.RECRUITER_EMAIL_ID).trim().toLowerCase();
+  const csmPart = ["INORGANIC_LEVEL_2_CSM", "INORGANIC_LEVEL_3_CSM", "INORGANIC_LEVEL_4_CSM"]
+    .map((col) => (row?.[col] == null ? "" : String(row[col]).trim().toLowerCase()))
+    .join(",");
+  // A row with neither signal (no recruiter change, no CSM divergence) has nothing worth deduping
+  // on its own identity — fall back to empty so callers skip it rather than colliding on an
+  // ambiguous "DEAL_SHEET_ID|PLACEMENT_ID||,," key shared by every no-signal row.
+  if (!email && csmPart === ",,") return "";
+  return `${dsid}|${pid}|${email}|${csmPart}`;
+}
+
+/**
+ * Returns Set of "<DEAL_SHEET_ID>|<PLACEMENT_ID>|<recruiter email>|<csm levels>" keys already logged.
+ */
+async function fetchExistingInorganicHierarchyLogKeysSet(candidates, options = {}) {
+  const out = new Set();
+  if (!candidates || candidates.length === 0) return out;
+
+  const { datasetId, tableId } = resolveBqDatasetTable(options);
+  const placementIds = [];
+  const seen = new Set();
+  for (const c of candidates) {
+    const pid = c?.PLACEMENT_ID == null ? "" : String(c.PLACEMENT_ID).trim();
+    if (!pid || seen.has(pid)) continue;
+    seen.add(pid);
+    placementIds.push(pid);
+  }
+  if (placementIds.length === 0) return out;
+
+  const chunkSize = 500;
+  for (let i = 0; i < placementIds.length; i += chunkSize) {
+    const chunk = placementIds.slice(i, i + chunkSize);
+    const inList = chunk.map((v) => `'${escapeSqlString(v)}'`).join(", ");
+    const sql = `SELECT DEAL_SHEET_ID, PLACEMENT_ID, RECRUITER_EMAIL_ID,
+                        INORGANIC_LEVEL_2_CSM, INORGANIC_LEVEL_3_CSM, INORGANIC_LEVEL_4_CSM
+                 FROM \`${config.projectId}.${datasetId}.${tableId}\`
+                 WHERE CAST(PLACEMENT_ID AS STRING) IN (${inList})`;
+    const rows = await queryObjects(sql, chunk.length * 5);
+    for (const row of rows) {
+      const key = buildInorganicHierarchyLogDedupeKey(row);
+      if (key) out.add(key);
+    }
+  }
+  return out;
+}
+
+/**
+ * Resolves full inorganic_hierarchy_logs rows for a batch of recruiter-change candidates (see
+ * buildInorganicHierarchyLogCandidate). For each candidate: looks up the new recruiter in
+ * directory_employees (own name/employee_id -> INORGANIC_RECRUITER/_EMP_NO, RECRUITER_NAME), then
+ * their manager chain in directory_employee_hierarchy (snapshot on/after the candidate's anchor
+ * date — NEW_HIRE_DATE for DEAL, EXTENSION_DATE for EXTENSION — else latest available), matching
+ * each level's title to a known designation (see DESIGNATION_TO_INORGANIC_LOG_COLUMN).
+ * @param {object[]} candidates
+ * @returns {Promise<object[]>}
+ */
+async function resolveInorganicHierarchyLogRows(candidates, options = {}, deps = {}) {
+  if (!candidates || candidates.length === 0) return [];
+
+  const directoryFetchFn = deps.directoryFetchFn ?? fetchEmployeeDirectoryByEmails;
+  const hierarchyFetchFn = deps.hierarchyFetchFn ?? fetchHierarchyLevelChainsByKey;
+
+  const recruiterCandidateIndexes = [];
+  const emails = [];
+  const emailSeen = new Set();
+  candidates.forEach((c, index) => {
+    if (!c.newRecruiterEmail) return;
+    recruiterCandidateIndexes.push(index);
+    const norm = c.newRecruiterEmail.toLowerCase();
+    if (emailSeen.has(norm)) return;
+    emailSeen.add(norm);
+    emails.push(norm);
+  });
+  // Never forward `options` — see the same note in fetchDealRecruiterHierarchyByPlacementId.
+  const directoryByEmail = emails.length > 0 ? await directoryFetchFn(emails) : new Map();
+
+  const targets = [];
+  for (const index of recruiterCandidateIndexes) {
+    const c = candidates[index];
+    const directoryEntry = directoryByEmail.get(c.newRecruiterEmail.toLowerCase());
+    if (!directoryEntry?.externalId) continue;
+    targets.push({ key: String(index), externalId: directoryEntry.externalId, anchorDate: c.anchorDate });
+  }
+  const levelsByKey = targets.length > 0 ? await hierarchyFetchFn(targets) : new Map();
+
+  const nowIso = new Date().toISOString();
+  const todayDate = nowIso.slice(0, 10);
+
+  return candidates.map((c, index) => {
+    const directoryEntry = c.newRecruiterEmail
+      ? directoryByEmail.get(c.newRecruiterEmail.toLowerCase())
+      : null;
+    const row = {
+      DATE_AND_TIME: nowIso,
+      PLACEMENT_ID: c.PLACEMENT_ID,
+      PLACEMENT_STATUS: c.PLACEMENT_STATUS,
+      DEAL_SHEET_ID: c.DEAL_SHEET_ID,
+      CANDIDATE_NAME: c.CANDIDATE_NAME,
+      CANDIDATE_NEXUS_ID: c.CANDIDATE_NEXUS_ID,
+      EFFECTIVE_DATE: todayDate,
+      RECRUITER_EMAIL_ID: c.newRecruiterEmail ?? null,
+      RECRUITER_NAME: directoryEntry?.nameFull ?? null,
+      INORGANIC_RECRUITER: directoryEntry?.nameFull ?? null,
+      INORGANIC_RECRUITER_EMP_NO: directoryEntry?.employeeId ?? null,
+    };
+
+    const levelRows = levelsByKey.get(String(index));
+    if (levelRows) {
+      const filledColumns = new Set();
+      for (const levelRow of levelRows) {
+        const designation = resolveHierarchyColumnForTitle(levelRow?.manager_title);
+        if (!designation || filledColumns.has(designation)) continue;
+        const target = DESIGNATION_TO_INORGANIC_LOG_COLUMN[designation];
+        if (!target) continue;
+        const name = normalizeExtensionRunrateBackfillValue(levelRow?.manager_name);
+        const empNo = normalizeExtensionRunrateBackfillValue(levelRow?.manager_employee_id);
+        if (name == null && empNo == null) continue;
+        filledColumns.add(designation);
+        row[target.column] = name;
+        row[target.empNoColumn] = empNo;
+      }
+    }
+
+    if (c.csmDivergedLevels) {
+      for (const [levelColumn, value] of Object.entries(c.csmDivergedLevels)) {
+        const inorganicColumn = CSM_LEVEL_TO_INORGANIC_COLUMN[levelColumn];
+        if (inorganicColumn) row[inorganicColumn] = value ?? null;
+      }
+    }
+
+    return row;
+  });
+}
+
+/**
+ * Insert recruiter-reassignment audit logs (append-only; one row per detected change).
+ */
+async function insertInorganicHierarchyLogBatch(logRows, insertIdBase, options = {}) {
+  if (!logRows || logRows.length === 0) {
+    logLine(`[inorganic hierarchy logs] [BigQuery insertAll] SKIP: no rows to insert`);
+    return { inserted: 0, attempted: 0, errorBatches: 0 };
+  }
+
+  const generatedUuidField =
+    typeof options.generatedUuidField === "string" && options.generatedUuidField.trim() !== ""
+      ? options.generatedUuidField.trim()
+      : "ID";
+  let rowsToInsert = logRows.map((row) => {
+    const next = { ...row };
+    const raw = next[generatedUuidField];
+    const existing = raw == null ? "" : String(raw).trim();
+    if (!existing) next[generatedUuidField] = randomUUID();
+    return next;
+  });
+
+  const seenKeys = new Set();
+  let deduped = [];
+  let droppedDupBatch = 0;
+  for (const row of rowsToInsert) {
+    const dedupeKey = buildInorganicHierarchyLogDedupeKey(row);
+    if (dedupeKey !== "") {
+      if (seenKeys.has(dedupeKey)) {
+        droppedDupBatch++;
+        continue;
+      }
+      seenKeys.add(dedupeKey);
+    }
+    deduped.push(row);
+  }
+  if (droppedDupBatch > 0) {
+    logLine(
+      `[inorganic hierarchy logs] dedupe(same batch DEAL_SHEET_ID+PLACEMENT_ID+RECRUITER_EMAIL_ID): dropped=${droppedDupBatch} remaining=${deduped.length}`
+    );
+  }
+
+  const skipExisting = options.skipExistingInorganicHierarchyLogs !== false;
+  if (skipExisting && deduped.length > 0) {
+    const existingKeys = await fetchExistingInorganicHierarchyLogKeysSet(deduped, {
+      datasetId: options.datasetId,
+      tableId: options.tableId,
+    });
+    if (existingKeys.size > 0) {
+      const filtered = [];
+      let skipped = 0;
+      for (const row of deduped) {
+        const key = buildInorganicHierarchyLogDedupeKey(row);
+        if (key !== "" && existingKeys.has(key)) {
+          skipped++;
+          continue;
+        }
+        filtered.push(row);
+      }
+      deduped = filtered;
+      logLine(
+        `[inorganic hierarchy logs] [BigQuery insertAll] dedupe(existing in log table): skipped=${skipped} remaining=${deduped.length}`
+      );
+    }
+  }
+
+  if (!deduped.length) {
+    logLine(`[inorganic hierarchy logs] [BigQuery insertAll] SKIP: nothing left after dedupe`);
+    return { inserted: 0, attempted: 0, errorBatches: 0 };
+  }
+
+  const rowsForInsert = deduped.map((row) => {
+    const dedupeKey = buildInorganicHierarchyLogDedupeKey(row);
+    return dedupeKey ? { ...row, _INSERT_ID: dedupeKey } : row;
+  });
+
+  const result = await insertAll(rowsForInsert, {
+    insertIdBase,
+    datasetId: options.datasetId,
+    tableId: options.tableId,
+    insertIdField: "_INSERT_ID",
+  });
+  const hasErrors = result.errors && result.errors.length > 0;
+
+  logLine(
+    `[inorganic hierarchy logs] [BigQuery insertAll] ${hasErrors ? "PARTIAL" : "OK"} attempted=${result.attempted} inserted=${result.inserted}`
+  );
+  return { inserted: result.inserted, attempted: result.attempted, errorBatches: hasErrors ? 1 : 0 };
+}
+
+// ===========================================================================================
+// ownership_change_logs — per-role ownership handover audit (recruiter / onsite AM / CSM levels)
+// ===========================================================================================
+
+/** Lowercase/trim a value for change comparison; null/blank -> "". */
+function normalizeOwnershipValueForCompare(value) {
+  if (value == null) return "";
+  const unwrapped = value != null && typeof value === "object" && "value" in value ? value.value : value;
+  if (unwrapped == null) return "";
+  return String(unwrapped).trim().toLowerCase();
+}
+
+/** Trim a display value to a non-empty string, else null. */
+function ownershipDisplayValueOrNull(value) {
+  const s = normalizeExtensionRunrateBackfillValue(value);
+  return s == null ? null : s;
+}
+
+/** Format a DATE-ish value to YYYY-MM-DD (UTC), else null. */
+function ownershipDateOnlyOrNull(value) {
+  return formatDateOnlyForSql(value);
+}
+
+/** Add one calendar day (UTC) to a DATE-ish value; returns YYYY-MM-DD or null. */
+function addOneDayToDateOnly(value) {
+  const ymd = formatDateOnlyForSql(value);
+  if (ymd == null) return null;
+  const ms = Date.parse(`${ymd}T00:00:00Z`);
+  if (!Number.isFinite(ms)) return null;
+  const d = new Date(ms + 86400000);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Scan active deal-sheet tables for placements whose latest row differs from the row before it in
+ * ANY ownership role (recruiter email, onsite AM email, or a CSM level). Returns
+ * Map<"DEAL_SHEET_ID|PLACEMENT_ID", { latest, previous }>. Mirrors
+ * fetchDealSheetRecruiterChangePairsFromActive but with a wider change predicate.
+ */
+async function fetchDealSheetOwnershipChangePairsFromActive(options = {}) {
+  const out = new Map();
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+
+  const unionParts = buildActiveChangeScanUnionParts(datasetId);
+
+  // A role "changed" when latest's normalized value differs from previous AND latest is non-empty
+  // (a genuine new owner — pure removals aren't logged here). Matches OWNERSHIP_CHANGE_DIFF_ROLES.
+  const changePredicate = OWNERSHIP_CHANGE_DIFF_ROLES.map((r) => {
+    const col = r.changeField;
+    return `(LOWER(TRIM(IFNULL(l.${col}, ''))) != LOWER(TRIM(IFNULL(p.${col}, ''))) `
+      + `AND TRIM(IFNULL(l.${col}, '')) != '')`;
+  }).join(" OR ");
+
+  const sql = `WITH all_rows AS (
+                 ${unionParts.join("\n                 UNION ALL\n                 ")}
+               ),
+               ranked AS (
+                 SELECT
+                   *,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY CAST(DEAL_SHEET_ID AS STRING), CAST(PLACEMENT_ID AS STRING)
+                     ORDER BY DATE_AND_TIME DESC NULLS LAST
+                   ) AS rn
+                 FROM all_rows
+               ),
+               latest AS (SELECT * FROM ranked WHERE rn = 1),
+               previous AS (SELECT * FROM ranked WHERE rn = 2),
+               changed_keys AS (
+                 SELECT DISTINCT
+                   CAST(l.DEAL_SHEET_ID AS STRING) AS deal_sheet_id,
+                   CAST(l.PLACEMENT_ID AS STRING) AS placement_id
+                 FROM latest l
+                 JOIN previous p
+                   ON CAST(l.DEAL_SHEET_ID AS STRING) = CAST(p.DEAL_SHEET_ID AS STRING)
+                  AND CAST(l.PLACEMENT_ID AS STRING) = CAST(p.PLACEMENT_ID AS STRING)
+                 WHERE ${changePredicate}
+               )
+               SELECT * FROM ranked
+               WHERE rn <= 2
+                 AND CAST(DEAL_SHEET_ID AS STRING) IN (SELECT deal_sheet_id FROM changed_keys)
+                 AND CAST(PLACEMENT_ID AS STRING) IN (SELECT placement_id FROM changed_keys)`;
+
+  const rows = await queryObjects(sql, 100000);
+  for (const raw of rows) {
+    const key = buildDealSheetPlacementCompositeKey(raw?.DEAL_SHEET_ID, raw?.PLACEMENT_ID);
+    if (!key) continue;
+    const rn = Number(raw.rn);
+    const cleaned = stripRateChangeHistoryMetaFields(raw);
+    if (!out.has(key)) out.set(key, { latest: null, previous: null });
+    const slot = out.get(key);
+    if (rn === 1) slot.latest = cleaned;
+    else if (rn === 2) slot.previous = cleaned;
+  }
+  for (const [key, pair] of [...out.entries()]) {
+    if (!pair.latest || !pair.previous) out.delete(key);
+  }
+
+  logLine(
+    `[ownership change logs] fetchDealSheetOwnershipChangePairsFromActive dataset=${datasetId} pairs=${out.size}`
+  );
+  return out;
+}
+
+/** Shared per-row context (candidate/placement/dates) for every ownership log row of a placement. */
+function buildOwnershipChangeLogContext(latestRow, nowIso) {
+  const tentative = latestRow?.TENTATIVE_DATE;
+  return {
+    DATE_AND_TIME: nowIso,
+    SKU_NO: null,
+    CONTRACT_ID: ownershipDisplayValueOrNull(latestRow?.CONTRACT_ID),
+    PLACEMENT_ID: latestRow?.PLACEMENT_ID == null ? null : String(latestRow.PLACEMENT_ID).trim(),
+    CANDIDATE_NAME: latestRow?.CANDIDATE_NAME ?? null,
+    CANDIDATE_EMAIL: latestRow?.CANDIDATE_EMAIL ?? null,
+    START_DATE: ownershipDateOnlyOrNull(latestRow?.START_DATE),
+    // Temporary: tentative end date + 1. Overwritten to the extension's START_DATE later, keyed by
+    // CONTRACT_ID (see overwriteOwnershipChangeLogEffectiveDatesFromExtensions).
+    EFFECTIVE_DATE: addOneDayToDateOnly(tentative),
+    END_DATE_PREVIOUS_OWNER: ownershipDateOnlyOrNull(tentative),
+    CHANGE_REASON_NOTES: null,
+    STATUS_REMARKS: null,
+    EDITED_BY: null,
+  };
+}
+
+/**
+ * Build ownership_change_logs rows for one placement's latest-vs-previous pair.
+ * One row per OWNERSHIP_CHANGE_DIFF_ROLES role whose owner changed. Plus, on a RECRUITER change,
+ * if the new recruiter's emp-no matches a hierarchy role the SAME person held in the previous row
+ * (e.g. they were the RM), a "vacated" row for that role (NEW_OWNER = 'NA').
+ */
+function buildOwnershipChangeLogRows(latestRow, previousRow) {
+  if (!latestRow || !previousRow) return [];
+  const nowIso = new Date().toISOString();
+  const ctx = buildOwnershipChangeLogContext(latestRow, nowIso);
+  const rows = [];
+
+  let recruiterChanged = false;
+  for (const r of OWNERSHIP_CHANGE_DIFF_ROLES) {
+    const latestKey = normalizeOwnershipValueForCompare(latestRow[r.changeField]);
+    const prevKey = normalizeOwnershipValueForCompare(previousRow[r.changeField]);
+    if (latestKey === "" || latestKey === prevKey) continue;
+    if (r.role === "RECRUITER") recruiterChanged = true;
+    rows.push({
+      ...ctx,
+      OWNERSHIP_ROLE: r.role,
+      NEW_OWNER_NAME: ownershipDisplayValueOrNull(latestRow[r.nameField]),
+      NEW_OWNER_EMP_NO: r.empField ? ownershipDisplayValueOrNull(latestRow[r.empField]) : null,
+      PREVIOUS_OWNER_NAME: ownershipDisplayValueOrNull(previousRow[r.nameField]),
+      PREVIOUS_OWNER_EMP_NO: r.empField ? ownershipDisplayValueOrNull(previousRow[r.empField]) : null,
+    });
+  }
+
+  // Vacated-role rows: the new recruiter previously held a hierarchy role on this deal, so that
+  // role's slot is now vacant (NEW_OWNER = 'NA'). Matched by emp-no on the PREVIOUS row.
+  if (recruiterChanged) {
+    const newRecruiterEmp = normalizeOwnershipValueForCompare(latestRow.RECRUITER_EMP_NO);
+    if (newRecruiterEmp !== "") {
+      for (const target of DEAL_RECRUITER_HIERARCHY_TARGETS) {
+        const prevEmp = normalizeOwnershipValueForCompare(previousRow[target.empNoColumn]);
+        if (prevEmp === "" || prevEmp !== newRecruiterEmp) continue;
+        rows.push({
+          ...ctx,
+          OWNERSHIP_ROLE: target.column,
+          NEW_OWNER_NAME: "NA",
+          NEW_OWNER_EMP_NO: "NA",
+          PREVIOUS_OWNER_NAME: ownershipDisplayValueOrNull(previousRow[target.column]),
+          PREVIOUS_OWNER_EMP_NO: ownershipDisplayValueOrNull(previousRow[target.empNoColumn]),
+        });
+      }
+    }
+  }
+
+  return rows;
+}
+
+/** Dedupe key: same placement + role + new owner + previous owner never logged twice. */
+function buildOwnershipChangeLogDedupeKey(row) {
+  const pid = row?.PLACEMENT_ID == null ? "" : String(row.PLACEMENT_ID).trim();
+  const role = row?.OWNERSHIP_ROLE == null ? "" : String(row.OWNERSHIP_ROLE).trim().toUpperCase();
+  if (!pid || !role) return "";
+  const parts = [
+    pid,
+    role,
+    normalizeOwnershipValueForCompare(row?.NEW_OWNER_NAME),
+    normalizeOwnershipValueForCompare(row?.NEW_OWNER_EMP_NO),
+    normalizeOwnershipValueForCompare(row?.PREVIOUS_OWNER_NAME),
+    normalizeOwnershipValueForCompare(row?.PREVIOUS_OWNER_EMP_NO),
+  ];
+  return parts.join("|");
+}
+
+/** Returns Set of dedupe keys already present in ownership_change_logs (looked up by PLACEMENT_ID). */
+async function fetchExistingOwnershipChangeLogKeysSet(logRows, options = {}) {
+  const out = new Set();
+  if (!logRows || logRows.length === 0) return out;
+
+  const { datasetId, tableId } = resolveBqDatasetTable(options);
+  const placementIds = [];
+  const seen = new Set();
+  for (const r of logRows) {
+    const pid = r?.PLACEMENT_ID == null ? "" : String(r.PLACEMENT_ID).trim();
+    if (!pid || seen.has(pid)) continue;
+    seen.add(pid);
+    placementIds.push(pid);
+  }
+  if (placementIds.length === 0) return out;
+
+  const chunkSize = 500;
+  for (let i = 0; i < placementIds.length; i += chunkSize) {
+    const chunk = placementIds.slice(i, i + chunkSize);
+    const inList = chunk.map((v) => `'${escapeSqlString(v)}'`).join(", ");
+    const sql = `SELECT PLACEMENT_ID, OWNERSHIP_ROLE, NEW_OWNER_NAME, NEW_OWNER_EMP_NO,
+                        PREVIOUS_OWNER_NAME, PREVIOUS_OWNER_EMP_NO
+                 FROM \`${config.projectId}.${datasetId}.${tableId}\`
+                 WHERE CAST(PLACEMENT_ID AS STRING) IN (${inList})`;
+    const rows = await queryObjects(sql, chunk.length * 10);
+    for (const row of rows) {
+      const key = buildOwnershipChangeLogDedupeKey(row);
+      if (key) out.add(key);
+    }
+  }
+  return out;
+}
+
+/** Insert ownership_change_logs rows (append-only; batch + existing-table dedupe). */
+async function insertOwnershipChangeLogBatch(logRows, insertIdBase, options = {}) {
+  if (!logRows || logRows.length === 0) {
+    logLine(`[ownership change logs] [BigQuery insertAll] SKIP: no rows to insert`);
+    return { inserted: 0, attempted: 0, errorBatches: 0 };
+  }
+
+  let rowsToInsert = logRows.map((row) => {
+    const next = { ...row };
+    const raw = next.ID;
+    if (raw == null || String(raw).trim() === "") next.ID = randomUUID();
+    return next;
+  });
+
+  const seenKeys = new Set();
+  let deduped = [];
+  let droppedDupBatch = 0;
+  for (const row of rowsToInsert) {
+    const key = buildOwnershipChangeLogDedupeKey(row);
+    if (key !== "") {
+      if (seenKeys.has(key)) {
+        droppedDupBatch++;
+        continue;
+      }
+      seenKeys.add(key);
+    }
+    deduped.push(row);
+  }
+  if (droppedDupBatch > 0) {
+    logLine(`[ownership change logs] dedupe(same batch): dropped=${droppedDupBatch} remaining=${deduped.length}`);
+  }
+
+  const skipExisting = options.skipExistingOwnershipChangeLogs !== false;
+  if (skipExisting && deduped.length > 0) {
+    const existingKeys = await fetchExistingOwnershipChangeLogKeysSet(deduped, {
+      datasetId: options.datasetId,
+      tableId: options.tableId,
+    });
+    if (existingKeys.size > 0) {
+      const filtered = [];
+      let skipped = 0;
+      for (const row of deduped) {
+        const key = buildOwnershipChangeLogDedupeKey(row);
+        if (key !== "" && existingKeys.has(key)) {
+          skipped++;
+          continue;
+        }
+        filtered.push(row);
+      }
+      deduped = filtered;
+      logLine(`[ownership change logs] [BigQuery insertAll] dedupe(existing in log table): skipped=${skipped} remaining=${deduped.length}`);
+    }
+  }
+
+  if (!deduped.length) {
+    logLine(`[ownership change logs] [BigQuery insertAll] SKIP: nothing left after dedupe`);
+    return { inserted: 0, attempted: 0, errorBatches: 0 };
+  }
+
+  const rowsForInsert = deduped.map((row) => {
+    const key = buildOwnershipChangeLogDedupeKey(row);
+    return key ? { ...row, _INSERT_ID: key } : row;
+  });
+
+  const result = await insertAll(rowsForInsert, {
+    insertIdBase,
+    datasetId: options.datasetId,
+    tableId: options.tableId,
+    insertIdField: "_INSERT_ID",
+  });
+  const hasErrors = result.errors && result.errors.length > 0;
+  logLine(
+    `[ownership change logs] [BigQuery insertAll] ${hasErrors ? "PARTIAL" : "OK"} attempted=${result.attempted} inserted=${result.inserted}`
+  );
+  return { inserted: result.inserted, attempted: result.attempted, errorBatches: hasErrors ? 1 : 0 };
+}
+
+/**
+ * Overwrite EFFECTIVE_DATE on ownership_change_logs rows once a real extension exists for the same
+ * CONTRACT_ID: set EFFECTIVE_DATE to the earliest EXTENSION START_DATE for that contract (the
+ * handover became effective when the extension started, replacing the temporary tentative+1 date).
+ * Idempotent — only touches rows whose EFFECTIVE_DATE differs from the resolved extension date.
+ */
+async function overwriteOwnershipChangeLogEffectiveDatesFromExtensions(options = {}) {
+  const dealSheetDatasetId =
+    typeof options.dealSheetDatasetId === "string" && options.dealSheetDatasetId.trim() !== ""
+      ? options.dealSheetDatasetId.trim()
+      : config.datasetId;
+  const { datasetId: logDatasetId, tableId: logTableId } = {
+    datasetId:
+      typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+        ? options.datasetId.trim()
+        : config.ownershipChangeLogDatasetId,
+    tableId:
+      typeof options.tableId === "string" && options.tableId.trim() !== ""
+        ? options.tableId.trim()
+        : config.ownershipChangeLogTableId,
+  };
+  const unionSql = buildActiveDealSheetsUnionSql(dealSheetDatasetId);
+
+  const sql = `
+    UPDATE \`${config.projectId}.${logDatasetId}.${logTableId}\` o
+    SET EFFECTIVE_DATE = ext.ext_start_date
+    FROM (
+      SELECT
+        UPPER(TRIM(CAST(CONTRACT_ID AS STRING))) AS contract_id_norm,
+        MIN(START_DATE) AS ext_start_date
+      FROM (${unionSql})
+      WHERE UPPER(TRIM(CAST(DEAL_TYPE AS STRING))) = 'EXTENSION'
+        AND CONTRACT_ID IS NOT NULL AND TRIM(CAST(CONTRACT_ID AS STRING)) != ''
+        AND START_DATE IS NOT NULL
+      GROUP BY contract_id_norm
+    ) ext
+    WHERE o.CONTRACT_ID IS NOT NULL
+      AND UPPER(TRIM(CAST(o.CONTRACT_ID AS STRING))) = ext.contract_id_norm
+      AND (o.EFFECTIVE_DATE IS NULL OR o.EFFECTIVE_DATE != ext.ext_start_date)
+  `;
+
+  const [job] = await bigquery.createQueryJob({ query: sql });
+  await job.getQueryResults();
+  const meta = job.metadata?.statistics?.query;
+  const updated = meta?.dmlStats?.updatedRowCount ?? null;
+  logLine(
+    `[ownership change logs] effective-date overwrite from extensions: updatedRows=${updated == null ? "n/a" : updated}`
+  );
+  return { updated: updated == null ? null : Number(updated) };
 }
 
 module.exports = {
@@ -2367,13 +4456,46 @@ module.exports = {
   applyNewHireDateFreeze,
   applyExtensionDateFreeze,
   applyExtensionStartDateForRow,
-  fetchEarliestDateAndTimeByDealSheetPlacementPairs,
-  resolveExtensionDatesForInsertRows,
+  applyExtensionStartDatesForInsertRows,
   fetchNewHireDatesFromActiveTable,
   resolveNewHireDatesForEndedRows,
   computeDealSheetFirstInsertDateStamps,
   fetchContractIdsByDealSheetIds,
   fetchContractIdsForExtensions,
+  fetchEmployeeDirectoryByEmails,
   buildActiveDealSheetsUnionSql,
   formatDateOnlyForSql,
+  EXTENSION_RUNRATE_HIERARCHY_COLUMNS,
+  EXTENSION_RUNRATE_ELIGIBLE_PLACEMENT_STATUSES,
+  isExtensionRunrateEligiblePlacementStatus,
+  buildRunrateEligiblePlacementStatusSqlPredicate,
+  EXTENSION_PARENT_DEAL_INHERIT_COLUMNS,
+  rowNeedsExtensionInsertBackfill,
+  rowNeedsExtensionRunrateBackfill,
+  fetchExtensionParentDealInheritByPlacementId,
+  fetchExtensionRunrateBackfillByPlacementId,
+  resolveContractIdsForRunrateMatchedExtensions,
+  applyExtensionInheritForInsertRows,
+  applyExtensionRunrateBackfillForInsertRows,
+  rowNeedsDealRecruiterHierarchyBackfill,
+  fetchDealRecruiterHierarchyByPlacementId,
+  applyDealRecruiterHierarchyForInsertRows,
+  fetchHierarchyLevelChainsByKey,
+  fetchDealSheetRecruiterChangePairsFromActive,
+  buildInorganicHierarchyLogCandidate,
+  buildInorganicHierarchyLogDedupeKey,
+  fetchExistingInorganicHierarchyLogKeysSet,
+  resolveInorganicHierarchyLogRows,
+  insertInorganicHierarchyLogBatch,
+  fetchOnsiteAmCsmHierarchyByKey,
+  applyOnsiteAmCsmHierarchyForRows,
+  fetchCsmHierarchyDivergenceCandidates,
+  mergeInorganicHierarchyLogCandidates,
+  fetchDealSheetOwnershipChangePairsFromActive,
+  buildOwnershipChangeLogRows,
+  buildOwnershipChangeLogDedupeKey,
+  fetchExistingOwnershipChangeLogKeysSet,
+  insertOwnershipChangeLogBatch,
+  overwriteOwnershipChangeLogEffectiveDatesFromExtensions,
+  applyPreviousRecruiterOnRecruiterChange,
 };

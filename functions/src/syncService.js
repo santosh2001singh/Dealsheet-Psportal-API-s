@@ -32,6 +32,16 @@ const {
   fetchLatestAdditionalCostLogRowsByKeys,
   fetchLatestTerminationReasonLogRowsByKeys,
   fetchContractRateChangePairsFromActive,
+  fetchDealSheetRecruiterChangePairsFromActive,
+  buildInorganicHierarchyLogCandidate,
+  fetchCsmHierarchyDivergenceCandidates,
+  mergeInorganicHierarchyLogCandidates,
+  resolveInorganicHierarchyLogRows,
+  insertInorganicHierarchyLogBatch,
+  fetchDealSheetOwnershipChangePairsFromActive,
+  buildOwnershipChangeLogRows,
+  insertOwnershipChangeLogBatch,
+  overwriteOwnershipChangeLogEffectiveDatesFromExtensions,
   hasBusinessColumnChanges,
   normalizeForCompare,
   resolveFirstInsertPlacementAllowlist,
@@ -1978,6 +1988,138 @@ async function syncRateChangeLogsFromBigQuery(params = {}) {
   };
 }
 
+/**
+ * Scans active deal-sheet tables for placements whose ASSIGNMENT_RECRUITER_EMAIL just changed
+ * (latest row vs the one before it); for each, resolves the new recruiter's identity + manager
+ * hierarchy (as of the placement's hire/extension date) and logs it to inorganic_hierarchy_logs.
+ * The deal sheet rows themselves are never modified by this scan.
+ */
+async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
+  const logDatasetId =
+    typeof params.bq_dataset === "string" && params.bq_dataset.trim() !== ""
+      ? params.bq_dataset.trim()
+      : config.inorganicHierarchyLogDatasetId;
+  const logTableId =
+    typeof params.bq_table === "string" && params.bq_table.trim() !== ""
+      ? params.bq_table.trim()
+      : config.inorganicHierarchyLogTableId;
+  const dealSheetDatasetId =
+    typeof params.deal_sheet_bq_dataset === "string" && params.deal_sheet_bq_dataset.trim() !== ""
+      ? params.deal_sheet_bq_dataset.trim()
+      : config.datasetId;
+
+  const startMs = Date.now();
+  logLine(
+    `[inorganic hierarchy logs BQ scan] === syncInorganicHierarchyLogsFromBigQuery START === dealSheetDataset=${dealSheetDatasetId} logTable=${config.projectId}.${logDatasetId}.${logTableId}`
+  );
+
+  const pairs = await fetchDealSheetRecruiterChangePairsFromActive({ datasetId: dealSheetDatasetId });
+  logLine(`[inorganic hierarchy logs BQ scan] recruiter-change pairs=${pairs.size}`);
+
+  const recruiterCandidates = [];
+  for (const [, { latest, previous }] of pairs) {
+    const candidate = buildInorganicHierarchyLogCandidate(latest, previous);
+    if (candidate) recruiterCandidates.push(candidate);
+  }
+
+  const csmCandidates = await fetchCsmHierarchyDivergenceCandidates({ datasetId: dealSheetDatasetId });
+
+  const candidates = mergeInorganicHierarchyLogCandidates(recruiterCandidates, csmCandidates);
+  const rows = await resolveInorganicHierarchyLogRows(candidates);
+
+  const result = await insertInorganicHierarchyLogBatch(rows, 0, {
+    datasetId: logDatasetId,
+    tableId: logTableId,
+  });
+
+  const elapsedStr = formatDuration(Date.now() - startMs);
+  logLine(
+    `[inorganic hierarchy logs BQ scan] DONE inserted=${result.inserted} recruiterChangePairs=${pairs.size} csmDivergences=${csmCandidates.length} candidates=${candidates.length} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
+  );
+
+  return {
+    inserted: result.inserted,
+    total: pairs.size,
+    csmDivergences: csmCandidates.length,
+    candidates: candidates.length,
+    errorBatches: result.errorBatches,
+    elapsed: elapsedStr,
+  };
+}
+
+/**
+ * Scans active deal-sheet tables for per-role ownership handovers (recruiter / onsite AM / CSM
+ * level, latest row vs the row before it) and appends one ownership_change_logs row per changed
+ * role — plus a "vacated" row when a hierarchy person became the recruiter. EFFECTIVE_DATE starts
+ * as tentative+1 and is later overwritten by the extension's start date (see
+ * syncOwnershipChangeLogEffectiveDatesFromExtensions, run in the insert trigger).
+ */
+async function syncOwnershipChangeLogsFromBigQuery(params = {}) {
+  const logDatasetId =
+    typeof params.bq_dataset === "string" && params.bq_dataset.trim() !== ""
+      ? params.bq_dataset.trim()
+      : config.ownershipChangeLogDatasetId;
+  const logTableId =
+    typeof params.bq_table === "string" && params.bq_table.trim() !== ""
+      ? params.bq_table.trim()
+      : config.ownershipChangeLogTableId;
+  const dealSheetDatasetId =
+    typeof params.deal_sheet_bq_dataset === "string" && params.deal_sheet_bq_dataset.trim() !== ""
+      ? params.deal_sheet_bq_dataset.trim()
+      : config.datasetId;
+
+  const startMs = Date.now();
+  logLine(
+    `[ownership change logs BQ scan] === syncOwnershipChangeLogsFromBigQuery START === dealSheetDataset=${dealSheetDatasetId} logTable=${config.projectId}.${logDatasetId}.${logTableId}`
+  );
+
+  const pairs = await fetchDealSheetOwnershipChangePairsFromActive({ datasetId: dealSheetDatasetId });
+
+  const rows = [];
+  for (const [, { latest, previous }] of pairs) {
+    rows.push(...buildOwnershipChangeLogRows(latest, previous));
+  }
+
+  const result = await insertOwnershipChangeLogBatch(rows, 0, {
+    datasetId: logDatasetId,
+    tableId: logTableId,
+  });
+
+  const elapsedStr = formatDuration(Date.now() - startMs);
+  logLine(
+    `[ownership change logs BQ scan] DONE inserted=${result.inserted} changedPairs=${pairs.size} builtRows=${rows.length} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
+  );
+
+  return {
+    inserted: result.inserted,
+    total: pairs.size,
+    builtRows: rows.length,
+    errorBatches: result.errorBatches,
+    elapsed: elapsedStr,
+  };
+}
+
+/**
+ * Overwrites EFFECTIVE_DATE on ownership_change_logs from the matching CONTRACT_ID's extension
+ * start date. Runs in the insert trigger (where extensions are created).
+ */
+async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
+  const dealSheetDatasetId =
+    typeof params.deal_sheet_bq_dataset === "string" && params.deal_sheet_bq_dataset.trim() !== ""
+      ? params.deal_sheet_bq_dataset.trim()
+      : config.datasetId;
+  const startMs = Date.now();
+  logLine(`[ownership change logs] === syncOwnershipChangeLogEffectiveDatesFromExtensions START ===`);
+  const result = await overwriteOwnershipChangeLogEffectiveDatesFromExtensions({
+    dealSheetDatasetId,
+    datasetId: params.bq_dataset,
+    tableId: params.bq_table,
+  });
+  const elapsedStr = formatDuration(Date.now() - startMs);
+  logLine(`[ownership change logs] effective-date overwrite DONE updated=${result.updated == null ? "n/a" : result.updated} elapsed=${elapsedStr}`);
+  return { updated: result.updated, elapsed: elapsedStr };
+}
+
 const UPDATE_SYNC_PRIORITY_PLACEMENT_STATUSES = new Set(["STARTED", "BOOKED", "ACTIVE"]);
 
 function normalizeUpdateSyncPlacementStatusKey(status) {
@@ -2222,6 +2364,9 @@ module.exports = {
   syncEnrichedDealSheetCandidatesToBigQuery,
   syncExistingActiveDealSheetUpdatesFromBigQuery,
   syncRateChangeLogsFromBigQuery,
+  syncInorganicHierarchyLogsFromBigQuery,
+  syncOwnershipChangeLogsFromBigQuery,
+  syncOwnershipChangeLogEffectiveDatesFromExtensions,
   refreshPlacementRecordToBigQuery,
   backfillPlacementRecordFromNexus,
   bulkBackfillPlacementRecordsFromNexus,

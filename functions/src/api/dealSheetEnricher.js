@@ -48,6 +48,7 @@ const {
   mapCanadaTypeFromTenNintyNine,
   resolveNewHireDateFromSubmittalNotes,
   resolveNewHireDateForDealRow,
+  resolveExtensionDateForExtensionRow,
   resolveTentativeDateForPlacementRow,
 } = require("../columnMappings");
 const { computeBonusTotals } = require("../bonusTotals");
@@ -61,6 +62,7 @@ const { resolveActiveDealSheetTableId } = require("../recruiterDomainTables");
 const {
   fetchContractIdsByDealSheetIds,
   fetchContractIdsForExtensions,
+  fetchEmployeeDirectoryByEmails,
 } = require("../bigQueryClient");
 
 /**
@@ -999,6 +1001,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       ? notesByPlacementId.get(String(placementIdForNotes)) ?? []
       : [];
     const newHireDate = resolveNewHireDateForDealRow(dealSheetPart?.DEAL_TYPE, notesForPlacement);
+    const extensionDate = resolveExtensionDateForExtensionRow(dealSheetPart?.DEAL_TYPE, submittalRow);
 
     const canadaTypePart = isCynetHealthCanadaRecruiter(userPart?.ASSIGNMENT_RECRUITER_EMAIL)
       ? { TYPE: mapCanadaTypeFromTenNintyNine(detail) }
@@ -1032,6 +1035,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       ),
       TERMINATION_REASON: terminationReason,
       NEW_HIRE_DATE: newHireDate,
+      EXTENSION_DATE: extensionDate,
     };
     const newRateFamilyPart = isCynetHealthCanadaRecruiter(row?.ASSIGNMENT_RECRUITER_EMAIL)
       ? {}
@@ -1065,6 +1069,28 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
   if (skippedDueToApiFailure > 0) {
     logLine(
       `[enriched sync] STEP 3/4 ENRICH: skipped ${skippedDueToApiFailure} candidate(s) due to API failures (no BigQuery insert; will retry next scheduled run)`
+    );
+  }
+
+  const recruiterEmails = [];
+  const recruiterEmailSeen = new Set();
+  for (const row of combined) {
+    const email = row?.ASSIGNMENT_RECRUITER_EMAIL;
+    if (email == null) continue;
+    const norm = String(email).trim().toLowerCase();
+    if (!norm || recruiterEmailSeen.has(norm)) continue;
+    recruiterEmailSeen.add(norm);
+    recruiterEmails.push(norm);
+  }
+  if (recruiterEmails.length > 0) {
+    const directoryByEmail = await fetchEmployeeDirectoryByEmails(recruiterEmails);
+    for (const row of combined) {
+      const email = row?.ASSIGNMENT_RECRUITER_EMAIL;
+      const norm = email == null ? "" : String(email).trim().toLowerCase();
+      row.RECRUITER_EMP_NO = norm ? directoryByEmail.get(norm)?.employeeId ?? null : null;
+    }
+    logLine(
+      `[enriched sync] STEP 3/4 ENRICH: RECRUITER_EMP_NO resolved for ${directoryByEmail.size}/${recruiterEmails.length} unique recruiter email(s)`
     );
   }
 

@@ -4,10 +4,13 @@
  * 1. dealSheetSync — HTTP (v2 onRequest, up to 3600s)
  * 2. rateChangeLogSync — HTTP rate-change log (BigQuery CONTRACT_ID scan)
  * 3. dealSheetSyncTrigger — scheduled insert (new deal sheets only)
- * 4. dealSheetSyncUpdateTrigger — scheduled update (existing BQ composites)
+ * 4. dealSheetSyncUpdateTrigger — scheduled update (existing BQ composites); also runs the
+ *    recruiter-reassignment / CSM-divergence audit log scan (inorganic_hierarchy_logs) as its
+ *    last step, on the same invocation
  * 5. dealSheetSyncOfferRejected — HTTP ended / offer-rejected stream (manual)
  * 6. rateChangeLogSyncTrigger — scheduled rate-change logs (BigQuery CONTRACT_ID scan)
  * 7. bulkBackfillByPlacementId — HTTP bulk Nexus backfill (no BQ baseline checks)
+ * 8. inorganicHierarchyLogSync — HTTP manual/debug trigger for the audit log scan (see 4.)
  */
 
 const { onRequest } = require("firebase-functions/v2/https");
@@ -17,6 +20,9 @@ const {
   syncEnrichedDealSheetCandidatesToBigQuery,
   syncExistingActiveDealSheetUpdatesFromBigQuery,
   syncRateChangeLogsFromBigQuery,
+  syncInorganicHierarchyLogsFromBigQuery,
+  syncOwnershipChangeLogsFromBigQuery,
+  syncOwnershipChangeLogEffectiveDatesFromExtensions,
   refreshPlacementRecordToBigQuery,
   bulkBackfillPlacementRecordsFromNexus,
   resolveBulkBackfillMaxPlacementIds,
@@ -207,6 +213,64 @@ exports.rateChangeLogSync = onRequest(
     } catch (error) {
       const executionTimeMs = Date.now() - wallStartMs;
       logError(`[rateChangeLogSync] FAILED after ${executionTimeMs}ms`, error);
+
+      res.status(500).json({
+        success: false,
+        error: error.message,
+        executionTimeMs,
+      });
+    }
+  }
+);
+
+/**
+ * HTTP: manual/debug trigger for the recruiter-reassignment + CSM-divergence audit log scan.
+ * The scheduled path is dealSheetSyncUpdateTrigger (runs this automatically as its last step);
+ * this endpoint exists only for on-demand testing/re-runs.
+ */
+exports.inorganicHierarchyLogSync = onRequest(
+  {
+    region: REGION,
+    timeoutSeconds: HTTP_TIMEOUT_SEC,
+    memory: HTTP_MEMORY,
+  },
+  async (req, res) => {
+    const wallStartMs = Date.now();
+    try {
+      const result = await withTimingAsync("inorganicHierarchyLogSync", async () => {
+        const q = req.query || {};
+        const bqTableRaw = typeof q.bq_table === "string" ? q.bq_table.trim() : "";
+        const bqDatasetRaw = typeof q.bq_dataset === "string" ? q.bq_dataset.trim() : "";
+        const dealSheetDatasetRaw =
+          typeof q.deal_sheet_bq_dataset === "string" ? q.deal_sheet_bq_dataset.trim() : "";
+        logLine(
+          `[inorganicHierarchyLogSync] HTTP Gen2 region=${REGION} timeoutSeconds=${HTTP_TIMEOUT_SEC} method=${req.method} bq_table=${bqTableRaw || "default"} bq_dataset=${bqDatasetRaw || "default"} deal_sheet_bq_dataset=${dealSheetDatasetRaw || "default"}`
+        );
+
+        const params = {};
+        if (bqTableRaw) params.bq_table = bqTableRaw;
+        if (bqDatasetRaw) params.bq_dataset = bqDatasetRaw;
+        if (dealSheetDatasetRaw) params.deal_sheet_bq_dataset = dealSheetDatasetRaw;
+
+        logLine(`[inorganicHierarchyLogSync] Params object: ${JSON.stringify(params)}`);
+        logLine(`[inorganicHierarchyLogSync] Invoking syncInorganicHierarchyLogsFromBigQuery`);
+        return syncInorganicHierarchyLogsFromBigQuery(params);
+      });
+
+      const executionTimeMs = Date.now() - wallStartMs;
+      logLine(
+        `[inorganicHierarchyLogSync] DONE success inserted=${result.inserted} total=${result.total} candidates=${result.candidates} errorBatches=${result.errorBatches} executionTimeMs=${executionTimeMs}`
+      );
+
+      res.status(200).json({
+        success: true,
+        message: "Inorganic hierarchy log sync completed successfully",
+        result,
+        executionTimeMs,
+      });
+    } catch (error) {
+      const executionTimeMs = Date.now() - wallStartMs;
+      logError(`[inorganicHierarchyLogSync] FAILED after ${executionTimeMs}ms`, error);
 
       res.status(500).json({
         success: false,
@@ -499,7 +563,23 @@ exports.dealSheetSyncTrigger = onSchedule(
         `[dealSheetSyncTrigger] Pipeline result inserted=${result.inserted} candidatesProcessed=${result.candidatesProcessed} errorBatches=${result.errorBatches} elapsed=${result.elapsed || "n/a"} pagesProcessed=${result.pagesProcessedThisRun ?? "n/a"}`
       );
 
-      return { success: true, result };
+      // Extensions get inserted here; reconcile ownership_change_logs EFFECTIVE_DATE from the
+      // matching CONTRACT_ID's extension start date (overwrites the temporary tentative+1 value).
+      logLine("[dealSheetSyncTrigger] Invoking syncOwnershipChangeLogEffectiveDatesFromExtensions");
+      let ownershipEffectiveDateResult = null;
+      try {
+        ownershipEffectiveDateResult = await syncOwnershipChangeLogEffectiveDatesFromExtensions({
+          deal_sheet_bq_dataset: bqDataset,
+          bq_table: "ownership_change_logs",
+        });
+        logLine(
+          `[dealSheetSyncTrigger] ownership effective-date overwrite updated=${ownershipEffectiveDateResult.updated == null ? "n/a" : ownershipEffectiveDateResult.updated} elapsed=${ownershipEffectiveDateResult.elapsed || "n/a"}`
+        );
+      } catch (effErr) {
+        logError("[dealSheetSyncTrigger] ownership effective-date overwrite FAILED (non-fatal)", effErr);
+      }
+
+      return { success: true, result, ownershipEffectiveDate: ownershipEffectiveDateResult };
     });
   }
 );
@@ -545,7 +625,43 @@ exports.dealSheetSyncUpdateTrigger = onSchedule(
         `[dealSheetSyncUpdateTrigger] Pipeline result checked=${result.checked} appended=${result.appended} no_change=${result.no_change} not_found=${result.not_found} no_baseline=${result.no_baseline ?? 0} skipped_date=${result.skipped_date} errors=${result.errors} priorityTotal=${result.priorityTotal ?? "n/a"} priorityChecked=${result.priorityChecked ?? "n/a"} batchTotal=${result.batchTotal ?? "n/a"} batchCheckedThisRun=${result.batchCheckedThisRun ?? "n/a"} batchOffsetEnd=${result.batchOffsetEnd ?? result.targetOffsetEnd ?? "n/a"} targetTotal=${result.targetTotal ?? result.pairTotal ?? "n/a"} hasMore=${result.hasMore ? "yes" : "no"} elapsed=${result.elapsed || "n/a"}`
       );
 
-      return { success: true, result };
+      logLine("[dealSheetSyncUpdateTrigger] Invoking syncInorganicHierarchyLogsFromBigQuery (recruiter-change + CSM-divergence scan)");
+      let inorganicHierarchyLogResult = null;
+      try {
+        inorganicHierarchyLogResult = await syncInorganicHierarchyLogsFromBigQuery({
+          bq_dataset: bqDataset,
+          bq_table: "inorganic_hierarchy_logs",
+        });
+        logLine(
+          `[dealSheetSyncUpdateTrigger] inorganic hierarchy log result inserted=${inorganicHierarchyLogResult.inserted} recruiterChangePairs=${inorganicHierarchyLogResult.total} csmDivergences=${inorganicHierarchyLogResult.csmDivergences} errorBatches=${inorganicHierarchyLogResult.errorBatches} elapsed=${inorganicHierarchyLogResult.elapsed || "n/a"}`
+        );
+      } catch (inorganicErr) {
+        // Non-fatal: the main deal-sheet update already succeeded above; don't fail the whole
+        // trigger run over the audit-log scan.
+        logError("[dealSheetSyncUpdateTrigger] inorganic hierarchy log scan FAILED (non-fatal)", inorganicErr);
+      }
+
+      logLine("[dealSheetSyncUpdateTrigger] Invoking syncOwnershipChangeLogsFromBigQuery (per-role ownership handover scan)");
+      let ownershipChangeLogResult = null;
+      try {
+        ownershipChangeLogResult = await syncOwnershipChangeLogsFromBigQuery({
+          bq_dataset: bqDataset,
+          bq_table: "ownership_change_logs",
+        });
+        logLine(
+          `[dealSheetSyncUpdateTrigger] ownership change log result inserted=${ownershipChangeLogResult.inserted} changedPairs=${ownershipChangeLogResult.total} builtRows=${ownershipChangeLogResult.builtRows} errorBatches=${ownershipChangeLogResult.errorBatches} elapsed=${ownershipChangeLogResult.elapsed || "n/a"}`
+        );
+      } catch (ownershipErr) {
+        // Non-fatal, same as the inorganic scan above.
+        logError("[dealSheetSyncUpdateTrigger] ownership change log scan FAILED (non-fatal)", ownershipErr);
+      }
+
+      return {
+        success: true,
+        result,
+        inorganicHierarchyLog: inorganicHierarchyLogResult,
+        ownershipChangeLog: ownershipChangeLogResult,
+      };
     });
   }
 );
@@ -701,4 +817,8 @@ exports.rateChangeLogSyncTrigger = onSchedule(
     });
   }
 );
+
+// Recruiter-reassignment / CSM-divergence audit log (inorganic_hierarchy_logs) is no longer a
+// separate schedule — it runs as the last step of dealSheetSyncUpdateTrigger above, right after
+// syncExistingActiveDealSheetUpdatesFromBigQuery, on the same invocation/schedule.
 

@@ -1,6 +1,9 @@
 -- Domain-routed active deal sheet tables (replace legacy ch_active_records).
 -- Manual BigQuery-edited columns: see MANUAL_COLUMNS in functions/src/columnMappings.js
 -- Run in BigQuery after migration. Optional: DROP TABLE IF EXISTS `cynetdatabase.rr_project_data.ch_active_records`;
+--
+-- LEVEL_2_CSM/LEVEL_3_CSM/LEVEL_4_CSM are NOT manual — they're auto-computed on every insert from
+-- ONSITE_AM_EMAIL's manager hierarchy (see applyOnsiteAmCsmHierarchyForRows in bigQueryClient.js).
 
 CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_deal_sheet` (
   CANDIDATE_NAME STRING,
@@ -89,6 +92,7 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_deal_shee
   MSP_NAME STRING,
   LINE_OF_BUSINESS STRING,
   RECRUITER_ID INT64,
+  RECRUITER_EMP_NO STRING,
   SUBMISSION_DATE TIMESTAMP,
   ONB_CAND_DOB DATE,
   ONB_I9_RECIEVED STRING,
@@ -203,3 +207,11 @@ ALTER TABLE `cynetdatabase.rr_project_data.cynet_health_canada_deal_sheet`
 
 CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_locums_deal_sheet`
 LIKE `cynetdatabase.rr_project_data.cynet_health_deal_sheet`;
+
+-- Idempotent column add for tables that already existed before RECRUITER_EMP_NO was introduced.
+ALTER TABLE `cynetdatabase.rr_project_data.cynet_health_deal_sheet`
+  ADD COLUMN IF NOT EXISTS RECRUITER_EMP_NO STRING;
+ALTER TABLE `cynetdatabase.rr_project_data.cynet_health_canada_deal_sheet`
+  ADD COLUMN IF NOT EXISTS RECRUITER_EMP_NO STRING;
+ALTER TABLE `cynetdatabase.rr_project_data.cynet_locums_deal_sheet`
+  ADD COLUMN IF NOT EXISTS RECRUITER_EMP_NO STRING;
