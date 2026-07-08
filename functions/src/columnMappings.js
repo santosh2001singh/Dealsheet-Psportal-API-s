@@ -1172,11 +1172,12 @@ function mapJobSubmittalToBq(submittalRow, jobObj) {
   const submitted = submittalRow.submitted_date;
   const submittedStr = submitted == null || String(submitted).trim() === ""
     ? null : String(submitted).trim();
-  const startRaw =
-    submittalRow?.start_date == null || String(submittalRow.start_date).trim() === ""
-      ? null
-      : String(submittalRow.start_date).trim();
-  const startDate = startRaw;
+  // START_DATE: submittal's own start_date, falling back to the job's start_date when the submittal
+  // has none (some submittals — e.g. offer-rejected — come back with start_date null while the job
+  // still carries the intended start). Mirrors the END_DATE / TENTATIVE_DATE job fallback.
+  const startRaw = firstNonEmptyDate(submittalRow?.start_date, jobObj?.start_date);
+  const startDate =
+    startRaw == null ? null : (formatDateStringForBq(startRaw) ?? String(startRaw).trim());
   const tentativeRaw = firstNonEmptyDate(submittalRow?.end_date, jobObj?.end_date);
   const tentativeDate = formatDateStringForBq(tentativeRaw) ?? (
     tentativeRaw == null || String(tentativeRaw).trim() === ""
@@ -1594,7 +1595,12 @@ const MANUAL_COLUMNS = new Set([
   "CREDENTIALING_SPECIALIST",
   "DELIVERY_DIRECTOR",
   "DELIVERY_DIRECTOR_EMP_NO",
+  // DELIVERY_POC + companions are auto-derived from the hierarchy on first insert
+  // (applyDeliveryPocForInsertRows) then frozen — carried forward like any manual column and only
+  // computed when currently empty, so a set value (derived or hand-edited) is never overwritten.
   "DELIVERY_POC",
+  "DELIVERY_POC_EMP_NO",
+  "DELIVERY_POC_EMAIL",
   "DIRECTOR_CLIENT_PARTNERSHIP",
   "DIVERSITY_STATUS",
   "DT_RATE",

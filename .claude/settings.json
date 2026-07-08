@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(node -e ' *)",
-      "Bash(node -e \"require\\('./src/index.js'\\); console.log\\('OK'\\)\")"
+      "Bash(node -e \"require\\('./src/index.js'\\); console.log\\('OK'\\)\")",
+      "Bash(node -e \"require\\('./src/bigQueryClient'\\); require\\('./src/index.js'\\); console.log\\('load OK'\\);\")",
+      "Bash(awk '/API_OWNED_COLUMNS = /,/\\\\]\\\\\\)/' src/columnMappings.js)",
+      "Bash(bq query --use_legacy_sql=false --format=json --project_id=cynetdatabase ' *)"
     ]
   }
 }

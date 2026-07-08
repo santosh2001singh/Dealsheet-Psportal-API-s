@@ -65,10 +65,19 @@ const HIERARCHY_DESIGNATION_SYNONYMS = {
     "srvp",
     "vp srvp",
     "vp/srvp",
+    "avp",
+    "associate vice president",
     "associate vice president - delivery",
     "associate vice president delivery",
   ],
 };
+
+/**
+ * Trailing department/qualifier suffixes real Google Workspace titles append to a role, e.g.
+ * "Vice President - Delivery", "AVP - Delivery", "Recruitment Manager - REC". These are stripped
+ * before the synonym lookup so the base role still matches.
+ */
+const DESIGNATION_TITLE_TRAILING_QUALIFIER = /\s*[-–/]\s*(delivery|rec|recruitment|staffing)\s*$/;
 
 /** normalized synonym -> hierarchy column (built once at module load). */
 const SYNONYM_TO_COLUMN = new Map();
@@ -95,7 +104,15 @@ function normalizeDesignationTitle(title) {
 function resolveHierarchyColumnForTitle(title) {
   const normalized = normalizeDesignationTitle(title);
   if (!normalized) return null;
-  return SYNONYM_TO_COLUMN.get(normalized) ?? null;
+  const direct = SYNONYM_TO_COLUMN.get(normalized);
+  if (direct) return direct;
+  // Retry after stripping a trailing " - Delivery"/" - REC"/etc. qualifier (real titles like
+  // "Vice President - Delivery" carry the department; the base role is what's in the synonym map).
+  const stripped = normalized.replace(DESIGNATION_TITLE_TRAILING_QUALIFIER, "").trim();
+  if (stripped && stripped !== normalized) {
+    return SYNONYM_TO_COLUMN.get(stripped) ?? null;
+  }
+  return null;
 }
 
 /**
@@ -218,10 +235,136 @@ const OWNERSHIP_CHANGE_DIFF_ROLES = [
 ];
 Object.freeze(OWNERSHIP_CHANGE_DIFF_ROLES);
 
+/**
+ * The designations whose deal-sheet regular hierarchy fields are AUTO-managed (the same set the
+ * inorganic log tracks). SECONDARY_RECRUITER and SECONDARY_AM are deliberately excluded — they are
+ * manual-only fields, never auto-filled or moved.
+ */
+const MANAGED_HIERARCHY_DESIGNATIONS = Object.freeze(Object.keys(DESIGNATION_TO_INORGANIC_LOG_COLUMN));
+
+/** designation -> { column, empNoColumn }, or null. */
+function hierarchyTargetForDesignation(designation) {
+  return DEAL_RECRUITER_HIERARCHY_TARGETS.find((t) => t.column === designation) || null;
+}
+
+/** Emp-no identity key: unwrap {value}, trim, lowercase; "" when empty. */
+function normalizeEmpNoKey(value) {
+  if (value == null) return "";
+  const unwrapped = typeof value === "object" && value !== null && "value" in value ? value.value : value;
+  if (unwrapped == null) return "";
+  return String(unwrapped).trim().toLowerCase();
+}
+
+/**
+ * Person-centric (emp-no) reconciliation of a placement's FROZEN regular recruiter-hierarchy fields
+ * against the recruiter's CURRENT live manager chain.
+ *
+ * Rules (all confirmed by the business):
+ *  - A person already sitting in a managed regular field who now holds a DIFFERENT managed
+ *    designation in the live chain is MOVED: their old field is vacated (set null) and the new
+ *    role's field takes their name + emp-no. Same emp-no travels with them.
+ *  - Collision (the mover's new role field is held by a DIFFERENT frozen person): the mover wins
+ *    ("new wins, old displaced"); the displaced person, if not itself a mover, is surfaced as an
+ *    inorganic person.
+ *  - A frozen person no longer anywhere in the live chain is LEFT FROZEN (no vacate) — unless
+ *    displaced by a collision.
+ *  - An emp-no present in the live chain but NOT in the frozen set is a genuinely NEW person and is
+ *    surfaced for the inorganic log — never written into a regular field.
+ *
+ * @param {object} storedRow - the placement's latest row (frozen regular hierarchy name+emp fields)
+ * @param {Object<string,{name:?string,empNo:?string}>} currentByDesignation - live chain resolved
+ *        to managed-designation -> {name, empNo} (closest level wins)
+ * @returns {{moves:object[], updatedFields:object, newPersons:object[], changed:boolean}}
+ *          moves: [{ empKey, name, empNoRaw, fromRole, toRole, displacedName, displacedEmpNoRaw }]
+ *          updatedFields: regular columns to write back (old cleared to null, new set)
+ *          newPersons: [{ empKey, designation, name, empNoRaw }] -> inorganic log
+ */
+function computeRecruiterHierarchyRoleChanges(storedRow, currentByDesignation) {
+  const row = storedRow && typeof storedRow === "object" ? storedRow : {};
+  const current =
+    currentByDesignation && typeof currentByDesignation === "object" ? currentByDesignation : {};
+
+  // frozen: empKey -> { designation, name, empNoRaw }  (first managed designation wins per emp-no)
+  const frozenByEmp = new Map();
+  for (const designation of MANAGED_HIERARCHY_DESIGNATIONS) {
+    const target = hierarchyTargetForDesignation(designation);
+    if (!target) continue;
+    const empKey = normalizeEmpNoKey(row[target.empNoColumn]);
+    if (!empKey || frozenByEmp.has(empKey)) continue;
+    frozenByEmp.set(empKey, {
+      designation,
+      name: row[target.column] ?? null,
+      empNoRaw: row[target.empNoColumn] ?? null,
+    });
+  }
+
+  // current: empKey -> { designation, name, empNoRaw }
+  const currentByEmp = new Map();
+  for (const designation of MANAGED_HIERARCHY_DESIGNATIONS) {
+    const info = current[designation];
+    if (!info) continue;
+    const empKey = normalizeEmpNoKey(info.empNo);
+    if (!empKey || currentByEmp.has(empKey)) continue;
+    currentByEmp.set(empKey, { designation, name: info.name ?? null, empNoRaw: info.empNo ?? null });
+  }
+
+  // Frozen person now holding a DIFFERENT managed designation => move.
+  const moves = [];
+  const moverEmps = new Set();
+  for (const [empKey, frozen] of frozenByEmp) {
+    const cur = currentByEmp.get(empKey);
+    if (!cur) continue; // disappeared -> leave frozen
+    if (cur.designation === frozen.designation) continue; // unchanged
+    moves.push({ empKey, name: cur.name, empNoRaw: cur.empNoRaw, fromRole: frozen.designation, toRole: cur.designation });
+    moverEmps.add(empKey);
+  }
+
+  const updatedFields = {};
+  const displaced = [];
+  if (moves.length > 0) {
+    const frozenOccupantByDesignation = {};
+    for (const [empKey, frozen] of frozenByEmp) {
+      frozenOccupantByDesignation[frozen.designation] = { empKey, ...frozen };
+    }
+    // Vacate each mover's old field first...
+    for (const mv of moves) {
+      const fromTarget = hierarchyTargetForDesignation(mv.fromRole);
+      updatedFields[fromTarget.column] = null;
+      updatedFields[fromTarget.empNoColumn] = null;
+    }
+    // ...then fill each mover's new field (overwriting any occupant — "new wins").
+    for (const mv of moves) {
+      const toTarget = hierarchyTargetForDesignation(mv.toRole);
+      const occupant = frozenOccupantByDesignation[mv.toRole];
+      const isCollision = occupant && occupant.empKey !== mv.empKey;
+      mv.displacedName = isCollision ? occupant.name : null;
+      mv.displacedEmpNoRaw = isCollision ? occupant.empNoRaw : null;
+      mv.displacedEmpKey = isCollision ? occupant.empKey : null;
+      updatedFields[toTarget.column] = mv.name;
+      updatedFields[toTarget.empNoColumn] = mv.empNoRaw;
+    }
+    for (const mv of moves) {
+      if (mv.displacedEmpKey && !moverEmps.has(mv.displacedEmpKey)) {
+        displaced.push({ empKey: mv.displacedEmpKey, designation: mv.toRole, name: mv.displacedName, empNoRaw: mv.displacedEmpNoRaw });
+      }
+    }
+  }
+
+  const newPersons = [];
+  for (const [empKey, cur] of currentByEmp) {
+    if (frozenByEmp.has(empKey)) continue;
+    newPersons.push({ empKey, designation: cur.designation, name: cur.name, empNoRaw: cur.empNoRaw });
+  }
+  for (const d of displaced) newPersons.push(d);
+
+  return { moves, updatedFields, newPersons, changed: moves.length > 0 };
+}
+
 module.exports = {
   DEAL_RECRUITER_HIERARCHY_TARGETS,
   HIERARCHY_DESIGNATION_SYNONYMS,
   DESIGNATION_TO_INORGANIC_LOG_COLUMN,
+  MANAGED_HIERARCHY_DESIGNATIONS,
   CSM_LEVEL_TARGETS,
   CSM_LEVEL_TO_INORGANIC_COLUMN,
   CSM_HIERARCHY_EXCLUDED_TITLES,
@@ -230,4 +373,6 @@ module.exports = {
   resolveCsmLevelsFromChain,
   normalizeDesignationTitle,
   resolveHierarchyColumnForTitle,
+  hierarchyTargetForDesignation,
+  computeRecruiterHierarchyRoleChanges,
 };

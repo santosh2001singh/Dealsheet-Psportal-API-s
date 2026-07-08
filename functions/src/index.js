@@ -40,16 +40,23 @@ const ENDED_BACKFILL_SUBMITTAL_CODES = "EARLY_TERM,COMPLETED,CANCELLED,CANCELED"
 const OFFER_REJECTED_SYNC_CHECKPOINT_KEY = "offer-rejected-ended-records";
 /** Firestore pair-index cursor for scheduled active update sync (distinct from Nexus page checkpoints) */
 const ACTIVE_UPDATE_SYNC_CHECKPOINT_KEY = "active-deal-sheet-update-cursor";
-/** First-insert placement allowlist for new DEAL_SHEET_ID+PLACEMENT_ID baselines on active `dealSheetSyncTrigger` (always STARTED/BOOKED) */
-const ACTIVE_BOOTSTRAP_FIRST_INSERT_PLACEMENT_STATUSES = "STARTED,BOOKED";
+/** Firestore submittal-page cursor for scheduled active INSERT trigger. On a socket-hangup / thrown
+ *  error mid-run the failed page is saved here and the next run resumes from it; once every page is
+ *  processed the doc is deleted (clear_checkpoint_on_complete) so the next run rescans from page 1. */
+const ACTIVE_INSERT_SYNC_CHECKPOINT_KEY = "active-deal-sheet-insert-page-cursor";
+/** First-insert placement allowlist for new DEAL_SHEET_ID+PLACEMENT_ID baselines on active `dealSheetSyncTrigger`
+ *  (STARTED/BOOKED, plus DID NOT ACCEPT for the offer-rejected VERBAL candidates admitted below). */
+const ACTIVE_BOOTSTRAP_FIRST_INSERT_PLACEMENT_STATUSES = "STARTED,BOOKED,DID NOT ACCEPT";
 /** First-insert allowlist for `dealSheetSyncOfferRejected` ended tables (wider than active scheduled) */
 const ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES =
   "STARTED,BOOKED,ENDED,ENDED<30,DID NOT START,DID NOT ACCEPT";
 /** Active HTTP/trigger + scheduled update: only insert rows with START_DATE on or after this day (UTC). */
 const DEAL_SHEET_MIN_START_DATE_MS = Date.UTC(2026, 4, 1);
 
-/** Nexus submittal filter for scheduled insert trigger (new deal sheets only) */
-const ACTIVE_BOOTSTRAP_SUBMITTAL_CODES = "PERM_STARTS,ACTIVE,BOOKED";
+/** Nexus submittal filter for scheduled insert trigger (new deal sheets only).
+ *  OFFER_REJECTED included so offer-rejected candidates (deal sheet only ever VERBAL) are picked up
+ *  too — their VERBAL deal sheet is admitted via verbal_for_offer_rejected (see dealSheetSyncTrigger). */
+const ACTIVE_BOOTSTRAP_SUBMITTAL_CODES = "PERM_STARTS,ACTIVE,BOOKED,OFFER_REJECTED";
 
 function filterEnrichedRowsByDealSheetMinStartDate(rows) {
   return rows.filter((row) =>
@@ -62,6 +69,19 @@ function resolveDealSheetUpdateTriggerMaxPairs() {
   const raw = process.env.DEAL_SHEET_UPDATE_TRIGGER_MAX_PAIRS;
   const n = parseInt(String(raw != null && raw !== "" ? raw : "500").trim(), 10);
   if (!Number.isFinite(n) || n < 1) return 500;
+  return n;
+}
+
+/**
+ * Optional per-run submittal-page cap for `dealSheetSyncTrigger` (env override). 0 = no cap (default).
+ * Set DEAL_SHEET_INSERT_TRIGGER_MAX_PAGES > 0 so each run voluntarily stops after N pages, writes the
+ * page checkpoint, and the next scheduled run resumes — protects against the 1800s hard timeout (which
+ * kills the process before the error-pause checkpoint can be written) when the full scan is large.
+ */
+function resolveDealSheetInsertTriggerMaxPages() {
+  const raw = process.env.DEAL_SHEET_INSERT_TRIGGER_MAX_PAGES;
+  const n = parseInt(String(raw != null && raw !== "" ? raw : "0").trim(), 10);
+  if (!Number.isFinite(n) || n < 1) return 0;
   return n;
 }
 /** Gen2 HTTP: max 3600s; avoids 540s Gen1 cap on full sync */
@@ -539,9 +559,10 @@ exports.dealSheetSyncTrigger = onSchedule(
       const bqDataset = "rr_project_data";
       const organizationSubmittalCodes = ACTIVE_BOOTSTRAP_SUBMITTAL_CODES;
       const firstInsertPlacementStatuses = ACTIVE_BOOTSTRAP_FIRST_INSERT_PLACEMENT_STATUSES;
+      const insertMaxPages = resolveDealSheetInsertTriggerMaxPages();
 
       logLine(
-        `[dealSheetSyncTrigger] Scheduled insert-only: ${organizationSubmittalCodes} -> cynetdatabase.${bqDataset}; skip if DEAL_SHEET_ID or PLACEMENT_ID exists in BQ; START_DATE>=2026-05-01; first_insert_allowlist=${firstInsertPlacementStatuses}; no append-on-change`
+        `[dealSheetSyncTrigger] Scheduled insert-only: ${organizationSubmittalCodes} -> cynetdatabase.${bqDataset}; skip if DEAL_SHEET_ID or PLACEMENT_ID exists in BQ; START_DATE>=2026-05-01; first_insert_allowlist=${firstInsertPlacementStatuses}; no append-on-change; checkpoint_key=${ACTIVE_INSERT_SYNC_CHECKPOINT_KEY} (resume-on-error/timeout by submittal page, clear-on-complete); max_pages_per_run=${insertMaxPages || "none"}`
       );
       logLine("[dealSheetSyncTrigger] Invoking syncEnrichedDealSheetCandidatesToBigQuery");
 
@@ -556,7 +577,17 @@ exports.dealSheetSyncTrigger = onSchedule(
         append_on_change_by_dealsheet: false,
         compare_ignore_fields: ["ID", "DATE_AND_TIME", "IS_REJECTED"],
         first_insert_placement_status_allowlist: firstInsertPlacementStatuses,
+        // Bring in BOTH FINAL and VERBAL deal sheets (no longer FINAL-only).
+        deal_sheet_status_codes: "FINAL,VERBAL",
         transform_rows_fn: filterEnrichedRowsByDealSheetMinStartDate,
+        // Page-level Firestore checkpoint: on a thrown socket-hangup (ECONNRESET after retries) the
+        // failed submittal page is saved and the next run resumes from it; on a fully-successful pass
+        // the doc is deleted so the next run rescans from page 1 to pick up newly-added deal sheets.
+        resume_from_checkpoint: true,
+        checkpoint_key: ACTIVE_INSERT_SYNC_CHECKPOINT_KEY,
+        checkpoint_use_submittal_page: true,
+        clear_checkpoint_on_complete: true,
+        ...(insertMaxPages > 0 ? { max_pages: insertMaxPages, max_pages_provided: true } : {}),
       });
 
       logLine(
@@ -579,7 +610,31 @@ exports.dealSheetSyncTrigger = onSchedule(
         logError("[dealSheetSyncTrigger] ownership effective-date overwrite FAILED (non-fatal)", effErr);
       }
 
-      return { success: true, result, ownershipEffectiveDate: ownershipEffectiveDateResult };
+      // Fresh inserts freeze hierarchy as of NEW_HIRE_DATE; the org chart can already have moved on
+      // by the time this same run happens (see recruiter-hierarchy-divergence signal below), so this
+      // full active-table scan runs on both triggers, not just dealSheetSyncUpdateTrigger.
+      logLine(
+        "[dealSheetSyncTrigger] Invoking syncInorganicHierarchyLogsFromBigQuery (recruiter-change + CSM-divergence + recruiter-hierarchy-divergence scan)"
+      );
+      let inorganicHierarchyLogResult = null;
+      try {
+        inorganicHierarchyLogResult = await syncInorganicHierarchyLogsFromBigQuery({
+          bq_dataset: bqDataset,
+          bq_table: "inorganic_hierarchy_logs",
+        });
+        logLine(
+          `[dealSheetSyncTrigger] inorganic hierarchy log result inserted=${inorganicHierarchyLogResult.inserted} recruiterChangePairs=${inorganicHierarchyLogResult.total} csmDivergences=${inorganicHierarchyLogResult.csmDivergences} recruiterHierarchyDivergences=${inorganicHierarchyLogResult.recruiterHierarchyDivergences} errorBatches=${inorganicHierarchyLogResult.errorBatches} elapsed=${inorganicHierarchyLogResult.elapsed || "n/a"}`
+        );
+      } catch (inorganicErr) {
+        logError("[dealSheetSyncTrigger] inorganic hierarchy log scan FAILED (non-fatal)", inorganicErr);
+      }
+
+      return {
+        success: true,
+        result,
+        ownershipEffectiveDate: ownershipEffectiveDateResult,
+        inorganicHierarchyLog: inorganicHierarchyLogResult,
+      };
     });
   }
 );
@@ -625,7 +680,9 @@ exports.dealSheetSyncUpdateTrigger = onSchedule(
         `[dealSheetSyncUpdateTrigger] Pipeline result checked=${result.checked} appended=${result.appended} no_change=${result.no_change} not_found=${result.not_found} no_baseline=${result.no_baseline ?? 0} skipped_date=${result.skipped_date} errors=${result.errors} priorityTotal=${result.priorityTotal ?? "n/a"} priorityChecked=${result.priorityChecked ?? "n/a"} batchTotal=${result.batchTotal ?? "n/a"} batchCheckedThisRun=${result.batchCheckedThisRun ?? "n/a"} batchOffsetEnd=${result.batchOffsetEnd ?? result.targetOffsetEnd ?? "n/a"} targetTotal=${result.targetTotal ?? result.pairTotal ?? "n/a"} hasMore=${result.hasMore ? "yes" : "no"} elapsed=${result.elapsed || "n/a"}`
       );
 
-      logLine("[dealSheetSyncUpdateTrigger] Invoking syncInorganicHierarchyLogsFromBigQuery (recruiter-change + CSM-divergence scan)");
+      logLine(
+        "[dealSheetSyncUpdateTrigger] Invoking syncInorganicHierarchyLogsFromBigQuery (recruiter-change + CSM-divergence + recruiter-hierarchy-divergence scan)"
+      );
       let inorganicHierarchyLogResult = null;
       try {
         inorganicHierarchyLogResult = await syncInorganicHierarchyLogsFromBigQuery({
@@ -633,7 +690,7 @@ exports.dealSheetSyncUpdateTrigger = onSchedule(
           bq_table: "inorganic_hierarchy_logs",
         });
         logLine(
-          `[dealSheetSyncUpdateTrigger] inorganic hierarchy log result inserted=${inorganicHierarchyLogResult.inserted} recruiterChangePairs=${inorganicHierarchyLogResult.total} csmDivergences=${inorganicHierarchyLogResult.csmDivergences} errorBatches=${inorganicHierarchyLogResult.errorBatches} elapsed=${inorganicHierarchyLogResult.elapsed || "n/a"}`
+          `[dealSheetSyncUpdateTrigger] inorganic hierarchy log result inserted=${inorganicHierarchyLogResult.inserted} recruiterChangePairs=${inorganicHierarchyLogResult.total} csmDivergences=${inorganicHierarchyLogResult.csmDivergences} recruiterHierarchyDivergences=${inorganicHierarchyLogResult.recruiterHierarchyDivergences} errorBatches=${inorganicHierarchyLogResult.errorBatches} elapsed=${inorganicHierarchyLogResult.elapsed || "n/a"}`
         );
       } catch (inorganicErr) {
         // Non-fatal: the main deal-sheet update already succeeded above; don't fail the whole

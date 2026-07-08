@@ -35,6 +35,10 @@ const {
   fetchDealSheetRecruiterChangePairsFromActive,
   buildInorganicHierarchyLogCandidate,
   fetchCsmHierarchyDivergenceCandidates,
+  fetchRecruiterHierarchyReconciliation,
+  buildInorganicCandidateFromReconciliation,
+  buildOwnershipChangeLogRowsForHierarchyMoves,
+  applyRecruiterHierarchyMovesToDealSheet,
   mergeInorganicHierarchyLogCandidates,
   resolveInorganicHierarchyLogRows,
   insertInorganicHierarchyLogBatch,
@@ -42,6 +46,7 @@ const {
   buildOwnershipChangeLogRows,
   insertOwnershipChangeLogBatch,
   overwriteOwnershipChangeLogEffectiveDatesFromExtensions,
+  finalizeDealSheetRowForResponse,
   hasBusinessColumnChanges,
   normalizeForCompare,
   resolveFirstInsertPlacementAllowlist,
@@ -883,6 +888,26 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     });
   }
 
+  // Response `data` must expose the SAME derived fields the deal-sheet table holds (hierarchy
+  // names+emp_no, DELIVERY_POC, CSM levels, SKU, PREVIOUS_RECRUITER). On INSERTED that's exactly
+  // the row just written; otherwise (preview/no-change/no-baseline) derive it without writing.
+  let responseData = row;
+  try {
+    if (action === "INSERTED" && Array.isArray(insertResult.finalRows) && insertResult.finalRows.length > 0) {
+      responseData = insertResult.finalRows[0];
+    } else {
+      responseData = await finalizeDealSheetRowForResponse(row, baseline, {
+        datasetId: effectiveDatasetId,
+        tableId: effectiveTableId,
+      });
+    }
+  } catch (finalizeErr) {
+    logLine(
+      `[refreshDealSheetByPlacementId] response finalize failed (non-fatal): ${String(finalizeErr?.message || finalizeErr).slice(0, 200)}`
+    );
+    responseData = row;
+  }
+
   return {
     action,
     reason,
@@ -906,7 +931,7 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
       candidate_id: seed.candidateId || normalizeNexusResourceId(seed.preferredCandidateRow?.candidate) || null,
       deal_sheet_id: seed.dealSheetId || normalizeNexusResourceId(seed.preferredCandidateRow?.deal_sheet) || null,
     },
-    data: row,
+    data: responseData,
     elapsed: formatDuration(Date.now() - startMs),
   };
 }
@@ -1220,6 +1245,18 @@ function dealSheetCandidateExcludeReason(candidate, allowedStatusKeys) {
   if (!key) return "EMPTY_STATUS";
   if (allowedStatusKeys.has(key)) return null;
   return "NOT_ALLOWED_STATUS";
+}
+
+/** True when a matched submittal row's status is "Offer Rejected" (code OFFER_REJECTED). */
+function isOfferRejectedSubmittalRow(submittalRow) {
+  if (!submittalRow || typeof submittalRow !== "object") return false;
+  const org = submittalRow.organization_submittal_status || {};
+  const code = String(org.code ?? "").trim().toUpperCase();
+  if (code === "OFFER_REJECTED") return true;
+  const label = String(org.submittal_status ?? submittalRow.submittal_status ?? "")
+    .trim()
+    .toLowerCase();
+  return label === "offer rejected";
 }
 
 /**
@@ -2024,7 +2061,18 @@ async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
 
   const csmCandidates = await fetchCsmHierarchyDivergenceCandidates({ datasetId: dealSheetDatasetId });
 
-  const candidates = mergeInorganicHierarchyLogCandidates(recruiterCandidates, csmCandidates);
+  // Single person-centric reconciliation drives THREE outputs: (1) new people -> inorganic log,
+  // (2) existing-person role changes -> moved regular fields (appended deal-sheet rows), and
+  // (3) ownership_change_logs vacate+fill rows for those moves.
+  const reconResults = await fetchRecruiterHierarchyReconciliation({ datasetId: dealSheetDatasetId });
+
+  const recruiterHierarchyCandidates = [];
+  for (const r of reconResults) {
+    const candidate = buildInorganicCandidateFromReconciliation(r);
+    if (candidate) recruiterHierarchyCandidates.push(candidate);
+  }
+
+  const candidates = mergeInorganicHierarchyLogCandidates(recruiterCandidates, csmCandidates, recruiterHierarchyCandidates);
   const rows = await resolveInorganicHierarchyLogRows(candidates);
 
   const result = await insertInorganicHierarchyLogBatch(rows, 0, {
@@ -2032,15 +2080,45 @@ async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
     tableId: logTableId,
   });
 
+  // (2) Apply hierarchy MOVES back to the deal sheet (append-only) ...
+  let movesResult = { appended: 0, placements: 0 };
+  try {
+    movesResult = await applyRecruiterHierarchyMovesToDealSheet(reconResults, { datasetId: dealSheetDatasetId });
+  } catch (e) {
+    logLine(`[recruiter hierarchy moves] WARN apply-to-deal-sheet failed (non-fatal): ${e && e.message ? e.message : e}`);
+  }
+
+  // (3) ... and log those moves to ownership_change_logs (vacate + fill rows).
+  let ownershipMovesInserted = 0;
+  try {
+    const nowIso = new Date().toISOString();
+    const moveOwnershipRows = [];
+    for (const r of reconResults) {
+      moveOwnershipRows.push(...buildOwnershipChangeLogRowsForHierarchyMoves(r, nowIso));
+    }
+    if (moveOwnershipRows.length > 0) {
+      const ownResult = await insertOwnershipChangeLogBatch(moveOwnershipRows, 0, {
+        datasetId: config.ownershipChangeLogDatasetId,
+        tableId: config.ownershipChangeLogTableId,
+      });
+      ownershipMovesInserted = ownResult.inserted;
+    }
+  } catch (e) {
+    logLine(`[recruiter hierarchy moves] WARN ownership-log write failed (non-fatal): ${e && e.message ? e.message : e}`);
+  }
+
   const elapsedStr = formatDuration(Date.now() - startMs);
   logLine(
-    `[inorganic hierarchy logs BQ scan] DONE inserted=${result.inserted} recruiterChangePairs=${pairs.size} csmDivergences=${csmCandidates.length} candidates=${candidates.length} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
+    `[inorganic hierarchy logs BQ scan] DONE inserted=${result.inserted} recruiterChangePairs=${pairs.size} csmDivergences=${csmCandidates.length} reconPlacements=${reconResults.length} newPersonCandidates=${recruiterHierarchyCandidates.length} moveAppends=${movesResult.appended} moveOwnershipRows=${ownershipMovesInserted} candidates=${candidates.length} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
   );
 
   return {
     inserted: result.inserted,
     total: pairs.size,
     csmDivergences: csmCandidates.length,
+    recruiterHierarchyDivergences: recruiterHierarchyCandidates.length,
+    hierarchyMoveAppends: movesResult.appended,
+    hierarchyMoveOwnershipRows: ownershipMovesInserted,
     candidates: candidates.length,
     errorBatches: result.errorBatches,
     elapsed: elapsedStr,
@@ -2362,6 +2440,7 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
 
 module.exports = {
   syncEnrichedDealSheetCandidatesToBigQuery,
+  isOfferRejectedSubmittalRow,
   syncExistingActiveDealSheetUpdatesFromBigQuery,
   syncRateChangeLogsFromBigQuery,
   syncInorganicHierarchyLogsFromBigQuery,

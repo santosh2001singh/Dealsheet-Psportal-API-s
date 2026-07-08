@@ -62,14 +62,21 @@ test("buildInorganicHierarchyLogCandidate uses EXTENSION_DATE as anchor for EXTE
   assert.equal(candidate.anchorDate, "2025-06-01T00:00:00.000Z");
 });
 
-test("buildInorganicHierarchyLogDedupeKey combines DEAL_SHEET_ID, PLACEMENT_ID, recruiter email, and CSM levels", () => {
+test("buildInorganicHierarchyLogDedupeKey combines DEAL_SHEET_ID, PLACEMENT_ID, recruiter email, CSM levels, and hierarchy divergences", () => {
+  const hierarchyBlank = ",,,,,,,"; // 8 INORGANIC_HIERARCHY_DEDUPE_COLUMNS, all empty
   const row = { DEAL_SHEET_ID: 1, PLACEMENT_ID: 100, RECRUITER_EMAIL_ID: "New@CynetHealth.com " };
-  assert.equal(buildInorganicHierarchyLogDedupeKey(row), "1|100|new@cynethealth.com|,,");
-  // No recruiter change AND no CSM divergence -> nothing to dedupe on, empty key.
+  assert.equal(buildInorganicHierarchyLogDedupeKey(row), `1|100|new@cynethealth.com|,,|${hierarchyBlank}`);
+  // No signal at all -> nothing to dedupe on, empty key.
   assert.equal(buildInorganicHierarchyLogDedupeKey({ DEAL_SHEET_ID: 1, PLACEMENT_ID: 100 }), "");
   // CSM-only signal (no recruiter change) still produces a non-empty, distinguishing key.
   const csmOnlyRow = { DEAL_SHEET_ID: 1, PLACEMENT_ID: 100, INORGANIC_LEVEL_2_CSM: "Jane Manager" };
-  assert.equal(buildInorganicHierarchyLogDedupeKey(csmOnlyRow), "1|100||jane manager,,");
+  assert.equal(buildInorganicHierarchyLogDedupeKey(csmOnlyRow), `1|100||jane manager,,|${hierarchyBlank}`);
+  // Recruiter-hierarchy-only signal (no recruiter change, no CSM) still produces a distinguishing key.
+  const hierarchyOnlyRow = { DEAL_SHEET_ID: 1, PLACEMENT_ID: 100, INORGANIC_ACCOUNT_MANAGER: "Nikhil Sharma" };
+  assert.equal(
+    buildInorganicHierarchyLogDedupeKey(hierarchyOnlyRow),
+    "1|100||,,|nikhil sharma,,,,,,,"
+  );
   assert.equal(buildInorganicHierarchyLogDedupeKey(null), "");
 });
 

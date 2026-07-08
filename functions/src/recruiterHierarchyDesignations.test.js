@@ -1,7 +1,28 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { isCsmHierarchyExcludedTitle, resolveCsmLevelsFromChain } = require("./recruiterHierarchyDesignations");
+const {
+  isCsmHierarchyExcludedTitle,
+  resolveCsmLevelsFromChain,
+  resolveHierarchyColumnForTitle,
+} = require("./recruiterHierarchyDesignations");
+
+test("resolveHierarchyColumnForTitle handles real '<role> - Delivery' title suffixes", () => {
+  // The bug: "Vice President - Delivery" (Amy Gupta's actual directory title) didn't match VP_SRVP.
+  assert.equal(resolveHierarchyColumnForTitle("Vice President - Delivery"), "VP_SRVP");
+  assert.equal(resolveHierarchyColumnForTitle("AVP - Delivery"), "VP_SRVP");
+  assert.equal(resolveHierarchyColumnForTitle("Associate Vice President - Delivery"), "VP_SRVP");
+  assert.equal(resolveHierarchyColumnForTitle("Vice President"), "VP_SRVP");
+  // Unchanged exact matches still work.
+  assert.equal(resolveHierarchyColumnForTitle("Sr. Delivery Manager"), "ACCOUNT_MANAGER");
+  assert.equal(resolveHierarchyColumnForTitle("Delivery Director"), "DELIVERY_DIRECTOR");
+  assert.equal(resolveHierarchyColumnForTitle("Recruitment Manager"), "RM");
+  assert.equal(resolveHierarchyColumnForTitle("Associate Delivery Manager"), "ASSOCIATE_AM");
+  // Non-roles still resolve to null (suffix strip must not create false matches).
+  assert.equal(resolveHierarchyColumnForTitle("Chief Growth Officer (CGO)"), null);
+  assert.equal(resolveHierarchyColumnForTitle("Some Team - Delivery"), null);
+  assert.equal(resolveHierarchyColumnForTitle(null), null);
+});
 
 test("isCsmHierarchyExcludedTitle matches excluded titles even combined with an abbreviation", () => {
   assert.equal(isCsmHierarchyExcludedTitle("Chief Growth Officer (CGO)"), true);

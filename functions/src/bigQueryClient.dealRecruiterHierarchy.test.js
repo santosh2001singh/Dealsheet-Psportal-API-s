@@ -158,3 +158,28 @@ test("applyDealRecruiterHierarchyForInsertRows is a no-op when no rows are eligi
   assert.equal(called, false);
   assert.equal(out[0].TEAM_LEAD, "Already Set");
 });
+
+test("carried-forward update-append (__CARRIED_FORWARD_UPDATE) is never re-backfilled — protects a MOVE-vacated field", async () => {
+  // A move vacated TEAM_LEAD (null) and filled ACCOUNT_MANAGER. On the next update-append the row
+  // is tagged carried-forward; the backfill must NOT re-derive TEAM_LEAD from the hire snapshot.
+  const carried = {
+    __CARRIED_FORWARD_UPDATE: true,
+    DEAL_TYPE: "DEAL",
+    PLACEMENT_ID: 1,
+    ASSIGNMENT_RECRUITER_EMAIL: "recruiter@cynethealth.com",
+    NEW_HIRE_DATE: "2026-03-01",
+    TEAM_LEAD: null, TEAM_LEAD_EMP_NO: null,           // vacated by an earlier move
+    ACCOUNT_MANAGER: "Udit Sharma", ACCOUNT_MANAGER_EMP_NO: "CY4978",
+  };
+  assert.equal(rowNeedsDealRecruiterHierarchyBackfill(carried), false);
+
+  let called = false;
+  const fetchFn = async () => {
+    called = true;
+    return new Map([["1", { TEAM_LEAD: "Udit Sharma", TEAM_LEAD_EMP_NO: "CY4978" }]]);
+  };
+  const out = await applyDealRecruiterHierarchyForInsertRows([carried], {}, { fetchFn });
+  assert.equal(called, false);          // nothing eligible -> no directory lookup
+  assert.equal(out[0].TEAM_LEAD, null); // vacated field stays vacated
+  assert.equal(out[0].ACCOUNT_MANAGER, "Udit Sharma");
+});
