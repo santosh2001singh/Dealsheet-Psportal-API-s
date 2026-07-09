@@ -11,10 +11,11 @@ const {
   getNexusAccessToken,
   nexusGetJson,
   nexusGetJsonWithRetry,
-  nexusFetchAllJsonBatched,
   normalizePagedResponse,
   normalizeNexusResourceId,
   shortUrlForLog,
+  sleep,
+  isNotFoundNexusError,
 } = require("./nexusClient");
 const {
   insertEnrichedDealSheetBatch,
@@ -43,6 +44,8 @@ const {
   resolveInorganicHierarchyLogRows,
   insertInorganicHierarchyLogBatch,
   fetchDealSheetOwnershipChangePairsFromActive,
+  fetchRecruiterHandoverOwnershipLogRows,
+  buildRecruiterHandoverOwnershipLogRows,
   buildOwnershipChangeLogRows,
   insertOwnershipChangeLogBatch,
   overwriteOwnershipChangeLogEffectiveDatesFromExtensions,
@@ -62,6 +65,7 @@ const { buildEnrichedRowsFromDealSheetCandidates } = require("./api/dealSheetEnr
 const { normalizeContractIdOrNull } = require("./contractIdFormat");
 const { getCheckpointRef } = require("./firestoreWorkspace");
 const { isCynetHealthCanadaRecruiter, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
+const { isCynetLocumsRecruiter, LOCUMS_EXCLUDED_API_OWNED_COLUMNS } = require("./locumsDerivedPlacementFields");
 const {
   resolveActiveDealSheetTableId,
   buildActiveDealSheetRoutingSentinel,
@@ -583,21 +587,31 @@ function resolvePreferredCandidateRow(candidateRows, preferredCandidateId, prefe
   return candidateRows[0];
 }
 
+function shouldSkipDomainExcludedApiOwnedColumn(email, key) {
+  if (isCynetHealthCanadaRecruiter(email) && CANADA_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
+  if (isCynetLocumsRecruiter(email) && LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
+  return false;
+}
+
 function computeChangedFields(incomingRow, existingRow, ignoreFields) {
   const out = [];
   if (!existingRow) return out;
   const ignore = new Set((ignoreFields || []).map((x) => String(x).trim()).filter(Boolean));
-  const isCanada = isCynetHealthCanadaRecruiter(incomingRow?.ASSIGNMENT_RECRUITER_EMAIL);
-  if (isCanada) {
+  const email = incomingRow?.ASSIGNMENT_RECRUITER_EMAIL;
+  const isDomainTypeDerived = isCynetHealthCanadaRecruiter(email) || isCynetLocumsRecruiter(email);
+  if (isDomainTypeDerived) {
     if (normalizeForCompare(incomingRow?.TYPE) !== normalizeForCompare(existingRow?.TYPE)) {
       out.push("TYPE");
     }
   }
   for (const key of API_OWNED_COLUMNS) {
     if (ignore.has(key)) continue;
-    if (isCanada && CANADA_EXCLUDED_API_OWNED_COLUMNS.has(key)) continue;
+    if (shouldSkipDomainExcludedApiOwnedColumn(email, key)) continue;
     const nextVal = normalizeForCompare(incomingRow?.[key]);
     const prevVal = normalizeForCompare(existingRow?.[key]);
+    // Mirror hasBusinessColumnChanges: CONTRACT_ID is resolved inside the insert pipeline (reused
+    // from the existing row), so incoming-null vs baseline-populated is not a real change.
+    if (key === "CONTRACT_ID" && nextVal == null && prevVal != null) continue;
     if (nextVal !== prevVal) out.push(key);
   }
   return out.sort();
@@ -908,10 +922,59 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     responseData = row;
   }
 
+  // Recruiter-handover ownership logs for this placement (RECRUITER change + vacated hierarchy role).
+  // The scheduled triggers do this table-wide; the refresh endpoint does it for just this row so the
+  // logs appear as soon as the API is hit. Dedupe on the log table makes repeat calls idempotent.
+  let ownershipHandoverLog = null;
+  try {
+    const handoverRows = await buildRecruiterHandoverOwnershipLogRows([responseData]);
+    if (handoverRows.length > 0) {
+      const owc = await insertOwnershipChangeLogBatch(handoverRows, 0, {
+        datasetId: config.ownershipChangeLogDatasetId,
+        tableId: config.ownershipChangeLogTableId,
+      });
+      ownershipHandoverLog = { built: handoverRows.length, inserted: owc.inserted, errorBatches: owc.errorBatches };
+      logLine(
+        `[refreshDealSheetByPlacementId] recruiter-handover ownership logs built=${handoverRows.length} inserted=${owc.inserted}`
+      );
+    }
+  } catch (ownErr) {
+    logLine(
+      `[refreshDealSheetByPlacementId] ownership handover log write failed (non-fatal): ${String(ownErr?.message || ownErr).slice(0, 200)}`
+    );
+  }
+
+  // Full inorganic-hierarchy scan (recruiter-change + CSM-divergence + recruiter-hierarchy
+  // reconciliation incl. moves + ownership-from-moves) so the refresh endpoint has full parity with
+  // the scheduled triggers. NOTE: this is a table-WIDE reconciliation (not scoped to this placement),
+  // so it can also append move rows / logs for other placements — same as a trigger run. Non-fatal;
+  // gated by refresh_run_inorganic_scan !== false so callers can opt out of the heavy scan.
+  let inorganicScanLog = null;
+  if (params.refresh_run_inorganic_scan !== false) {
+    try {
+      inorganicScanLog = await syncInorganicHierarchyLogsFromBigQuery({
+        deal_sheet_bq_dataset: effectiveDatasetId,
+        bq_dataset: "rr_project_data",
+        bq_table: "inorganic_hierarchy_logs",
+      });
+      logLine(
+        `[refreshDealSheetByPlacementId] inorganic scan inserted=${inorganicScanLog?.inserted ?? "n/a"} recruiterHierarchyDivergences=${inorganicScanLog?.recruiterHierarchyDivergences ?? "n/a"}`
+      );
+    } catch (inErr) {
+      logLine(
+        `[refreshDealSheetByPlacementId] inorganic scan failed (non-fatal): ${String(inErr?.message || inErr).slice(0, 200)}`
+      );
+    }
+  }
+
   return {
     action,
     reason,
     inserted: insertResult.inserted,
+    ownership_handover_log: ownershipHandoverLog,
+    inorganic_scan: inorganicScanLog
+      ? { inserted: inorganicScanLog.inserted, recruiterHierarchyDivergences: inorganicScanLog.recruiterHierarchyDivergences }
+      : null,
     attempted: insertResult.attempted,
     errorBatches: insertResult.errorBatches,
     diff_fields: diffFields,
@@ -1262,47 +1325,73 @@ function isOfferRejectedSubmittalRow(submittalRow) {
 /**
  * Fetch deal-sheet-candidates for multiple job_ids in parallel (tolerates individual failures)
  */
+/** Parallel-fetch concurrency for deal-sheet-candidates (env override, default 8, clamped 1..20).
+ *  Kept low on purpose: 20 simultaneous Nexus connections was breaking sockets (ECONNRESET) once
+ *  VERBAL deal sheets multiplied the row volume. Lower fan-out = fewer socket resets at the source. */
+function resolveCandidateFetchConcurrency() {
+  const raw = process.env.DEAL_SHEET_CANDIDATE_FETCH_CONCURRENCY;
+  const n = parseInt(String(raw != null && raw !== "" ? raw : "8").trim(), 10);
+  if (!Number.isFinite(n) || n < 1) return 8;
+  return Math.min(n, 20);
+}
+
 async function fetchDealSheetCandidatesByJobIdsParallel(jobIds, accessToken, dealSheetStatusCodesCsv = "FINAL") {
   if (!jobIds || jobIds.length === 0) return new Map();
   const requestedCodes = String(dealSheetStatusCodesCsv || "").trim() || "FINAL";
 
-  const urls = jobIds.map((jobId) =>
+  const buildJobUrl = (jobId) =>
     buildUrl(`${config.nexus.baseUrl}/api/deal-sheet-candidates/`, {
       job_id: String(jobId),
       deal_sheet_status_code: requestedCodes,
       page: 1,
       per_page: 1000,
-    })
-  );
+    });
 
-  let responses;
-  let failedJobIds = [];
-  try {
-    responses = await nexusFetchAllJsonBatched(urls, accessToken);
-  } catch (err) {
-    logLine(`[enriched sync] WARN: nexusFetchAllJsonBatched threw error, attempting individual fallback: ${String(err.message || err).slice(0, 200)}`);
-    responses = [];
-    for (let i = 0; i < urls.length; i++) {
-      try {
-        const resp = await nexusGetJson(urls[i], accessToken);
-        responses.push(resp);
-      } catch (e) {
-        logLine(`[enriched sync] SKIP job_id=${jobIds[i]} due to persistent error: ${String(e.message || e).slice(0, 150)}`);
-        responses.push({ results: [] });
-        failedJobIds.push(jobIds[i]);
+  const concurrency = resolveCandidateFetchConcurrency();
+  const result = new Map();
+  const persistentFailures = [];
+
+  // Bounded-concurrency window: at most `concurrency` in-flight at once, and EACH job_id is fetched
+  // with its own retry/backoff (nexusGetJsonWithRetry). A transient failure on one job_id no longer
+  // poisons the other 19 in a shared Promise.all batch (the old all-or-nothing behaviour), and every
+  // request is retried independently before it is treated as a real failure.
+  for (let i = 0; i < jobIds.length; i += concurrency) {
+    if (i > 0 && config.batchDelayMs > 0) await sleep(config.batchDelayMs);
+    const windowJobIds = jobIds.slice(i, i + concurrency);
+    const settled = await Promise.all(
+      windowJobIds.map(async (jobId) => {
+        try {
+          const resp = await nexusGetJsonWithRetry(buildJobUrl(jobId), accessToken);
+          return { jobId, resp, error: null };
+        } catch (e) {
+          return { jobId, resp: null, error: e };
+        }
+      })
+    );
+    for (const s of settled) {
+      if (s.error) {
+        persistentFailures.push({ jobId: s.jobId, message: String(s.error?.message || s.error).slice(0, 150) });
+        continue;
       }
+      const normalized = normalizePagedResponse(s.resp || {});
+      result.set(String(s.jobId), normalized.items || []);
     }
   }
 
-  const result = new Map();
-  for (let i = 0; i < jobIds.length; i++) {
-    const jobId = String(jobIds[i]);
-    const normalized = normalizePagedResponse(responses[i] || {});
-    result.set(jobId, normalized.items || []);
-  }
-
-  if (failedJobIds.length > 0) {
-    logLine(`[enriched sync] SUMMARY: skipped ${failedJobIds.length} job(s) due to Nexus errors, continuing with ${jobIds.length - failedJobIds.length} successful`);
+  // Completeness guarantee: if any job_id still failed after its own retries, DO NOT silently drop
+  // its deal sheets (that produced half-inserted pages). Throw so the caller's page-level checkpoint
+  // pauses on this page and the next scheduled run resumes and re-fetches it. Inserts are idempotent
+  // (skip-existing), so re-running the page is safe.
+  if (persistentFailures.length > 0) {
+    const sample = persistentFailures.slice(0, 5).map((f) => f.jobId).join(",");
+    const err = new Error(
+      `deal-sheet-candidates fetch failed for ${persistentFailures.length}/${jobIds.length} job_id(s) after retries (e.g. ${sample}); pausing page for checkpoint resume`
+    );
+    err.code = persistentFailures[0]?.message?.includes("ECONNRESET") ? "ECONNRESET" : "NEXUS_FETCH_INCOMPLETE";
+    logLine(
+      `[enriched sync] ERROR: ${persistentFailures.length}/${jobIds.length} deal-sheet-candidate fetch(es) failed after retries (concurrency=${concurrency}); throwing to pause page — sample job_ids=${sample}`
+    );
+    throw err;
   }
 
   return result;
@@ -1389,18 +1478,29 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
     ? Math.min(Math.floor(Number(enrichBatchSizeRaw)), config.batchSize)
     : config.batchSize;
 
+  // Server-side START_DATE lower bound pushed to the Nexus job-submittals list, so we fetch only
+  // relevant submittals instead of scanning every page and discarding old ones in-code. NO upper
+  // bound: our filter is a minimum only (>=) and many placements have future start dates — capping
+  // at "today" would silently drop them. The in-code filterEnrichedRowsByDealSheetMinStartDate stays
+  // as a safety net for any record the API over-returns.
+  const submittalStartDateFrom =
+    typeof params.submittal_start_date_from === "string" && params.submittal_start_date_from.trim() !== ""
+      ? params.submittal_start_date_from.trim()
+      : "";
+
   const submittalBasePath = "/api/job-submittals/";
   const urlQuery = {
     organization_submittal_status_code: allowedSubmittalCodes,
     per_page: perPage,
     page: 1,
+    ...(submittalStartDateFrom ? { start_date_from: submittalStartDateFrom } : {}),
   };
 
   const url = buildUrl(`${config.nexus.baseUrl}${submittalBasePath}`, urlQuery);
   const startMs = Date.now();
 
   logLine(
-    `[enriched sync] === syncEnrichedDealSheetCandidatesToBigQuery START === table=${tableFqn} submittalCodes=${allowedSubmittalCodes} dealSheetStatusCodes=${dealSheetStatusCodesCsv} followNextPage=${followNextPage} onlyNewDealSheets=${onlyNewDealSheets} dedupeByPlacementId=${dedupeByPlacementId} skipDidNotAcceptIfAlreadyDidNotAccept=${skipDidNotAcceptIfAlreadyDidNotAccept} skipContractId=${skipContractId ? "true" : "false"} maxStreamRows=${maxCandidates || "none"} maxSubmittalPages=${maxPages || "none"} testSubmittalLimit=${testSubmittalLimit || "none"} batchSize=${config.batchSize} enrichBatchSize=${enrichBatchSize} fetchAllMax=${config.fetchAllMax} batchDelayMs=${config.batchDelayMs}`
+    `[enriched sync] === syncEnrichedDealSheetCandidatesToBigQuery START === table=${tableFqn} submittalCodes=${allowedSubmittalCodes} startDateFrom=${submittalStartDateFrom || "none"} dealSheetStatusCodes=${dealSheetStatusCodesCsv} followNextPage=${followNextPage} onlyNewDealSheets=${onlyNewDealSheets} dedupeByPlacementId=${dedupeByPlacementId} skipDidNotAcceptIfAlreadyDidNotAccept=${skipDidNotAcceptIfAlreadyDidNotAccept} skipContractId=${skipContractId ? "true" : "false"} maxStreamRows=${maxCandidates || "none"} maxSubmittalPages=${maxPages || "none"} testSubmittalLimit=${testSubmittalLimit || "none"} batchSize=${config.batchSize} enrichBatchSize=${enrichBatchSize} fetchAllMax=${config.fetchAllMax} batchDelayMs=${config.batchDelayMs}`
   );
 
   logLine(
@@ -1480,6 +1580,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
               organization_submittal_status_code: allowedSubmittalCodes,
               per_page: perPage,
               page: data.submittalPageNext,
+              ...(submittalStartDateFrom ? { start_date_from: submittalStartDateFrom } : {}),
             });
             checkpointLoadedNextUrl = nextUrl;
             logLine(
@@ -1524,13 +1625,18 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
 
         const savedCodes = typeof data.submittalStatusCodes === "string" ? data.submittalStatusCodes : "";
         const savedTable = typeof data.table === "string" ? data.table.trim() : "";
+        const savedStartDateFrom = typeof data.submittalStartDateFrom === "string" ? data.submittalStartDateFrom.trim() : "";
         const codesMismatch =
           savedCodes.trim() !== "" &&
           normalizeSubmittalCodesForCompare(savedCodes) !== normalizeSubmittalCodesForCompare(allowedSubmittalCodes);
         const tableMismatch = savedTable !== "" && savedTable !== tableFqn;
-        if ((codesMismatch || tableMismatch) && nextUrl && nextUrl !== url) {
+        // The result set (and therefore the valid page range) depends on start_date_from. If it
+        // changed — including a legacy doc saved before this filter existed (saved "" vs current set)
+        // — the old page cursor is meaningless (page 14 of a now-4-page list) and must reset.
+        const startDateFromMismatch = savedStartDateFrom !== submittalStartDateFrom;
+        if ((codesMismatch || tableMismatch || startDateFromMismatch) && nextUrl && nextUrl !== url) {
           logLine(
-            `[checkpoint] resume stale cursor ignored (checkpoint was for different submittalCodes or table) — starting page=1 fresh list`
+            `[checkpoint] resume stale cursor ignored (checkpoint was for different submittalCodes / table / start_date_from saved=${savedStartDateFrom || "none"} current=${submittalStartDateFrom || "none"}) — starting page=1 fresh list`
           );
           nextUrl = url;
           checkpointLoadedNextUrl = null;
@@ -1616,6 +1722,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
       key: checkpointKey,
       table: tableFqn,
       submittalStatusCodes: allowedSubmittalCodes,
+      submittalStartDateFrom: submittalStartDateFrom,
       mode: "resume",
       reason,
       nextUrl: hasMoreValue ? resumeUrl : null,
@@ -1655,7 +1762,24 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
         `[enriched sync] STEP 2/5 NEXUS API: REQUEST wave=${pageNum} listPage=${nexusListPage ?? "?"} GET ${shortUrlForLog(requestUrl)}`
       );
 
-      const page = await nexusGetJsonWithRetry(requestUrl, accessToken);
+      let page;
+      try {
+        page = await nexusGetJsonWithRetry(requestUrl, accessToken);
+      } catch (pageErr) {
+        // A 404 on a page BEYOND the first means we asked for a page past the last one — e.g. a
+        // checkpoint cursor saved when the result set was larger (before a tighter start_date_from
+        // filter shrank it). Treat it as the natural end of pagination and let the completion logic
+        // clear the checkpoint, instead of re-pausing on the same dead page forever. A 404 on page 1
+        // is a real problem, so it still throws.
+        if (isNotFoundNexusError(pageErr) && nexusListPage != null && nexusListPage > 1) {
+          logLine(
+            `[enriched sync] STEP 2/5 NEXUS API: listPage=${nexusListPage} returned 404 (past last page) — treating as end of pagination`
+          );
+          nextUrl = null;
+          break;
+        }
+        throw pageErr;
+      }
       const reqMs = Date.now() - reqStarted;
       const normalized = normalizePagedResponse(page);
       const submittalItems = normalized.items || [];
@@ -2158,6 +2282,11 @@ async function syncOwnershipChangeLogsFromBigQuery(params = {}) {
     rows.push(...buildOwnershipChangeLogRows(latest, previous));
   }
 
+  // Recruiter-handover logs (single-row: submittal recruiter -> deal-sheet recruiter on a DEAL),
+  // incl. the vacated-hierarchy-role row. Independent of the latest-vs-previous pair scan above.
+  const handoverRows = await fetchRecruiterHandoverOwnershipLogRows({ datasetId: dealSheetDatasetId });
+  rows.push(...handoverRows);
+
   const result = await insertOwnershipChangeLogBatch(rows, 0, {
     datasetId: logDatasetId,
     tableId: logTableId,
@@ -2165,12 +2294,13 @@ async function syncOwnershipChangeLogsFromBigQuery(params = {}) {
 
   const elapsedStr = formatDuration(Date.now() - startMs);
   logLine(
-    `[ownership change logs BQ scan] DONE inserted=${result.inserted} changedPairs=${pairs.size} builtRows=${rows.length} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
+    `[ownership change logs BQ scan] DONE inserted=${result.inserted} changedPairs=${pairs.size} handoverRows=${handoverRows.length} builtRows=${rows.length} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
   );
 
   return {
     inserted: result.inserted,
     total: pairs.size,
+    handoverRows: handoverRows.length,
     builtRows: rows.length,
     errorBatches: result.errorBatches,
     elapsed: elapsedStr,

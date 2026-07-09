@@ -177,6 +177,13 @@ function isTransientNexusError(err) {
   );
 }
 
+/** True when the error is an HTTP 404 (e.g. a job-submittals page number past the last page). */
+function isNotFoundNexusError(err) {
+  const ax = rootAxiosError(err);
+  if (ax && ax.response?.status === 404) return true;
+  return /\bHTTP 404\b|status code 404/i.test(String(err?.message || ""));
+}
+
 /**
  * Make parallel GET requests to Nexus API
  */
@@ -353,4 +360,5 @@ module.exports = {
   sleep,
   shortUrlForLog,
   isTransientNexusError,
+  isNotFoundNexusError,
 };

@@ -22,6 +22,7 @@ const {
   isDidNotStartPlacementStatus,
 } = require("./columnMappings");
 const { isCynetHealthCanadaRecruiter, sanitizeCanadaDealSheetRow, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
+const { isCynetLocumsRecruiter, sanitizeLocumsDealSheetRow, LOCUMS_EXCLUDED_API_OWNED_COLUMNS } = require("./locumsDerivedPlacementFields");
 const { normalizeContractIdOrNull, buildSequenceOptionsForTable } = require("./contractIdFormat");
 const { allocateContractIds } = require("./contractIdSequence");
 const {
@@ -701,19 +702,32 @@ function normalizeForCompare(value) {
   return String(sanitized);
 }
 
+function shouldSkipDomainExcludedApiOwnedColumn(email, key) {
+  if (isCynetHealthCanadaRecruiter(email) && CANADA_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
+  if (isCynetLocumsRecruiter(email) && LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
+  return false;
+}
+
 function hasBusinessColumnChanges(incomingRow, existingRow, ignoreFieldsSet) {
   if (!existingRow) return true;
-  const isCanada = isCynetHealthCanadaRecruiter(incomingRow?.ASSIGNMENT_RECRUITER_EMAIL);
-  if (isCanada) {
+  const email = incomingRow?.ASSIGNMENT_RECRUITER_EMAIL;
+  const isDomainTypeDerived = isCynetHealthCanadaRecruiter(email) || isCynetLocumsRecruiter(email);
+  if (isDomainTypeDerived) {
     if (normalizeForCompare(incomingRow?.TYPE) !== normalizeForCompare(existingRow?.TYPE)) {
       return true;
     }
   }
   for (const key of API_OWNED_COLUMNS) {
     if (ignoreFieldsSet && ignoreFieldsSet.has(key)) continue;
-    if (isCanada && CANADA_EXCLUDED_API_OWNED_COLUMNS.has(key)) continue;
+    if (shouldSkipDomainExcludedApiOwnedColumn(email, key)) continue;
     const incomingVal = normalizeForCompare(incomingRow?.[key]);
     const existingVal = normalizeForCompare(existingRow?.[key]);
+    // CONTRACT_ID is a Cynet-internal identity resolved INSIDE the insert pipeline (reused from the
+    // existing row), so a freshly-enriched incoming row still has it null at compare time. Treat
+    // "incoming null vs baseline populated" as unchanged — otherwise every update refresh sees a
+    // false CONTRACT_ID change and re-appends a 0-diff row forever. A genuine reassignment (both
+    // non-null and different) is still detected.
+    if (key === "CONTRACT_ID" && incomingVal == null && existingVal != null) continue;
     if (incomingVal !== existingVal) return true;
   }
   if (!config.newHireDateFreezeEnabled) {
@@ -731,6 +745,11 @@ function hasBusinessColumnChanges(incomingRow, existingRow, ignoreFieldsSet) {
     const existingTent = normalizeForCompare(existingRow?.TENTATIVE_DATE);
     if (incomingTent !== existingTent) return true;
   }
+  // A handover DEAL whose previous recruiter (from the submittal) is not yet stored should append a
+  // row so the fill-when-empty PREVIOUS_RECRUITER lands (it is a MANUAL column, not compared above).
+  const incomingPrevEmail = normalizeForCompare(incomingRow?.__PREV_RECRUITER_EMAIL);
+  const existingPrevEmail = normalizeForCompare(existingRow?.PREVIOUS_RECRUITER_EMAIL);
+  if (incomingPrevEmail != null && existingPrevEmail == null) return true;
   return false;
 }
 
@@ -804,15 +823,19 @@ function applyManualColumnsCarryForward(incomingRow, baselineRow) {
   if (!baselineRow || !incomingRow || typeof incomingRow !== "object") {
     return { row: incomingRow, carriedCount: 0 };
   }
-  const isCanada = isCynetHealthCanadaRecruiter(incomingRow?.ASSIGNMENT_RECRUITER_EMAIL);
+  const email = incomingRow?.ASSIGNMENT_RECRUITER_EMAIL;
+  const skipManualType = isCynetHealthCanadaRecruiter(email) || isCynetLocumsRecruiter(email);
+  const skipManualEntity = isCynetLocumsRecruiter(email);
   const out = { ...incomingRow };
   for (const key of MANUAL_COLUMNS) {
-    if (isCanada && key === "TYPE") continue;
+    if (skipManualType && key === "TYPE") continue;
+    if (skipManualEntity && key === "ENTITY") continue;
     delete out[key];
   }
   let carriedCount = 0;
   for (const key of MANUAL_COLUMNS) {
-    if (isCanada && key === "TYPE") continue;
+    if (skipManualType && key === "TYPE") continue;
+    if (skipManualEntity && key === "ENTITY") continue;
     out[key] = Object.prototype.hasOwnProperty.call(baselineRow, key)
       ? baselineRow[key]
       : null;
@@ -1247,11 +1270,13 @@ function sanitizeRowForBigQueryStreamingInsert(row) {
   if (!row || typeof row !== "object") return row;
   const out = {};
   for (const [k, v] of Object.entries(row)) {
-    if (k === "_rn" || k === "_INSERT_ID" || k === "rn" || k === "_src" || k === "_src_table" || k === "__CARRIED_FORWARD_UPDATE") continue;
+    // Strip query-only / pipeline-internal fields: the fixed set below plus any "__"-prefixed temp
+    // field (e.g. __PREV_RECRUITER_*), which never belong in the BigQuery streaming insert.
+    if (k === "_rn" || k === "_INSERT_ID" || k === "rn" || k === "_src" || k === "_src_table" || k.startsWith("__")) continue;
     const inner = sanitizeValueForStreamingInsert(v);
     if (inner !== undefined) out[k] = inner;
   }
-  return sanitizeCanadaDealSheetRow(out);
+  return sanitizeLocumsDealSheetRow(sanitizeCanadaDealSheetRow(out));
 }
 
 function isEmptyDateFieldValue(value) {
@@ -1607,6 +1632,10 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
       + ` extensionFrozenCount=${extensionFrozenCount}`
     );
   }
+
+  // Fill PREVIOUS_RECRUITER from the enrichment temp fields (when empty) BEFORE the DEAL hierarchy
+  // fetch below, which sources the chain from PREVIOUS_RECRUITER_EMAIL on a handover.
+  rowsToInsert = applyPreviousRecruiterFillForInsertRows(rowsToInsert);
 
   rowsToInsert = await applyExtensionInheritForInsertRows(
     rowsToInsert,
@@ -2378,6 +2407,9 @@ const ACTIVE_CHANGE_SCAN_COLUMNS = [
   "ASSIGNMENT_RECRUITER",
   "ASSIGNMENT_RECRUITER_EMAIL",
   "RECRUITER_EMP_NO",
+  "PREVIOUS_RECRUITER_NAME",
+  "PREVIOUS_RECRUITER_EMAIL",
+  "PREVIOUS_RECRUITER_EMP_NO",
   "ONSITE_AM",
   "ONSITE_AM_EMAIL",
   "LEVEL_2_CSM",
@@ -3795,13 +3827,22 @@ async function fetchDealRecruiterHierarchyByPlacementId(rows, options = {}, deps
   const out = new Map();
   if (!rows || rows.length === 0) return out;
 
+  // Hierarchy is resolved from the PREVIOUS recruiter's chain on a handover DEAL (so the deal keeps
+  // its original delivery hierarchy), else from the current/Assignment recruiter. Also remember the
+  // current recruiter's emp-no per placement so we can vacate the slot the new recruiter used to hold.
+  const hierarchyEmailForRow = (row) => {
+    const prev = row?.PREVIOUS_RECRUITER_EMAIL;
+    const prevNorm = prev == null ? "" : String(prev).trim().toLowerCase();
+    if (prevNorm) return prevNorm;
+    const cur = row?.ASSIGNMENT_RECRUITER_EMAIL;
+    return cur == null ? "" : String(cur).trim().toLowerCase();
+  };
+
   const directoryFetchFn = deps.directoryFetchFn ?? fetchEmployeeDirectoryByEmails;
   const emails = [];
   const emailSeen = new Set();
   for (const row of rows) {
-    const email = row?.ASSIGNMENT_RECRUITER_EMAIL;
-    if (email == null) continue;
-    const norm = String(email).trim().toLowerCase();
+    const norm = hierarchyEmailForRow(row);
     if (!norm || emailSeen.has(norm)) continue;
     emailSeen.add(norm);
     emails.push(norm);
@@ -3811,18 +3852,17 @@ async function fetchDealRecruiterHierarchyByPlacementId(rows, options = {}, deps
   const directoryByEmail = await directoryFetchFn(emails);
 
   const targets = [];
+  const currentRecruiterEmpByKey = new Map();
   for (const row of rows) {
     const pid = row?.PLACEMENT_ID;
     if (pid == null || String(pid).trim() === "") continue;
-    const email = row?.ASSIGNMENT_RECRUITER_EMAIL;
-    const norm = email == null ? "" : String(email).trim().toLowerCase();
+    const norm = hierarchyEmailForRow(row);
     const externalId = norm ? directoryByEmail.get(norm)?.externalId : null;
     if (!externalId) continue;
-    targets.push({
-      key: String(pid).trim(),
-      externalId,
-      anchorDate: row?.NEW_HIRE_DATE ?? null,
-    });
+    const key = String(pid).trim();
+    targets.push({ key, externalId, anchorDate: row?.NEW_HIRE_DATE ?? null });
+    const curEmp = normalizeExtensionRunrateBackfillValue(row?.RECRUITER_EMP_NO);
+    if (curEmp != null) currentRecruiterEmpByKey.set(key, String(curEmp).trim().toUpperCase());
   }
   if (targets.length === 0) return out;
 
@@ -3834,6 +3874,7 @@ async function fetchDealRecruiterHierarchyByPlacementId(rows, options = {}, deps
   for (const [placementId, levelRows] of levelsByKey) {
     const entry = {};
     const filledColumns = new Set();
+    const newRecruiterEmp = currentRecruiterEmpByKey.get(placementId) ?? null;
     for (const levelRow of levelRows) {
       const column = resolveHierarchyColumnForTitle(levelRow?.manager_title);
       if (!column || filledColumns.has(column)) continue;
@@ -3843,8 +3884,17 @@ async function fetchDealRecruiterHierarchyByPlacementId(rows, options = {}, deps
       const empNo = normalizeExtensionRunrateBackfillValue(levelRow?.manager_employee_id);
       if (name == null && empNo == null) continue;
       filledColumns.add(column);
-      entry[target.column] = name;
-      entry[target.empNoColumn] = empNo;
+      // Vacate: this chain came from the PREVIOUS recruiter, and the person sitting here is the
+      // NEW recruiter (matched by emp-no) — they can't be both, so their old slot is now "NA".
+      const isNowRecruiter =
+        newRecruiterEmp != null && empNo != null && String(empNo).trim().toUpperCase() === newRecruiterEmp;
+      if (isNowRecruiter) {
+        entry[target.column] = "NA";
+        entry[target.empNoColumn] = "NA";
+      } else {
+        entry[target.column] = name;
+        entry[target.empNoColumn] = empNo;
+      }
     }
     if (Object.keys(entry).length > 0) out.set(placementId, entry);
   }
@@ -3858,6 +3908,29 @@ async function fetchDealRecruiterHierarchyByPlacementId(rows, options = {}, deps
  * hierarchy columns were already carried forward from a baseline (an update-append, not a
  * first insert) is left untouched, and a manual BigQuery edit is never overwritten.
  */
+/**
+ * Fill PREVIOUS_RECRUITER_* from the enrichment temp fields (__PREV_RECRUITER_*) when the row's
+ * PREVIOUS_RECRUITER is currently empty. Runs AFTER manual-column carry-forward (which would have
+ * overwritten the enriched value with the baseline's) and BEFORE the DEAL hierarchy fetch (which
+ * reads PREVIOUS_RECRUITER_EMAIL to source the chain). Freeze-once-set: a row that already carries a
+ * previous recruiter from baseline is left untouched.
+ */
+function applyPreviousRecruiterFillForInsertRows(rows) {
+  if (!rows || rows.length === 0) return rows;
+  return rows.map((row) => {
+    if (!row || typeof row !== "object") return row;
+    const tempEmail = row.__PREV_RECRUITER_EMAIL;
+    if (tempEmail == null || String(tempEmail).trim() === "") return row;
+    if (!isEmptyDateFieldValue(row.PREVIOUS_RECRUITER_EMAIL)) return row;
+    return {
+      ...row,
+      PREVIOUS_RECRUITER_NAME: row.__PREV_RECRUITER_NAME ?? null,
+      PREVIOUS_RECRUITER_EMAIL: tempEmail,
+      PREVIOUS_RECRUITER_EMP_NO: row.__PREV_RECRUITER_EMP_NO ?? null,
+    };
+  });
+}
+
 async function applyDealRecruiterHierarchyForInsertRows(rows, options = {}, deps = {}) {
   if (!rows || rows.length === 0) return rows;
 
@@ -5038,6 +5111,131 @@ function buildOwnershipChangeLogRows(latestRow, previousRow) {
   return rows;
 }
 
+/**
+ * Recruiter-handover ownership logs (single row, not a latest-vs-previous pair): on a DEAL_TYPE=DEAL
+ * whose PREVIOUS_RECRUITER_EMAIL (the job-submittal recruiter) differs from ASSIGNMENT_RECRUITER_EMAIL
+ * (the deal-sheet recruiter), build:
+ *   (1) OWNERSHIP_ROLE=RECRUITER — PREVIOUS_OWNER = previous recruiter, NEW_OWNER = current recruiter.
+ *   (2) the vacated hierarchy role — if the CURRENT recruiter used to sit in the PREVIOUS recruiter's
+ *       manager chain (matched by emp-no), PREVIOUS_OWNER = current recruiter, NEW_OWNER = 'NA'.
+ * EFFECTIVE_DATE / END_DATE_PREVIOUS_OWNER come from buildOwnershipChangeLogContext (tentative+1 /
+ * tentative), so the extension effective-date overwrite applies here identically.
+ */
+async function fetchRecruiterHandoverOwnershipLogRows(options = {}, deps = {}) {
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+
+  const unionParts = buildActiveChangeScanUnionParts(datasetId);
+  const sql = `WITH all_rows AS (
+                 ${unionParts.join("\n                 UNION ALL\n                 ")}
+               )
+               SELECT * EXCEPT(rn) FROM (
+                 SELECT *, ROW_NUMBER() OVER (
+                   PARTITION BY CAST(DEAL_SHEET_ID AS STRING), CAST(PLACEMENT_ID AS STRING)
+                   ORDER BY DATE_AND_TIME DESC NULLS LAST
+                 ) AS rn
+                 FROM all_rows
+               )
+               WHERE rn = 1
+                 AND UPPER(TRIM(IFNULL(DEAL_TYPE, ''))) = 'DEAL'
+                 AND TRIM(IFNULL(PREVIOUS_RECRUITER_EMAIL, '')) != ''
+                 AND LOWER(TRIM(IFNULL(PREVIOUS_RECRUITER_EMAIL, ''))) != LOWER(TRIM(IFNULL(ASSIGNMENT_RECRUITER_EMAIL, '')))`;
+
+  const rows = await queryObjects(sql, 100000);
+  logLine(`[ownership handover] latest DEAL rows with a previous recruiter=${rows.length}`);
+  return buildRecruiterHandoverOwnershipLogRows(rows, deps);
+}
+
+/**
+ * Build the recruiter-handover ownership log rows for an explicit set of deal rows (each a
+ * DEAL_TYPE=DEAL with PREVIOUS_RECRUITER_EMAIL populated and differing from ASSIGNMENT_RECRUITER_EMAIL).
+ * Rows not matching that shape are skipped. Used by both the table-wide scan and the single-placement
+ * refresh endpoint. See fetchRecruiterHandoverOwnershipLogRows for the two rows produced per deal.
+ */
+async function buildRecruiterHandoverOwnershipLogRows(inputRows, deps = {}) {
+  const rows = (inputRows || []).filter((row) => {
+    if (!row || typeof row !== "object") return false;
+    if (String(row.DEAL_TYPE || "").trim().toUpperCase() !== "DEAL") return false;
+    const prev = row.PREVIOUS_RECRUITER_EMAIL == null ? "" : String(row.PREVIOUS_RECRUITER_EMAIL).trim();
+    const cur = row.ASSIGNMENT_RECRUITER_EMAIL == null ? "" : String(row.ASSIGNMENT_RECRUITER_EMAIL).trim();
+    return prev !== "" && prev.toLowerCase() !== cur.toLowerCase();
+  });
+  if (rows.length === 0) return [];
+
+  // Resolve each placement's PREVIOUS recruiter manager chain (same anchor/direction as the deal
+  // hierarchy) so we can locate the role the CURRENT recruiter used to hold (to vacate it).
+  const directoryFetchFn = deps.directoryFetchFn ?? fetchEmployeeDirectoryByEmails;
+  const hierarchyFetchFn = deps.hierarchyFetchFn ?? fetchHierarchyLevelChainsByKey;
+
+  const emails = [];
+  const emailSeen = new Set();
+  for (const row of rows) {
+    const norm = String(row.PREVIOUS_RECRUITER_EMAIL).trim().toLowerCase();
+    if (!norm || emailSeen.has(norm)) continue;
+    emailSeen.add(norm);
+    emails.push(norm);
+  }
+  const directoryByEmail = await directoryFetchFn(emails);
+
+  const targets = [];
+  rows.forEach((row, index) => {
+    const norm = String(row.PREVIOUS_RECRUITER_EMAIL).trim().toLowerCase();
+    const externalId = directoryByEmail.get(norm)?.externalId;
+    if (!externalId) return;
+    targets.push({ key: String(index), externalId, anchorDate: row?.NEW_HIRE_DATE ?? null });
+  });
+  const levelsByKey =
+    targets.length > 0 ? await hierarchyFetchFn(targets, { direction: "on_or_before" }) : new Map();
+
+  const nowIso = new Date().toISOString();
+  const out = [];
+  rows.forEach((row, index) => {
+    const ctx = buildOwnershipChangeLogContext(row, nowIso);
+
+    // (1) recruiter handover
+    out.push({
+      ...ctx,
+      OWNERSHIP_ROLE: "RECRUITER",
+      NEW_OWNER_NAME: ownershipDisplayValueOrNull(row.ASSIGNMENT_RECRUITER),
+      NEW_OWNER_EMP_NO: ownershipDisplayValueOrNull(row.RECRUITER_EMP_NO),
+      PREVIOUS_OWNER_NAME: ownershipDisplayValueOrNull(row.PREVIOUS_RECRUITER_NAME),
+      PREVIOUS_OWNER_EMP_NO: ownershipDisplayValueOrNull(row.PREVIOUS_RECRUITER_EMP_NO),
+    });
+
+    // (2) vacated role — where the current recruiter (by emp-no) sat in the previous chain
+    const newRecruiterEmp = normalizeExtensionRunrateBackfillValue(row.RECRUITER_EMP_NO);
+    const newEmpKey = newRecruiterEmp == null ? "" : String(newRecruiterEmp).trim().toUpperCase();
+    const levelRows = levelsByKey.get(String(index));
+    if (newEmpKey !== "" && levelRows) {
+      const filled = new Set();
+      for (const levelRow of levelRows) {
+        const column = resolveHierarchyColumnForTitle(levelRow?.manager_title);
+        if (!column || filled.has(column)) continue;
+        const target = DEAL_RECRUITER_HIERARCHY_TARGETS.find((t) => t.column === column);
+        if (!target) continue;
+        filled.add(column);
+        const empNo = normalizeExtensionRunrateBackfillValue(levelRow?.manager_employee_id);
+        if (empNo != null && String(empNo).trim().toUpperCase() === newEmpKey) {
+          out.push({
+            ...ctx,
+            OWNERSHIP_ROLE: target.column,
+            NEW_OWNER_NAME: "NA",
+            NEW_OWNER_EMP_NO: "NA",
+            PREVIOUS_OWNER_NAME: ownershipDisplayValueOrNull(row.ASSIGNMENT_RECRUITER),
+            PREVIOUS_OWNER_EMP_NO: ownershipDisplayValueOrNull(row.RECRUITER_EMP_NO),
+          });
+          break;
+        }
+      }
+    }
+  });
+
+  logLine(`[ownership handover] built log rows=${out.length}`);
+  return out;
+}
+
 /** Dedupe key: same placement + role + new owner + previous owner never logged twice. */
 function buildOwnershipChangeLogDedupeKey(row) {
   const pid = row?.PLACEMENT_ID == null ? "" : String(row.PLACEMENT_ID).trim();
@@ -5239,6 +5437,7 @@ async function finalizeDealSheetRowForResponse(row, baseline, options = {}) {
     current = { ...current, __CARRIED_FORWARD_UPDATE: true };
   }
   let arr = [current];
+  arr = applyPreviousRecruiterFillForInsertRows(arr);
   arr = await applyExtensionInheritForInsertRows(arr, options);
   arr = await applyDealRecruiterHierarchyForInsertRows(arr, options);
   arr = applyExtensionStartDatesForInsertRows(arr);
@@ -5330,6 +5529,7 @@ module.exports = {
   rowNeedsDealRecruiterHierarchyBackfill,
   fetchDealRecruiterHierarchyByPlacementId,
   applyDealRecruiterHierarchyForInsertRows,
+  applyPreviousRecruiterFillForInsertRows,
   fetchHierarchyLevelChainsByKey,
   fetchDealSheetRecruiterChangePairsFromActive,
   buildInorganicHierarchyLogCandidate,
@@ -5348,6 +5548,8 @@ module.exports = {
   applyRecruiterHierarchyMovesToDealSheet,
   mergeInorganicHierarchyLogCandidates,
   fetchDealSheetOwnershipChangePairsFromActive,
+  fetchRecruiterHandoverOwnershipLogRows,
+  buildRecruiterHandoverOwnershipLogRows,
   buildOwnershipChangeLogRows,
   buildOwnershipChangeLogDedupeKey,
   fetchExistingOwnershipChangeLogKeysSet,

@@ -5,7 +5,9 @@
       "Bash(node -e \"require\\('./src/index.js'\\); console.log\\('OK'\\)\")",
       "Bash(node -e \"require\\('./src/bigQueryClient'\\); require\\('./src/index.js'\\); console.log\\('load OK'\\);\")",
       "Bash(awk '/API_OWNED_COLUMNS = /,/\\\\]\\\\\\)/' src/columnMappings.js)",
-      "Bash(bq query --use_legacy_sql=false --format=json --project_id=cynetdatabase ' *)"
+      "Bash(bq query --use_legacy_sql=false --format=json --project_id=cynetdatabase ' *)",
+      "Bash(node -e 'const cm=require\\(\"./src/columnMappings.js\"\\); console.log\\(\"SKU_NUMBER:\", cm.API_OWNED_COLUMNS.has\\(\"SKU_NUMBER\"\\), \"| CONTRACT_ID:\", cm.API_OWNED_COLUMNS.has\\(\"CONTRACT_ID\"\\)\\);')",
+      "Bash(node -e 'const cm=require\\(\"./src/columnMappings.js\"\\); console.log\\(\"MANUAL:\", cm.MANUAL_COLUMNS.has\\(\"IS_REJECTED\"\\), \"| API_OWNED:\", cm.API_OWNED_COLUMNS.has\\(\"IS_REJECTED\"\\)\\);')"
     ]
   }
 }

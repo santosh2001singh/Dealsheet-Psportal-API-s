@@ -8,6 +8,10 @@ const {
   isCynetHealthCanadaRecruiter,
   computeCanadaDerivedPlacementFields,
 } = require("./canadaDerivedPlacementFields");
+const {
+  isCynetLocumsRecruiter,
+  computeLocumsDerivedPlacementFields,
+} = require("./locumsDerivedPlacementFields");
 const { normalizeContractIdOrNull } = require("./contractIdFormat");
 
 /**
@@ -296,12 +300,33 @@ function mapCandidateCandidateTypesToBq(rows) {
 function mapDealSheetUsersToBq(dealSheet, recruiterUser, salesRepUser, submittalRow) {
   const recruiterFromSubmittal = normalizeRecruiterFromSubmittal(submittalRow);
   const recruiterIdFromDealSheet = toIntOrNull(dealSheet?.recruiter);
+  // ASSIGNMENT_RECRUITER (current owner) = the deal-sheet's recruiter (via /api/users), falling back
+  // to the submittal's recruiter when the user lookup is missing.
   const recruiterObj = recruiterUser ?? recruiterFromSubmittal;
   const salesRepIdFromSubmittal = toIntOrNull(submittalRow?.sales_rep);
+
+  // Recruiter handover: on a DEAL, the job-submittal's recruiter is the PREVIOUS owner while the
+  // deal-sheet's recruiter is the current/Assignment owner. When they differ we capture the previous
+  // recruiter here (emp-no is resolved from the directory later in the enricher). Only for DEAL rows
+  // (EXTENSION rows use the across-append PREVIOUS_RECRUITER logic instead).
+  const currentEmail = recruiterObj?.email ? String(recruiterObj.email).trim().toLowerCase() : "";
+  const submittalEmail = recruiterFromSubmittal?.email
+    ? String(recruiterFromSubmittal.email).trim().toLowerCase()
+    : "";
+  const isDeal = String(dealSheet?.type ?? "").trim().toUpperCase() === "DEAL";
+  const hasPreviousRecruiter =
+    isDeal && currentEmail !== "" && submittalEmail !== "" && currentEmail !== submittalEmail;
+
   return {
     RECRUITER_ID: recruiterIdFromDealSheet ?? recruiterFromSubmittal?.id ?? null,
     ASSIGNMENT_RECRUITER: mapUserToFullName(recruiterObj),
     ASSIGNMENT_RECRUITER_EMAIL: recruiterObj?.email ?? null,
+    // Stashed in "__"-prefixed temp fields (stripped before insert). PREVIOUS_RECRUITER_* is a MANUAL
+    // column that carry-forward would overwrite with the baseline, so it's filled from these temps
+    // only when currently empty (applyPreviousRecruiterFillForInsertRows) — freeze-once-set, but
+    // still backfills on an existing deal that never had a previous recruiter stored.
+    __PREV_RECRUITER_NAME: hasPreviousRecruiter ? mapUserToFullName(recruiterFromSubmittal) : null,
+    __PREV_RECRUITER_EMAIL: hasPreviousRecruiter ? recruiterFromSubmittal.email : null,
     CLIENT_SALES_REP: mapUserToFullName(salesRepUser),
     CLIENT_SALES_REP_ID:
       toIntOrNull(dealSheet?.sales_rep) ?? salesRepIdFromSubmittal ?? null,
@@ -970,6 +995,9 @@ const DAYS_WORKED_ELIGIBLE_STATUSES = new Set([
 function computeDerivedPlacementFields(row) {
   if (isCynetHealthCanadaRecruiter(row?.ASSIGNMENT_RECRUITER_EMAIL)) {
     return computeCanadaDerivedPlacementFields(row);
+  }
+  if (isCynetLocumsRecruiter(row?.ASSIGNMENT_RECRUITER_EMAIL)) {
+    return computeLocumsDerivedPlacementFields(row);
   }
 
   const payRate = toNumberOrNull(row?.PAY_RATE);

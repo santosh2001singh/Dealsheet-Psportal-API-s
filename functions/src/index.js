@@ -52,6 +52,9 @@ const ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES =
   "STARTED,BOOKED,ENDED,ENDED<30,DID NOT START,DID NOT ACCEPT";
 /** Active HTTP/trigger + scheduled update: only insert rows with START_DATE on or after this day (UTC). */
 const DEAL_SHEET_MIN_START_DATE_MS = Date.UTC(2026, 4, 1);
+/** Same lower bound as YYYY-MM-DD, pushed to the Nexus job-submittals list as start_date_from so the
+ *  scan fetches only relevant submittals. Derived from the ms constant so the two never drift. */
+const DEAL_SHEET_MIN_START_DATE_ISO = new Date(DEAL_SHEET_MIN_START_DATE_MS).toISOString().slice(0, 10);
 
 /** Nexus submittal filter for scheduled insert trigger (new deal sheets only).
  *  OFFER_REJECTED included so offer-rejected candidates (deal sheet only ever VERBAL) are picked up
@@ -538,13 +541,16 @@ exports.peoplestrongEmployeeDetailsSyncTrigger = onSchedule(
 );
 
 /**
- * Scheduled: every 4 hours at :00 Eastern (01:00, 05:00, 09:00, 13:00, 17:00, 21:00).
+ * Scheduled: every 2 hours at :00 Eastern on ODD slots (09,11,13,15,17,19), alternating with
+ * dealSheetSyncUpdateTrigger which runs on the EVEN hours in between (10,12,...). This gives a clean
+ * insert -> (1h) update -> (1h) insert -> (1h) update rhythm: a new EXTENSION whose parent DEAL is
+ * inserted in the same run (and may sort before it) gets its CONTRACT_ID / hierarchy / ORIGINAL_START_DATE
+ * inherited on the very next update run, once the parent DEAL row exists in BigQuery.
  * Inserts **new** deal sheets only (DEAL_SHEET_ID not yet in BigQuery), first row STARTED/BOOKED.
- * Full Nexus job-submittals scan each run (no page checkpoint). Updates to existing rows use `dealSheetSyncUpdateTrigger`.
  */
 exports.dealSheetSyncTrigger = onSchedule(
   {
-    schedule: "0 9-19 * * *",
+    schedule: "0 9,11,13,15,17,19 * * *",
     timeZone: "America/New_York",
     region: REGION,
     timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
@@ -579,6 +585,11 @@ exports.dealSheetSyncTrigger = onSchedule(
         first_insert_placement_status_allowlist: firstInsertPlacementStatuses,
         // Bring in BOTH FINAL and VERBAL deal sheets (no longer FINAL-only).
         deal_sheet_status_codes: "FINAL,VERBAL",
+        // Push the START_DATE >= 2026-05-01 lower bound to the Nexus list (server-side) so we fetch
+        // ~1k relevant submittals instead of scanning every page (~3k+) and discarding old ones —
+        // this is the real cut to the socket-hangup / timeout load. No upper bound (future starts).
+        // filterEnrichedRowsByDealSheetMinStartDate stays below as the in-code safety net.
+        submittal_start_date_from: DEAL_SHEET_MIN_START_DATE_ISO,
         transform_rows_fn: filterEnrichedRowsByDealSheetMinStartDate,
         // Page-level Firestore checkpoint: on a thrown socket-hangup (ECONNRESET after retries) the
         // failed submittal page is saved and the next run resumes from it; on a fully-successful pass
@@ -629,23 +640,43 @@ exports.dealSheetSyncTrigger = onSchedule(
         logError("[dealSheetSyncTrigger] inorganic hierarchy log scan FAILED (non-fatal)", inorganicErr);
       }
 
+      // Ownership change logs incl. the recruiter-handover (previous->new recruiter + vacated role)
+      // rows — runs on this insert trigger too (not just the update trigger) per requirement.
+      logLine("[dealSheetSyncTrigger] Invoking syncOwnershipChangeLogsFromBigQuery (per-role + recruiter-handover scan)");
+      let ownershipChangeLogResult = null;
+      try {
+        ownershipChangeLogResult = await syncOwnershipChangeLogsFromBigQuery({
+          bq_dataset: bqDataset,
+          bq_table: "ownership_change_logs",
+        });
+        logLine(
+          `[dealSheetSyncTrigger] ownership change log result inserted=${ownershipChangeLogResult.inserted} changedPairs=${ownershipChangeLogResult.total} handoverRows=${ownershipChangeLogResult.handoverRows} builtRows=${ownershipChangeLogResult.builtRows} errorBatches=${ownershipChangeLogResult.errorBatches} elapsed=${ownershipChangeLogResult.elapsed || "n/a"}`
+        );
+      } catch (ownershipErr) {
+        logError("[dealSheetSyncTrigger] ownership change log scan FAILED (non-fatal)", ownershipErr);
+      }
+
       return {
         success: true,
         result,
         ownershipEffectiveDate: ownershipEffectiveDateResult,
         inorganicHierarchyLog: inorganicHierarchyLogResult,
+        ownershipChangeLog: ownershipChangeLogResult,
       };
     });
   }
 );
 
 /**
- * Scheduled: hourly :30 Eastern, 9:30 AM–7:30 PM (30 min after each insert trigger run).
- * Loads existing DEAL_SHEET_IDs from BigQuery (placement_id fallback when deal sheet null), refreshes via Nexus, appends on column diff vs latest deal-sheet row.
+ * Scheduled: every 2 hours at :00 Eastern on EVEN slots (10,12,14,16,18,20), interleaved with
+ * dealSheetSyncTrigger's ODD slots — so an insert run is always followed ~1h later by an update run.
+ * Loads existing DEAL_SHEET_IDs from BigQuery (placement_id fallback when deal sheet null), refreshes
+ * via Nexus, appends on column diff vs latest deal-sheet row. This is also where a same-run-inserted
+ * EXTENSION gets its parent-DEAL inheritance (CONTRACT_ID / hierarchy / ORIGINAL_START_DATE) filled in.
  */
 exports.dealSheetSyncUpdateTrigger = onSchedule(
   {
-    schedule: "30 9-19 * * *",
+    schedule: "0 10,12,14,16,18,20 * * *",
     timeZone: "America/New_York",
     region: REGION,
     timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
@@ -706,7 +737,7 @@ exports.dealSheetSyncUpdateTrigger = onSchedule(
           bq_table: "ownership_change_logs",
         });
         logLine(
-          `[dealSheetSyncUpdateTrigger] ownership change log result inserted=${ownershipChangeLogResult.inserted} changedPairs=${ownershipChangeLogResult.total} builtRows=${ownershipChangeLogResult.builtRows} errorBatches=${ownershipChangeLogResult.errorBatches} elapsed=${ownershipChangeLogResult.elapsed || "n/a"}`
+          `[dealSheetSyncUpdateTrigger] ownership change log result inserted=${ownershipChangeLogResult.inserted} changedPairs=${ownershipChangeLogResult.total} handoverRows=${ownershipChangeLogResult.handoverRows} builtRows=${ownershipChangeLogResult.builtRows} errorBatches=${ownershipChangeLogResult.errorBatches} elapsed=${ownershipChangeLogResult.elapsed || "n/a"}`
         );
       } catch (ownershipErr) {
         // Non-fatal, same as the inorganic scan above.

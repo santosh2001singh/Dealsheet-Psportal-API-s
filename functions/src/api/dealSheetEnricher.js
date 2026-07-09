@@ -55,6 +55,11 @@ const { computeBonusTotals } = require("../bonusTotals");
 const { computeWeekSplit } = require("../weekSplit");
 const { computeNewRateFamily } = require("../w2PayRateNew");
 const { sanitizeCanadaDealSheetRow, isCynetHealthCanadaRecruiter, pickCanadaDealSheetHoursPart } = require("../canadaDerivedPlacementFields");
+const {
+  sanitizeLocumsDealSheetRow,
+  isCynetLocumsRecruiter,
+  mapLocumsTypeFromTenNintyNine,
+} = require("../locumsDerivedPlacementFields");
 const { shouldExcludeRowFromBigQuery } = require("../bqRowExclusions");
 const { resolveContractIdsForRows } = require("../contractIdResolver");
 const { allocateContractIds } = require("../contractIdSequence");
@@ -958,6 +963,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     const userPart = mapDealSheetUsersToBq(detail, recruiterUser, salesRepUser, submittalRow);
 
     const isCanadaRecruiter = isCynetHealthCanadaRecruiter(userPart?.ASSIGNMENT_RECRUITER_EMAIL);
+    const isLocumsRecruiter = isCynetLocumsRecruiter(userPart?.ASSIGNMENT_RECRUITER_EMAIL);
     const hoursPartForRow = isCanadaRecruiter ? pickCanadaDealSheetHoursPart(hoursPart) : hoursPart;
     const bonusTotalsPart = isCanadaRecruiter
       ? {}
@@ -1003,8 +1009,11 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     const newHireDate = resolveNewHireDateForDealRow(dealSheetPart?.DEAL_TYPE, notesForPlacement);
     const extensionDate = resolveExtensionDateForExtensionRow(dealSheetPart?.DEAL_TYPE, submittalRow);
 
-    const canadaTypePart = isCynetHealthCanadaRecruiter(userPart?.ASSIGNMENT_RECRUITER_EMAIL)
+    const canadaTypePart = isCanadaRecruiter
       ? { TYPE: mapCanadaTypeFromTenNintyNine(detail) }
+      : {};
+    const locumsTypePart = isLocumsRecruiter
+      ? { TYPE: mapLocumsTypeFromTenNintyNine(detail) }
       : {};
 
     const row = {
@@ -1026,6 +1035,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       ...candidateDetailPart,
       ...providerTypePart,
       ...canadaTypePart,
+      ...locumsTypePart,
       CLIENT_TYPE: mspPart?.CLIENT_TYPE ?? null,
       LINE_OF_BUSINESS: lineOfBusiness,
       START_DATE: submittalPart?.START_DATE ?? null,
@@ -1037,11 +1047,11 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       NEW_HIRE_DATE: newHireDate,
       EXTENSION_DATE: extensionDate,
     };
-    const newRateFamilyPart = isCynetHealthCanadaRecruiter(row?.ASSIGNMENT_RECRUITER_EMAIL)
+    const newRateFamilyPart = (isCanadaRecruiter || isLocumsRecruiter)
       ? {}
       : computeNewRateFamily(row);
     const derivedPart = computeDerivedPlacementFields(row);
-    const finalRow = sanitizeCanadaDealSheetRow(coerceApiFloatNullsToZero({
+    const finalRow = sanitizeLocumsDealSheetRow(sanitizeCanadaDealSheetRow(coerceApiFloatNullsToZero({
       ...row,
       ...newRateFamilyPart,
       ...derivedPart,
@@ -1072,15 +1082,18 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     );
   }
 
+  // Resolve emp-no for both the current recruiter (ASSIGNMENT_RECRUITER_EMAIL -> RECRUITER_EMP_NO)
+  // and, on a handover DEAL, the previous recruiter (PREVIOUS_RECRUITER_EMAIL -> PREVIOUS_RECRUITER_EMP_NO).
   const recruiterEmails = [];
   const recruiterEmailSeen = new Set();
   for (const row of combined) {
-    const email = row?.ASSIGNMENT_RECRUITER_EMAIL;
-    if (email == null) continue;
-    const norm = String(email).trim().toLowerCase();
-    if (!norm || recruiterEmailSeen.has(norm)) continue;
-    recruiterEmailSeen.add(norm);
-    recruiterEmails.push(norm);
+    for (const email of [row?.ASSIGNMENT_RECRUITER_EMAIL, row?.__PREV_RECRUITER_EMAIL]) {
+      if (email == null) continue;
+      const norm = String(email).trim().toLowerCase();
+      if (!norm || recruiterEmailSeen.has(norm)) continue;
+      recruiterEmailSeen.add(norm);
+      recruiterEmails.push(norm);
+    }
   }
   if (recruiterEmails.length > 0) {
     const directoryByEmail = await fetchEmployeeDirectoryByEmails(recruiterEmails);
@@ -1088,9 +1101,14 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       const email = row?.ASSIGNMENT_RECRUITER_EMAIL;
       const norm = email == null ? "" : String(email).trim().toLowerCase();
       row.RECRUITER_EMP_NO = norm ? directoryByEmail.get(norm)?.employeeId ?? null : null;
+      const prevEmail = row?.__PREV_RECRUITER_EMAIL;
+      const prevNorm = prevEmail == null ? "" : String(prevEmail).trim().toLowerCase();
+      // Stash previous recruiter's emp-no on a temp field too; the real PREVIOUS_RECRUITER_EMP_NO is
+      // filled (when empty) later, after manual-column carry-forward.
+      if (prevNorm) row.__PREV_RECRUITER_EMP_NO = directoryByEmail.get(prevNorm)?.employeeId ?? null;
     }
     logLine(
-      `[enriched sync] STEP 3/4 ENRICH: RECRUITER_EMP_NO resolved for ${directoryByEmail.size}/${recruiterEmails.length} unique recruiter email(s)`
+      `[enriched sync] STEP 3/4 ENRICH: RECRUITER_EMP_NO / previous-recruiter emp-no resolved from ${directoryByEmail.size}/${recruiterEmails.length} unique email(s)`
     );
   }
 
