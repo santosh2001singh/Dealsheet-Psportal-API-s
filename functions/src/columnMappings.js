@@ -1677,6 +1677,8 @@ const MANUAL_COLUMNS = new Set([
   "TEAM_LEAD_EMP_NO",
   "TYPE",
   "UPDATED_AT",
+  "AVP",
+  "AVP_EMP_NO",
   "VP_SRVP",
   "VP_SRVP_EMP_NO",
   "WEEKLY_WALLET_MONEY",

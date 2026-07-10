@@ -18,7 +18,7 @@ test("resolveHierarchyColumnForTitle maps known designations, case/whitespace-in
   assert.equal(resolveHierarchyColumnForTitle("Sr. Delivery Manager"), "ACCOUNT_MANAGER");
   assert.equal(resolveHierarchyColumnForTitle("Delivery Director"), "DELIVERY_DIRECTOR");
   assert.equal(resolveHierarchyColumnForTitle("Associate Group Director"), "GRP_DIR_ASSOC_GRP_DIR");
-  assert.equal(resolveHierarchyColumnForTitle("Associate Vice President - Delivery"), "VP_SRVP");
+  assert.equal(resolveHierarchyColumnForTitle("Associate Vice President - Delivery"), "AVP");
   assert.equal(resolveHierarchyColumnForTitle("SrVP"), "VP_SRVP");
   assert.equal(resolveHierarchyColumnForTitle("Chief Growth Officer (CGO)"), null);
   assert.equal(resolveHierarchyColumnForTitle(null), null);
@@ -51,6 +51,7 @@ test("rowNeedsDealRecruiterHierarchyBackfill requires DEAL_TYPE=DEAL, recruiter 
     ACCOUNT_MANAGER: "A", ACCOUNT_MANAGER_EMP_NO: "1",
     DELIVERY_DIRECTOR: "A", DELIVERY_DIRECTOR_EMP_NO: "1",
     GRP_DIR_ASSOC_GRP_DIR: "A", GRP_DIR_ASSOC_GRP_DIR_EMP_NO: "1",
+    AVP: "A", AVP_EMP_NO: "1",
     VP_SRVP: "A", VP_SRVP_EMP_NO: "1",
   };
   assert.equal(rowNeedsDealRecruiterHierarchyBackfill(fullyFilled), false);
@@ -146,6 +147,7 @@ test("applyDealRecruiterHierarchyForInsertRows is a no-op when no rows are eligi
       ACCOUNT_MANAGER: "Already Set", ACCOUNT_MANAGER_EMP_NO: "1",
       DELIVERY_DIRECTOR: "Already Set", DELIVERY_DIRECTOR_EMP_NO: "1",
       GRP_DIR_ASSOC_GRP_DIR: "Already Set", GRP_DIR_ASSOC_GRP_DIR_EMP_NO: "1",
+      AVP: "Already Set", AVP_EMP_NO: "1",
       VP_SRVP: "Already Set", VP_SRVP_EMP_NO: "1",
     },
   ];

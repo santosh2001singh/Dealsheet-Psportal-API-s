@@ -15,6 +15,7 @@ const DEAL_RECRUITER_HIERARCHY_TARGETS = [
   { column: "ACCOUNT_MANAGER", empNoColumn: "ACCOUNT_MANAGER_EMP_NO" },
   { column: "DELIVERY_DIRECTOR", empNoColumn: "DELIVERY_DIRECTOR_EMP_NO" },
   { column: "GRP_DIR_ASSOC_GRP_DIR", empNoColumn: "GRP_DIR_ASSOC_GRP_DIR_EMP_NO" },
+  { column: "AVP", empNoColumn: "AVP_EMP_NO" },
   { column: "VP_SRVP", empNoColumn: "VP_SRVP_EMP_NO" },
 ];
 Object.freeze(DEAL_RECRUITER_HIERARCHY_TARGETS);
@@ -65,6 +66,10 @@ const HIERARCHY_DESIGNATION_SYNONYMS = {
     "srvp",
     "vp srvp",
     "vp/srvp",
+  ],
+  // Associate VP is its OWN designation (AVP column), split out of VP_SRVP. Exact-map lookup means
+  // "associate vice president" never collides with VP_SRVP's "vice president".
+  AVP: [
     "avp",
     "associate vice president",
     "associate vice president - delivery",
@@ -214,6 +219,7 @@ const DESIGNATION_TO_INORGANIC_LOG_COLUMN = {
     empNoColumn: "INORGANIC_ASSOCIATE_GROUP_DIRECTOR_EMP_NO",
   },
   DELIVERY_DIRECTOR: { column: "INORGANIC_DELIVERY_DIRECTOR", empNoColumn: "INORGANIC_DELIVERY_DIRECTOR_EMP_NO" },
+  AVP: { column: "INORGANIC_AVP", empNoColumn: "INORGANIC_AVP_EMP_NO" },
   VP_SRVP: { column: "INORGANIC_VP_SR_VP", empNoColumn: "INORGANIC_VP_SR_VP_EMP_NO" },
 };
 Object.freeze(DESIGNATION_TO_INORGANIC_LOG_COLUMN);

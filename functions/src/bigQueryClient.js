@@ -886,6 +886,10 @@ function applyPreviousRecruiterOnRecruiterChange(incomingRow, baselineRow) {
       PREVIOUS_RECRUITER_NAME: baselineRow.ASSIGNMENT_RECRUITER ?? null,
       PREVIOUS_RECRUITER_EMAIL: baselineRow.ASSIGNMENT_RECRUITER_EMAIL ?? null,
       PREVIOUS_RECRUITER_EMP_NO: baselineRow.RECRUITER_EMP_NO ?? null,
+      // Recruiter changed -> stamp EFFECTIVE_DATE = TENTATIVE_DATE + 1 (temporary), the same value
+      // the ownership_change_logs RECRUITER row gets; both are later overwritten to the extension's
+      // START_DATE (see the effective-date overwrite in the insert trigger).
+      EFFECTIVE_DATE: addOneDayToDateOnly(incomingRow.TENTATIVE_DATE),
     },
     changed: true,
   };
@@ -2400,6 +2404,7 @@ const ACTIVE_CHANGE_SCAN_COLUMNS = [
   "CANDIDATE_EMAIL",
   "CANDIDATE_NEXUS_ID",
   "CONTRACT_ID",
+  "SKU_NUMBER",
   "START_DATE",
   "TENTATIVE_DATE",
   "NEW_HIRE_DATE",
@@ -2424,6 +2429,7 @@ const ACTIVE_CHANGE_SCAN_COLUMNS = [
   "ACCOUNT_MANAGER", "ACCOUNT_MANAGER_EMP_NO",
   "DELIVERY_DIRECTOR", "DELIVERY_DIRECTOR_EMP_NO",
   "GRP_DIR_ASSOC_GRP_DIR", "GRP_DIR_ASSOC_GRP_DIR_EMP_NO",
+  "AVP", "AVP_EMP_NO",
   "VP_SRVP", "VP_SRVP_EMP_NO",
 ];
 Object.freeze(ACTIVE_CHANGE_SCAN_COLUMNS);
@@ -2722,6 +2728,7 @@ const EXTENSION_RUNRATE_HIERARCHY_COLUMNS = [
   "SECONDARY_AM",
   "ASSOCIATE_AM",
   "GRP_DIR_ASSOC_GRP_DIR",
+  "AVP",
   "VP_SRVP",
 ];
 Object.freeze(EXTENSION_RUNRATE_HIERARCHY_COLUMNS);
@@ -3364,8 +3371,13 @@ ${runrateSelectHierarchy}
       )
       SELECT
         CAST(e.placement_id AS STRING) AS placement_id,
-        COALESCE(c.client_original_start_date, s.sku_original_start_date) AS proposed_original_start_date,
-        COALESCE(c.client_new_hire_date, s.sku_new_hire_date, b.runrate_new_hire_date) AS proposed_new_hire_date,
+        -- Prefer the SKU-based origin over the parent-client-based one. SKU_NUMBER (from the MATCHED
+        -- parent b) identifies the specific contract chain, whereas the parent-client-only key is too
+        -- broad: a candidate can have SEPARATE engagements at the same client years apart (e.g. an
+        -- old 2022 assignment + a new 2026 one), and client-first wrongly reaches back to the oldest,
+        -- putting a stale 2022 ORIGINAL_START_DATE / NEW_HIRE_DATE on a 2026 extension.
+        COALESCE(s.sku_original_start_date, c.client_original_start_date) AS proposed_original_start_date,
+        COALESCE(s.sku_new_hire_date, c.client_new_hire_date, b.runrate_new_hire_date) AS proposed_new_hire_date,
         b.runrate_sku AS proposed_sku_number,
 ${bestMatchHierarchySelect}
       FROM extensions e
@@ -3700,7 +3712,13 @@ function rowNeedsDealRecruiterHierarchyBackfill(row) {
  */
 function formatTimestampLiteralForSql(value) {
   if (value == null || value === "") return "CAST(NULL AS TIMESTAMP)";
-  const d = value instanceof Date ? value : new Date(value);
+  // BigQuery timestamp/datetime columns come back as { value: "..." } wrapper objects. On an
+  // update-append NEW_HIRE_DATE is carried from the baseline (a wrapper), and `new Date(wrapper)` is
+  // Invalid → this used to emit CAST(NULL) → null anchor → the hierarchy/CSM lookup fell back to the
+  // EARLIEST snapshot (months-old, e.g. a since-departed manager) instead of the hire-date snapshot.
+  const raw = value && typeof value === "object" && !(value instanceof Date) && "value" in value ? value.value : value;
+  if (raw == null || raw === "") return "CAST(NULL AS TIMESTAMP)";
+  const d = raw instanceof Date ? raw : new Date(raw);
   if (!Number.isFinite(d.getTime())) return "CAST(NULL AS TIMESTAMP)";
   return `TIMESTAMP '${escapeSqlString(d.toISOString())}'`;
 }
@@ -3927,6 +3945,11 @@ function applyPreviousRecruiterFillForInsertRows(rows) {
       PREVIOUS_RECRUITER_NAME: row.__PREV_RECRUITER_NAME ?? null,
       PREVIOUS_RECRUITER_EMAIL: tempEmail,
       PREVIOUS_RECRUITER_EMP_NO: row.__PREV_RECRUITER_EMP_NO ?? null,
+      // Handover = a recruiter change; stamp EFFECTIVE_DATE = TENTATIVE_DATE + 1 (only when empty),
+      // same as the across-append recruiter change and the ownership log. Overwritten by extension.
+      EFFECTIVE_DATE: isEmptyDateFieldValue(row.EFFECTIVE_DATE)
+        ? addOneDayToDateOnly(row.TENTATIVE_DATE)
+        : row.EFFECTIVE_DATE,
     };
   });
 }
@@ -4070,12 +4093,28 @@ function isAvailableHierarchyValue(value) {
 }
 
 /**
- * Pick the DELIVERY_POC owner for a row: first priority slot with an available name. Returns
- * { nameCol, name, empNo, isRecruiter } or null when the whole chain (incl. recruiter) is empty.
+ * Same priority chain as DELIVERY_POC but over the INORGANIC_* columns of an inorganic_hierarchy_logs
+ * row (no SECONDARY_AM / DELIVERY_DIRECTOR / AVP — mirrors DELIVERY_POC_PRIORITY exactly). Used to
+ * derive INORGANIC_DELIVERY_POC = the highest-seniority person present in the recruiter's live chain.
  */
-function pickDeliveryPocForRow(row) {
+const INORGANIC_DELIVERY_POC_PRIORITY = [
+  { nameCol: "INORGANIC_VP_SR_VP", empCol: "INORGANIC_VP_SR_VP_EMP_NO" },
+  { nameCol: "INORGANIC_ASSOCIATE_GROUP_DIRECTOR", empCol: "INORGANIC_ASSOCIATE_GROUP_DIRECTOR_EMP_NO" },
+  { nameCol: "INORGANIC_ACCOUNT_MANAGER", empCol: "INORGANIC_ACCOUNT_MANAGER_EMP_NO" },
+  { nameCol: "INORGANIC_ASSOCIATE_AM", empCol: "INORGANIC_ASSOCIATE_AM_EMP_NO" },
+  { nameCol: "INORGANIC_RM", empCol: "INORGANIC_RM_EMP_NO" },
+  { nameCol: "INORGANIC_TL", empCol: "INORGANIC_TL_EMP_NO" },
+  { nameCol: "INORGANIC_ATL", empCol: "INORGANIC_ATL_EMP_NO" },
+  { nameCol: "INORGANIC_RECRUITER", empCol: "INORGANIC_RECRUITER_EMP_NO", isRecruiter: true },
+];
+
+/**
+ * Pick the delivery-POC owner for a row from a priority chain: first slot with an available name.
+ * Returns { nameCol, name, empNo, isRecruiter } or null when the whole chain is empty.
+ */
+function pickPocForRow(row, priority) {
   if (!row || typeof row !== "object") return null;
-  for (const slot of DELIVERY_POC_PRIORITY) {
+  for (const slot of priority) {
     if (!isAvailableHierarchyValue(row[slot.nameCol])) continue;
     const empRaw = row[slot.empCol];
     return {
@@ -4086,6 +4125,11 @@ function pickDeliveryPocForRow(row) {
     };
   }
   return null;
+}
+
+/** Deal-sheet DELIVERY_POC pick (see DELIVERY_POC_PRIORITY). */
+function pickDeliveryPocForRow(row) {
+  return pickPocForRow(row, DELIVERY_POC_PRIORITY);
 }
 
 /**
@@ -4687,6 +4731,7 @@ const INORGANIC_HIERARCHY_DEDUPE_COLUMNS = [
   "INORGANIC_ATL",
   "INORGANIC_ASSOCIATE_GROUP_DIRECTOR",
   "INORGANIC_DELIVERY_DIRECTOR",
+  "INORGANIC_AVP",
   "INORGANIC_VP_SR_VP",
 ];
 const INORGANIC_HIERARCHY_DEDUPE_ALL_BLANK = INORGANIC_HIERARCHY_DEDUPE_COLUMNS.map(() => "").join(",");
@@ -4789,7 +4834,7 @@ async function resolveInorganicHierarchyLogRows(candidates, options = {}, deps =
   const nowIso = new Date().toISOString();
   const todayDate = nowIso.slice(0, 10);
 
-  return candidates.map((c, index) => {
+  const rows = candidates.map((c, index) => {
     const directoryEntry = c.newRecruiterEmail
       ? directoryByEmail.get(c.newRecruiterEmail.toLowerCase())
       : null;
@@ -4842,6 +4887,37 @@ async function resolveInorganicHierarchyLogRows(candidates, options = {}, deps =
 
     return row;
   });
+
+  // INORGANIC_DELIVERY_POC = highest-seniority person present in the recruiter's live chain (same
+  // priority as the deal-sheet DELIVERY_POC). Name + emp-no picked synchronously; email resolved from
+  // directory by emp-no (recruiter POC uses its own RECRUITER_EMAIL_ID).
+  const pocByRowIndex = new Map();
+  const pocEmpNos = [];
+  rows.forEach((row, i) => {
+    const picked = pickPocForRow(row, INORGANIC_DELIVERY_POC_PRIORITY);
+    if (!picked) return;
+    pocByRowIndex.set(i, picked);
+    row.INORGANIC_DELIVERY_POC = picked.name;
+    row.INORGANIC_DELIVERY_POC_EMP_NO = picked.empNo;
+    if (!picked.isRecruiter && picked.empNo) pocEmpNos.push(picked.empNo);
+  });
+  if (pocByRowIndex.size > 0) {
+    const fetchEmailsFn = deps.fetchEmailsFn ?? fetchDeliveryPocEmails;
+    const { byEmp } = await fetchEmailsFn(pocEmpNos, []);
+    rows.forEach((row, i) => {
+      const picked = pocByRowIndex.get(i);
+      if (!picked) return;
+      if (picked.isRecruiter) {
+        row.INORGANIC_DELIVERY_POC_EMAIL = row.RECRUITER_EMAIL_ID ?? null;
+      } else if (picked.empNo && byEmp.has(picked.empNo)) {
+        row.INORGANIC_DELIVERY_POC_EMAIL = byEmp.get(picked.empNo);
+      } else {
+        row.INORGANIC_DELIVERY_POC_EMAIL = null;
+      }
+    });
+  }
+
+  return rows;
 }
 
 /**
@@ -5044,7 +5120,7 @@ function buildOwnershipChangeLogContext(latestRow, nowIso) {
   const tentative = latestRow?.TENTATIVE_DATE;
   return {
     DATE_AND_TIME: nowIso,
-    SKU_NO: null,
+    SKU_NO: ownershipDisplayValueOrNull(latestRow?.SKU_NUMBER),
     CONTRACT_ID: ownershipDisplayValueOrNull(latestRow?.CONTRACT_ID),
     PLACEMENT_ID: latestRow?.PLACEMENT_ID == null ? null : String(latestRow.PLACEMENT_ID).trim(),
     CANDIDATE_NAME: latestRow?.CANDIDATE_NAME ?? null,
@@ -5368,6 +5444,112 @@ async function insertOwnershipChangeLogBatch(logRows, insertIdBase, options = {}
  * handover became effective when the extension started, replacing the temporary tentative+1 date).
  * Idempotent — only touches rows whose EFFECTIVE_DATE differs from the resolved extension date.
  */
+/**
+ * Sync CANDIDATE_NAME / CANDIDATE_EMAIL onto ownership_change_logs from the LATEST deal-sheet row of
+ * each placement. The deal sheet appends a new row when a candidate's name/email changes, but the
+ * ownership log must keep ONE row per (placement, role) — so this OVERWRITES the existing log rows in
+ * place (matched by PLACEMENT_ID), rather than adding new ones. Only touches rows whose stored name/
+ * email actually differs (no no-op DML).
+ */
+async function overwriteOwnershipChangeLogCandidateInfoFromDealSheet(options = {}) {
+  const dealSheetDatasetId =
+    typeof options.dealSheetDatasetId === "string" && options.dealSheetDatasetId.trim() !== ""
+      ? options.dealSheetDatasetId.trim()
+      : config.datasetId;
+  const logDatasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.ownershipChangeLogDatasetId;
+  const logTableId =
+    typeof options.tableId === "string" && options.tableId.trim() !== ""
+      ? options.tableId.trim()
+      : config.ownershipChangeLogTableId;
+
+  // Base union lacks CANDIDATE_NAME / DATE_AND_TIME — project them so we can pick the latest row.
+  const unionSql = buildActiveDealSheetsUnionSql(dealSheetDatasetId, undefined, [
+    "CANDIDATE_NAME",
+    "DATE_AND_TIME",
+  ]);
+
+  const sql = `
+    UPDATE \`${config.projectId}.${logDatasetId}.${logTableId}\` o
+    SET o.CANDIDATE_NAME = latest.CANDIDATE_NAME, o.CANDIDATE_EMAIL = latest.CANDIDATE_EMAIL
+    FROM (
+      SELECT placement_id_norm, CANDIDATE_NAME, CANDIDATE_EMAIL FROM (
+        SELECT
+          TRIM(CAST(PLACEMENT_ID AS STRING)) AS placement_id_norm,
+          CANDIDATE_NAME,
+          CANDIDATE_EMAIL,
+          ROW_NUMBER() OVER (
+            PARTITION BY TRIM(CAST(PLACEMENT_ID AS STRING))
+            ORDER BY DATE_AND_TIME DESC NULLS LAST
+          ) AS rn
+        FROM (${unionSql})
+        WHERE PLACEMENT_ID IS NOT NULL AND TRIM(CAST(PLACEMENT_ID AS STRING)) != ''
+      )
+      WHERE rn = 1
+    ) latest
+    WHERE o.PLACEMENT_ID IS NOT NULL
+      AND TRIM(CAST(o.PLACEMENT_ID AS STRING)) = latest.placement_id_norm
+      AND (
+        IFNULL(o.CANDIDATE_NAME, '') != IFNULL(latest.CANDIDATE_NAME, '')
+        OR IFNULL(o.CANDIDATE_EMAIL, '') != IFNULL(latest.CANDIDATE_EMAIL, '')
+      )
+  `;
+
+  const [job] = await bigquery.createQueryJob({ query: sql });
+  await job.getQueryResults();
+  const meta = job.metadata?.statistics?.query;
+  const updated = meta?.dmlStats?.updatedRowCount ?? null;
+  logLine(
+    `[ownership change logs] candidate name/email overwrite from deal sheet: updatedRows=${updated == null ? "n/a" : updated}`
+  );
+  return { updated: updated == null ? null : Number(updated) };
+}
+
+/**
+ * Overwrite the DEAL-SHEET EFFECTIVE_DATE (stamped as TENTATIVE_DATE+1 on a recruiter-change row)
+ * with the matching CONTRACT_ID's extension START_DATE — the mirror of
+ * overwriteOwnershipChangeLogEffectiveDatesFromExtensions, but on the deal-sheet tables themselves.
+ * Only touches rows that already carry an EFFECTIVE_DATE (i.e. recruiter-change rows), so ordinary
+ * rows stay null. This is a deliberate in-place UPDATE of the otherwise append-only deal sheet.
+ */
+async function overwriteDealSheetEffectiveDatesFromExtensions(options = {}) {
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+  const unionSql = buildActiveDealSheetsUnionSql(datasetId);
+  let totalUpdated = 0;
+
+  for (const tableId of ACTIVE_DEAL_SHEET_TABLE_IDS) {
+    const sql = `
+      UPDATE \`${config.projectId}.${datasetId}.${tableId}\` d
+      SET EFFECTIVE_DATE = ext.ext_start_date
+      FROM (
+        SELECT
+          UPPER(TRIM(CAST(CONTRACT_ID AS STRING))) AS contract_id_norm,
+          MIN(START_DATE) AS ext_start_date
+        FROM (${unionSql})
+        WHERE UPPER(TRIM(CAST(DEAL_TYPE AS STRING))) = 'EXTENSION'
+          AND CONTRACT_ID IS NOT NULL AND TRIM(CAST(CONTRACT_ID AS STRING)) != ''
+          AND START_DATE IS NOT NULL
+        GROUP BY contract_id_norm
+      ) ext
+      WHERE d.CONTRACT_ID IS NOT NULL
+        AND UPPER(TRIM(CAST(d.CONTRACT_ID AS STRING))) = ext.contract_id_norm
+        AND d.EFFECTIVE_DATE IS NOT NULL
+        AND d.EFFECTIVE_DATE != ext.ext_start_date
+    `;
+    const [job] = await bigquery.createQueryJob({ query: sql });
+    await job.getQueryResults();
+    totalUpdated += Number(job.metadata?.statistics?.query?.dmlStats?.updatedRowCount ?? 0);
+  }
+
+  logLine(`[deal sheet] EFFECTIVE_DATE overwrite from extensions: updatedRows=${totalUpdated}`);
+  return { updated: totalUpdated };
+}
+
 async function overwriteOwnershipChangeLogEffectiveDatesFromExtensions(options = {}) {
   const dealSheetDatasetId =
     typeof options.dealSheetDatasetId === "string" && options.dealSheetDatasetId.trim() !== ""
@@ -5555,6 +5737,8 @@ module.exports = {
   fetchExistingOwnershipChangeLogKeysSet,
   insertOwnershipChangeLogBatch,
   overwriteOwnershipChangeLogEffectiveDatesFromExtensions,
+  overwriteOwnershipChangeLogCandidateInfoFromDealSheet,
+  overwriteDealSheetEffectiveDatesFromExtensions,
   applyPreviousRecruiterOnRecruiterChange,
   finalizeDealSheetRowForResponse,
 };

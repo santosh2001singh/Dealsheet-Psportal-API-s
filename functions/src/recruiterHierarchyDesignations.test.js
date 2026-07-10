@@ -10,9 +10,11 @@ const {
 test("resolveHierarchyColumnForTitle handles real '<role> - Delivery' title suffixes", () => {
   // The bug: "Vice President - Delivery" (Amy Gupta's actual directory title) didn't match VP_SRVP.
   assert.equal(resolveHierarchyColumnForTitle("Vice President - Delivery"), "VP_SRVP");
-  assert.equal(resolveHierarchyColumnForTitle("AVP - Delivery"), "VP_SRVP");
-  assert.equal(resolveHierarchyColumnForTitle("Associate Vice President - Delivery"), "VP_SRVP");
   assert.equal(resolveHierarchyColumnForTitle("Vice President"), "VP_SRVP");
+  // Associate VP is its own designation now (split out of VP_SRVP).
+  assert.equal(resolveHierarchyColumnForTitle("AVP - Delivery"), "AVP");
+  assert.equal(resolveHierarchyColumnForTitle("Associate Vice President - Delivery"), "AVP");
+  assert.equal(resolveHierarchyColumnForTitle("AVP"), "AVP");
   // Unchanged exact matches still work.
   assert.equal(resolveHierarchyColumnForTitle("Sr. Delivery Manager"), "ACCOUNT_MANAGER");
   assert.equal(resolveHierarchyColumnForTitle("Delivery Director"), "DELIVERY_DIRECTOR");

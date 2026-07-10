@@ -63,7 +63,7 @@ test("buildInorganicHierarchyLogCandidate uses EXTENSION_DATE as anchor for EXTE
 });
 
 test("buildInorganicHierarchyLogDedupeKey combines DEAL_SHEET_ID, PLACEMENT_ID, recruiter email, CSM levels, and hierarchy divergences", () => {
-  const hierarchyBlank = ",,,,,,,"; // 8 INORGANIC_HIERARCHY_DEDUPE_COLUMNS, all empty
+  const hierarchyBlank = ",,,,,,,,"; // 9 INORGANIC_HIERARCHY_DEDUPE_COLUMNS, all empty
   const row = { DEAL_SHEET_ID: 1, PLACEMENT_ID: 100, RECRUITER_EMAIL_ID: "New@CynetHealth.com " };
   assert.equal(buildInorganicHierarchyLogDedupeKey(row), `1|100|new@cynethealth.com|,,|${hierarchyBlank}`);
   // No signal at all -> nothing to dedupe on, empty key.
@@ -75,7 +75,7 @@ test("buildInorganicHierarchyLogDedupeKey combines DEAL_SHEET_ID, PLACEMENT_ID, 
   const hierarchyOnlyRow = { DEAL_SHEET_ID: 1, PLACEMENT_ID: 100, INORGANIC_ACCOUNT_MANAGER: "Nikhil Sharma" };
   assert.equal(
     buildInorganicHierarchyLogDedupeKey(hierarchyOnlyRow),
-    "1|100||,,|nikhil sharma,,,,,,,"
+    "1|100||,,|nikhil sharma,,,,,,,,"
   );
   assert.equal(buildInorganicHierarchyLogDedupeKey(null), "");
 });
@@ -118,7 +118,11 @@ test("resolveInorganicHierarchyLogRows fills recruiter identity and hierarchy fr
     ]);
   };
 
-  const rows = await resolveInorganicHierarchyLogRows(candidates, {}, { directoryFetchFn, hierarchyFetchFn });
+  const fetchEmailsFn = async (empNos) => ({
+    byEmp: new Map((empNos || []).includes("CY2431") ? [["CY2431", "nikhil.s@cynethealth.com"]] : []),
+    byName: new Map(),
+  });
+  const rows = await resolveInorganicHierarchyLogRows(candidates, {}, { directoryFetchFn, hierarchyFetchFn, fetchEmailsFn });
   assert.equal(rows.length, 1);
   const row = rows[0];
   assert.equal(row.DEAL_SHEET_ID, 1);
@@ -129,8 +133,14 @@ test("resolveInorganicHierarchyLogRows fills recruiter identity and hierarchy fr
   assert.equal(row.INORGANIC_RECRUITER_EMP_NO, "CY2393");
   assert.equal(row.INORGANIC_ACCOUNT_MANAGER, "Nikhil Sharma");
   assert.equal(row.INORGANIC_ACCOUNT_MANAGER_EMP_NO, "CY2431");
-  assert.equal(row.INORGANIC_VP_SR_VP, "Maneet Gupta");
-  assert.equal(row.INORGANIC_VP_SR_VP_EMP_NO, "CY2088");
+  // "Associate Vice President - Delivery" is now its own AVP designation (split out of VP_SRVP).
+  assert.equal(row.INORGANIC_AVP, "Maneet Gupta");
+  assert.equal(row.INORGANIC_AVP_EMP_NO, "CY2088");
+  // INORGANIC_DELIVERY_POC = highest present in the deal-sheet POC chain. AVP is NOT in that chain,
+  // so ACCOUNT_MANAGER (Nikhil) wins; email resolved by emp-no.
+  assert.equal(row.INORGANIC_DELIVERY_POC, "Nikhil Sharma");
+  assert.equal(row.INORGANIC_DELIVERY_POC_EMP_NO, "CY2431");
+  assert.equal(row.INORGANIC_DELIVERY_POC_EMAIL, "nikhil.s@cynethealth.com");
   // "Chief Growth Officer (CGO)" matches no known designation -> no INORGANIC_* column set for it.
   assert.equal(row.EFFECTIVE_DATE, new Date().toISOString().slice(0, 10));
   assert.equal(typeof row.DATE_AND_TIME, "string");

@@ -1055,7 +1055,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       ...row,
       ...newRateFamilyPart,
       ...derivedPart,
-    }));
+    })));
     if (shouldExcludeRowFromBigQuery(finalRow)) {
       excludedDummyOrTraining++;
       continue;

@@ -49,6 +49,8 @@ const {
   buildOwnershipChangeLogRows,
   insertOwnershipChangeLogBatch,
   overwriteOwnershipChangeLogEffectiveDatesFromExtensions,
+  overwriteOwnershipChangeLogCandidateInfoFromDealSheet,
+  overwriteDealSheetEffectiveDatesFromExtensions,
   finalizeDealSheetRowForResponse,
   hasBusinessColumnChanges,
   normalizeForCompare,
@@ -2292,9 +2294,22 @@ async function syncOwnershipChangeLogsFromBigQuery(params = {}) {
     tableId: logTableId,
   });
 
+  // Candidate name/email can change on the deal sheet (a new appended row); the ownership log keeps
+  // one row per (placement, role) and must be OVERWRITTEN in place (by PLACEMENT_ID) — not appended.
+  let candidateInfoOverwrite = null;
+  try {
+    candidateInfoOverwrite = await overwriteOwnershipChangeLogCandidateInfoFromDealSheet({
+      dealSheetDatasetId,
+      datasetId: logDatasetId,
+      tableId: logTableId,
+    });
+  } catch (ciErr) {
+    logLine(`[ownership change logs BQ scan] candidate name/email overwrite failed (non-fatal): ${String(ciErr?.message || ciErr).slice(0, 200)}`);
+  }
+
   const elapsedStr = formatDuration(Date.now() - startMs);
   logLine(
-    `[ownership change logs BQ scan] DONE inserted=${result.inserted} changedPairs=${pairs.size} handoverRows=${handoverRows.length} builtRows=${rows.length} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
+    `[ownership change logs BQ scan] DONE inserted=${result.inserted} changedPairs=${pairs.size} handoverRows=${handoverRows.length} builtRows=${rows.length} candidateInfoUpdated=${candidateInfoOverwrite?.updated ?? "n/a"} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
   );
 
   return {
@@ -2302,6 +2317,7 @@ async function syncOwnershipChangeLogsFromBigQuery(params = {}) {
     total: pairs.size,
     handoverRows: handoverRows.length,
     builtRows: rows.length,
+    candidateInfoUpdated: candidateInfoOverwrite?.updated ?? null,
     errorBatches: result.errorBatches,
     elapsed: elapsedStr,
   };
@@ -2323,9 +2339,16 @@ async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
     datasetId: params.bq_dataset,
     tableId: params.bq_table,
   });
+  // Same overwrite on the deal-sheet EFFECTIVE_DATE (recruiter-change rows: tentative+1 -> ext start).
+  let dealSheetResult = { updated: null };
+  try {
+    dealSheetResult = await overwriteDealSheetEffectiveDatesFromExtensions({ datasetId: dealSheetDatasetId });
+  } catch (dsErr) {
+    logLine(`[deal sheet] effective-date overwrite failed (non-fatal): ${String(dsErr?.message || dsErr).slice(0, 200)}`);
+  }
   const elapsedStr = formatDuration(Date.now() - startMs);
-  logLine(`[ownership change logs] effective-date overwrite DONE updated=${result.updated == null ? "n/a" : result.updated} elapsed=${elapsedStr}`);
-  return { updated: result.updated, elapsed: elapsedStr };
+  logLine(`[ownership change logs] effective-date overwrite DONE ownershipUpdated=${result.updated == null ? "n/a" : result.updated} dealSheetUpdated=${dealSheetResult.updated == null ? "n/a" : dealSheetResult.updated} elapsed=${elapsedStr}`);
+  return { updated: result.updated, dealSheetUpdated: dealSheetResult.updated, elapsed: elapsedStr };
 }
 
 const UPDATE_SYNC_PRIORITY_PLACEMENT_STATUSES = new Set(["STARTED", "BOOKED", "ACTIVE"]);
