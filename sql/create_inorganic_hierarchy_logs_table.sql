@@ -5,10 +5,12 @@
 -- is purely an audit trail of the reassignment event.
 -- Table already exists in BigQuery; this is documentation/reproducibility only.
 --
--- INORGANIC_DELIVERY_POC, INORGANIC_ONSITE_AM, and INORGANIC_ACCOUNTS_DIRECTOR_SR_AM_VERTICAL_HEAD
--- have no designation synonym list yet (see functions/src/recruiterHierarchyDesignations.js:
--- DESIGNATION_TO_INORGANIC_LOG_COLUMN) and are always NULL until one is supplied.
+-- INORGANIC_DELIVERY_POC / _EMP_NO / _EMAIL are derived (highest-seniority person present in the
+-- recruiter's live chain, same priority as the deal-sheet DELIVERY_POC; email resolved from
+-- MISC.directory_employees). INORGANIC_ONSITE_AM and INORGANIC_ACCOUNTS_DIRECTOR_SR_AM_VERTICAL_HEAD
+-- have no designation synonym list yet and are always NULL until one is supplied.
 -- SECONDARY_AM and SECONDARY_RECRUITER are intentionally not tracked in this table.
+-- INORGANIC_AVP / _EMP_NO added when AVP (Associate Vice President - Delivery) was split out of VP_SRVP.
 
 CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.inorganic_hierarchy_logs` (
   ID STRING NOT NULL,
@@ -29,6 +31,7 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.inorganic_hierarchy_lo
   INORGANIC_ATL STRING,
   INORGANIC_ASSOCIATE_GROUP_DIRECTOR STRING,
   INORGANIC_DELIVERY_DIRECTOR STRING,
+  INORGANIC_AVP STRING,
   INORGANIC_VP_SR_VP STRING,
   INORGANIC_DELIVERY_POC STRING,
   INORGANIC_ONSITE_AM STRING,
@@ -41,6 +44,7 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.inorganic_hierarchy_lo
   INORGANIC_ATL_EMP_NO STRING,
   INORGANIC_ASSOCIATE_GROUP_DIRECTOR_EMP_NO STRING,
   INORGANIC_DELIVERY_DIRECTOR_EMP_NO STRING,
+  INORGANIC_AVP_EMP_NO STRING,
   INORGANIC_VP_SR_VP_EMP_NO STRING,
   INORGANIC_DELIVERY_POC_EMP_NO STRING,
   INORGANIC_ONSITE_AM_EMP_NO STRING,

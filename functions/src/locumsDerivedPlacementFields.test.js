@@ -180,3 +180,83 @@ test("LOCUMS_EXCLUDED_API_OWNED_COLUMNS includes NEW rate fields", () => {
   assert.equal(LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has("W2_PAY_RATE_NEW"), true);
   assert.equal(LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has("NEW_MARGIN"), true);
 });
+
+test("1099 OT: FINAL_OT_PAY_RATE = OT_RATE x 1.09", () => {
+  const out = computeLocumsDerivedPlacementFields(baseRow({
+    PLACEMENT_TYPE: "CT",
+    TYPE: "1099",
+    OT_RATE: 150,
+    PARENT_CLIENT_NAME: "The Southeast Permanente Medical Group",
+  }));
+  assert.equal(out.FINAL_OT_PAY_RATE, 163.5);
+});
+
+test("1099 Holiday: FINAL_HOLIDAY_PAY_RATE = HOLIDAY_RATE x 1.09", () => {
+  const out = computeLocumsDerivedPlacementFields(baseRow({
+    PLACEMENT_TYPE: "CT",
+    TYPE: "1099",
+    HOLIDAY_RATE: 150,
+  }));
+  assert.equal(out.FINAL_HOLIDAY_PAY_RATE, 163.5);
+});
+
+test("1099 zero call back: FINAL_CALL_BACK_PAY_RATE = 0", () => {
+  const out = computeLocumsDerivedPlacementFields(baseRow({
+    PLACEMENT_TYPE: "CT",
+    TYPE: "1099",
+    CALL_BACK_RATE: 0,
+  }));
+  assert.equal(out.FINAL_CALL_BACK_PAY_RATE, 0);
+});
+
+test("FT placement: premium pay rates are null", () => {
+  const out = computeLocumsDerivedPlacementFields(baseRow({
+    PLACEMENT_TYPE: "FT",
+    TYPE: "1099",
+    OT_RATE: 150,
+    HOLIDAY_RATE: 150,
+    CALL_BACK_RATE: 0,
+  }));
+  assert.equal(out.FINAL_OT_PAY_RATE, null);
+  assert.equal(out.FINAL_HOLIDAY_PAY_RATE, null);
+  assert.equal(out.FINAL_CALL_BACK_PAY_RATE, null);
+});
+
+test("Gainwell parent: FINAL_OT_PAY_RATE = OT_RATE x 1.23 when TYPE not 1099", () => {
+  const out = computeLocumsDerivedPlacementFields(baseRow({
+    PLACEMENT_TYPE: "CT",
+    TYPE: null,
+    PARENT_CLIENT_NAME: "Gainwell Technologies",
+    OT_RATE: 100,
+  }));
+  assert.equal(out.FINAL_OT_PAY_RATE, 123);
+});
+
+test("1099 beats Gainwell for FINAL_OT_PAY_RATE", () => {
+  const out = computeLocumsDerivedPlacementFields(baseRow({
+    PLACEMENT_TYPE: "CT",
+    TYPE: "1099",
+    PARENT_CLIENT_NAME: "Gainwell Technologies",
+    OT_RATE: 100,
+  }));
+  assert.equal(out.FINAL_OT_PAY_RATE, 109);
+});
+
+test("health recruiter does not get premium pay rates from computeDerivedPlacementFields", () => {
+  const { computeDerivedPlacementFields } = require("./columnMappings");
+  const out = computeDerivedPlacementFields({
+    ASSIGNMENT_RECRUITER_EMAIL: "recruiter@cynethealth.com",
+    PLACEMENT_TYPE: "CT",
+    TYPE: "1099",
+    PAY_RATE: 100,
+    OT_RATE: 150,
+    HOLIDAY_RATE: 150,
+    CALL_BACK_RATE: 0,
+    SCHEDULE_HOURS_1: 40,
+    INITIAL_PROJECT_DURATION_IN_WEEKS: 13,
+    BILL_RATE: 200,
+  });
+  assert.equal(out.FINAL_OT_PAY_RATE, undefined);
+  assert.equal(out.FINAL_HOLIDAY_PAY_RATE, undefined);
+  assert.equal(out.FINAL_CALL_BACK_PAY_RATE, undefined);
+});

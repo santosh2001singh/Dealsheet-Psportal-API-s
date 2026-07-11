@@ -253,6 +253,54 @@ function computeDaysWorked(row) {
   return diff == null ? 0 : diff;
 }
 
+function normPlacementType(value) {
+  if (value == null || String(value).trim() === "") return null;
+  return String(value).trim().toUpperCase();
+}
+
+function isType1099(row) {
+  const typeVal = row?.TYPE;
+  if (typeVal == null) return false;
+  const s = String(typeVal).trim();
+  return s === "1099" || s === String(1099);
+}
+
+function isGainwellParentClient(row) {
+  const parent = row?.PARENT_CLIENT_NAME == null ? "" : String(row.PARENT_CLIENT_NAME).trim();
+  return parent === "Gainwell Technologies";
+}
+
+/**
+ * Locumns FINAL_*_PAY_RATE burden on pay-side base rates (OT / Holiday / Call Back).
+ * @param {Record<string, *>} row
+ * @param {unknown} baseRateRaw
+ * @returns {number|null}
+ */
+function computeLocumsBurdenedPremiumRate(row, baseRateRaw) {
+  const placementType = normPlacementType(row?.PLACEMENT_TYPE);
+  if (placementType == null) return null;
+  if (placementType === "FT" || placementType === "INTERNAL") return null;
+
+  const baseRate = toNumberOrNull(baseRateRaw);
+  if (baseRate == null) return null;
+
+  if (isType1099(row)) return round2(baseRate * 1.09);
+  if (isGainwellParentClient(row)) return round2(baseRate * 1.23);
+  return null;
+}
+
+function computeLocumsFinalOtPayRate(row) {
+  return computeLocumsBurdenedPremiumRate(row, row?.OT_RATE);
+}
+
+function computeLocumsFinalHolidayPayRate(row) {
+  return computeLocumsBurdenedPremiumRate(row, row?.HOLIDAY_RATE);
+}
+
+function computeLocumsFinalCallBackPayRate(row) {
+  return computeLocumsBurdenedPremiumRate(row, row?.CALL_BACK_RATE);
+}
+
 /**
  * @param {Record<string, *>} row
  * @returns {Record<string, *>}
@@ -273,6 +321,9 @@ function computeLocumsDerivedPlacementFields(row) {
     GM_OT: computeGmOt(row),
     DAYS_WORKED: computeDaysWorked(row),
     ENTITY: LOCUMS_ENTITY,
+    FINAL_OT_PAY_RATE: computeLocumsFinalOtPayRate(row),
+    FINAL_HOLIDAY_PAY_RATE: computeLocumsFinalHolidayPayRate(row),
+    FINAL_CALL_BACK_PAY_RATE: computeLocumsFinalCallBackPayRate(row),
   };
 }
 

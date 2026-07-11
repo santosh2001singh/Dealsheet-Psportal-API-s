@@ -213,3 +213,7 @@ ALTER TABLE `cynetdatabase.rr_project_data.cynet_health_canada_ended_deal_sheet`
   ADD COLUMN IF NOT EXISTS RECRUITER_EMP_NO STRING;
 ALTER TABLE `cynetdatabase.rr_project_data.cynet_locums_ended_deal_sheet`
   ADD COLUMN IF NOT EXISTS RECRUITER_EMP_NO STRING;
+ALTER TABLE `cynetdatabase.rr_project_data.cynet_locums_ended_deal_sheet`
+  ADD COLUMN IF NOT EXISTS FINAL_OT_PAY_RATE FLOAT64,
+  ADD COLUMN IF NOT EXISTS FINAL_HOLIDAY_PAY_RATE FLOAT64,
+  ADD COLUMN IF NOT EXISTS FINAL_CALL_BACK_PAY_RATE FLOAT64;
