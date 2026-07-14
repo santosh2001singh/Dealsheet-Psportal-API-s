@@ -152,6 +152,18 @@ function dealSheetVmsDisplayValue(dealSheet) {
 }
 
 /**
+ * Format Nexus billable_orientation for BigQuery (percent display string).
+ * API "70.00" -> "70.00%"; null/blank -> "0.00%".
+ */
+function formatBillableOrientationPercent(value) {
+  if (value == null || String(value).trim() === "") return "0.00%";
+  const raw = String(value).trim().replace(/%/g, "");
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return "0.00%";
+  return `${n.toFixed(2)}%`;
+}
+
+/**
  * Map deal sheet detail to BigQuery schema
  */
 function mapDealSheetDetailToBq(dealSheet) {
@@ -166,6 +178,8 @@ function mapDealSheetDetailToBq(dealSheet) {
     GP_PERCENTAGE: toNumberOrNull(dealSheet?.gross_margin_percentage),
     CLIENT_MSP_FEE: vmsFee == null ? null : vmsFee / 100,
     ORIENTATION_HOURS: toNumberOrNull(dealSheet?.non_billable_orientation_hrs),
+    BILLABLE_ORIENTATION_HRS: toNumberOrNull(dealSheet?.billable_orientation_hrs),
+    BILLABLE_ORIENTATION: formatBillableOrientationPercent(dealSheet?.billable_orientation),
     INITIAL_PROJECT_DURATION_IN_WEEKS: toNumberOrNull(dealSheet?.job_duration),
     VMS: dealSheetVmsDisplayValue(dealSheet),
   };
@@ -1108,8 +1122,16 @@ function computeDerivedPlacementFields(row) {
  * Map early term placement status
  */
 function mapEarlyTermPlacementStatus(submittalRow, jobObj) {
-  const startStr = submittalRow?.start_date ?? jobObj?.start_date ?? null;
-  const endStr = submittalRow?.end_date ?? jobObj?.end_date ?? null;
+  // Job first, submittal fallback (matches START_DATE / END_DATE resolution order).
+  const nonBlank = (...vals) => {
+    for (const v of vals) {
+      if (v == null) continue;
+      if (String(v).trim() !== "") return v;
+    }
+    return null;
+  };
+  const startStr = nonBlank(jobObj?.start_date, submittalRow?.start_date);
+  const endStr = nonBlank(jobObj?.end_date, submittalRow?.end_date);
   const days = dateDiffDaysEndMinusStart(startStr, endStr);
   if (days == null) return null;
   if (days < 30) return "ENDED<30";
@@ -1150,8 +1172,16 @@ function computeBqEndDateFromSubmittal(submittalRow, jobObj) {
     label === "perm starts" ||
     label === "booked";
 
-  const endRaw = submittalRow?.end_date ?? jobObj?.end_date ?? null;
-  const startRaw = submittalRow?.start_date ?? jobObj?.start_date ?? null;
+  // Job first, submittal fallback (reversed per business rule); treat blank/"" as empty too.
+  const nonBlank = (...vals) => {
+    for (const v of vals) {
+      if (v == null) continue;
+      if (String(v).trim() !== "") return v;
+    }
+    return null;
+  };
+  const endRaw = nonBlank(jobObj?.end_date, submittalRow?.end_date);
+  const startRaw = nonBlank(jobObj?.start_date, submittalRow?.start_date);
 
   if (isEnded) return formatDateStringForBq(endRaw);
   if (isCancelled) return formatDateStringForBq(startRaw);
@@ -1200,13 +1230,13 @@ function mapJobSubmittalToBq(submittalRow, jobObj) {
   const submitted = submittalRow.submitted_date;
   const submittedStr = submitted == null || String(submitted).trim() === ""
     ? null : String(submitted).trim();
-  // START_DATE: submittal's own start_date, falling back to the job's start_date when the submittal
-  // has none (some submittals — e.g. offer-rejected — come back with start_date null while the job
-  // still carries the intended start). Mirrors the END_DATE / TENTATIVE_DATE job fallback.
-  const startRaw = firstNonEmptyDate(submittalRow?.start_date, jobObj?.start_date);
+  // START_DATE: job's start_date first, falling back to the submittal's start_date when the job has
+  // none/blank. (Reversed from the old submittal-first order per business rule — the job carries the
+  // authoritative start; the submittal is the fallback.) Mirrors the END_DATE / TENTATIVE_DATE order.
+  const startRaw = firstNonEmptyDate(jobObj?.start_date, submittalRow?.start_date);
   const startDate =
     startRaw == null ? null : (formatDateStringForBq(startRaw) ?? String(startRaw).trim());
-  const tentativeRaw = firstNonEmptyDate(submittalRow?.end_date, jobObj?.end_date);
+  const tentativeRaw = firstNonEmptyDate(jobObj?.end_date, submittalRow?.end_date);
   const tentativeDate = formatDateStringForBq(tentativeRaw) ?? (
     tentativeRaw == null || String(tentativeRaw).trim() === ""
       ? null
@@ -1281,6 +1311,7 @@ const API_FLOAT_COLUMNS_DEFAULT_ZERO = [
   "CLIENT_MSP_FEE",
   "WEEKLY_PER_DIEM_NON_TAXED",
   "ORIENTATION_HOURS",
+  "BILLABLE_ORIENTATION_HRS",
   "INITIAL_PROJECT_DURATION_IN_WEEKS",
   "GP_PERCENTAGE",
   "GROSS_MARGIN",
@@ -1299,6 +1330,9 @@ function coerceApiFloatNullsToZero(row) {
     if (v == null || (typeof v === "number" && !Number.isFinite(v))) {
       out[key] = 0;
     }
+  }
+  if (out.BILLABLE_ORIENTATION == null || String(out.BILLABLE_ORIENTATION).trim() === "") {
+    out.BILLABLE_ORIENTATION = "0.00%";
   }
   return out;
 }
@@ -1485,6 +1519,8 @@ const API_OWNED_COLUMNS = new Set([
   "GP_PERCENTAGE",
   "CLIENT_MSP_FEE",
   "ORIENTATION_HOURS",
+  "BILLABLE_ORIENTATION_HRS",
+  "BILLABLE_ORIENTATION",
   "INITIAL_PROJECT_DURATION_IN_WEEKS",
   "VMS",
   "CANDIDATE_NAME",
@@ -1701,6 +1737,7 @@ module.exports = {
   mapClientToBq,
   mapDealSheetCandidateToBq,
   mapDealSheetDetailToBq,
+  formatBillableOrientationPercent,
   mapUserToFullName,
   mapCandidateToBq,
   mapCandidateCandidateTypesToBq,

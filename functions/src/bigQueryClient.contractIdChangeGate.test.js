@@ -36,3 +36,27 @@ test("hasBusinessColumnChanges: a genuine CONTRACT_ID reassignment (both non-nul
 test("hasBusinessColumnChanges: identical rows are unchanged", () => {
   assert.equal(hasBusinessColumnChanges({ ...baseline }, baseline, IGNORE), false);
 });
+
+// START_DATE/END_DATE are compared normally at the gate. For DID NOT ACCEPT / DID NOT START
+// EXTENSION rows, refreshPlacementRecordToBigQuery applies applyOfferRejectedExtensionEndedDates
+// ForInsertRows to the compare row BEFORE calling the gate, so by the time these two dates reach
+// the gate they already hold the final (overridden) values — no special-casing needed here.
+const doNotAcceptExtBaseline = {
+  ASSIGNMENT_RECRUITER_EMAIL: "ammy.n@cynethealth.com",
+  DEAL_TYPE: "EXTENSION",
+  PLACEMENT_STATUS: "DID NOT ACCEPT",
+  CONTRACT_ID: "CHC1779",
+  START_DATE: "2026-04-01",
+  END_DATE: "2026-05-09",
+};
+
+test("hasBusinessColumnChanges: matching (already-overridden) START/END on a DID NOT ACCEPT EXTENSION is unchanged", () => {
+  // Compare row was pre-overridden by the refresh, so it equals the stored baseline -> no append.
+  const incoming = { ...doNotAcceptExtBaseline, CONTRACT_ID: null };
+  assert.equal(hasBusinessColumnChanges(incoming, doNotAcceptExtBaseline, IGNORE), false);
+});
+
+test("hasBusinessColumnChanges: a genuinely different START/END (stale baseline) IS a change so it self-corrects", () => {
+  const incoming = { ...doNotAcceptExtBaseline, CONTRACT_ID: null, START_DATE: "2026-05-10", END_DATE: "2026-05-10" };
+  assert.equal(hasBusinessColumnChanges(incoming, doNotAcceptExtBaseline, IGNORE), true);
+});

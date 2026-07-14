@@ -7,7 +7,7 @@
     "node": "20"
   },
   "scripts": {
-    "test": "node --test src/contractIdFormat.test.js src/contractIdSequence.test.js src/contractIdResolver.test.js src/firestoreWorkspace.test.js src/api/dealSheetEnricher.test.js src/bigQueryClient.extensionDates.test.js src/bigQueryClient.extensionRunrateBackfill.test.js",
+    "test": "node --test src/contractIdFormat.test.js src/contractIdSequence.test.js src/contractIdResolver.test.js src/firestoreWorkspace.test.js src/api/dealSheetEnricher.test.js src/bigQueryClient.extensionDates.test.js src/bigQueryClient.extensionRunrateBackfill.test.js src/w2PayRateNew.test.js src/syncService.rateChangeLog.test.js",
     "lint": "eslint .",
     "serve": "firebase emulators:start --only functions",
     "shell": "firebase functions:shell",

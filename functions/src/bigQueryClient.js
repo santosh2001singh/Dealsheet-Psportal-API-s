@@ -6,7 +6,7 @@
 const { BigQuery } = require("@google-cloud/bigquery");
 const { randomUUID } = require("crypto");
 const config = require("./config");
-const { logLine, logError } = require("./logger");
+const { logLine, logDetail, logError } = require("./logger");
 const { shouldExcludeRowFromBigQuery } = require("./bqRowExclusions");
 const {
   ACTIVE_DEAL_SHEET_TABLE_IDS,
@@ -49,12 +49,12 @@ if (config.serviceAccount.client_email && config.serviceAccount.private_key) {
       private_key: config.serviceAccount.private_key,
     },
   });
-  logLine(
+  logDetail(
     `[enriched sync] [BigQuery auth] mode=service_account client_email=${config.serviceAccount.client_email} target_table=${tableFqn}`
   );
 } else {
   bigquery = new BigQuery({ projectId: config.projectId });
-  logLine(`[enriched sync] [BigQuery auth] mode=runtime_default target_table=${tableFqn}`);
+  logDetail(`[enriched sync] [BigQuery auth] mode=runtime_default target_table=${tableFqn}`);
 }
 
 /**
@@ -385,7 +385,7 @@ async function fetchContractRateChangePairsFromActive(options = {}) {
     if (!pair.latest || !pair.previous) out.delete(key);
   }
 
-  logLine(
+  logDetail(
     `[rate-change logs BQ scan] fetchContractRateChangePairsFromActive dataset=${datasetId} pairs=${out.size}`
   );
   return out;
@@ -727,6 +727,9 @@ function hasBusinessColumnChanges(incomingRow, existingRow, ignoreFieldsSet) {
     // "incoming null vs baseline populated" as unchanged — otherwise every update refresh sees a
     // false CONTRACT_ID change and re-appends a 0-diff row forever. A genuine reassignment (both
     // non-null and different) is still detected.
+    // NOTE: START_DATE/END_DATE for DID NOT ACCEPT/START extensions are NOT special-cased here — the
+    // refresh applies applyOfferRejectedExtensionEndedDatesForInsertRows to the compare row first, so
+    // the gate already sees the final overridden dates (see refreshPlacementRecordToBigQuery).
     if (key === "CONTRACT_ID" && incomingVal == null && existingVal != null) continue;
     if (incomingVal !== existingVal) return true;
   }
@@ -1028,8 +1031,10 @@ function buildOfferRejectedEndedMatchStructLiterals(rows) {
 /**
  * For offer-rejected EXTENSION rows, resolve START_DATE + END_DATE from the candidate's MOST-RECENT
  * prior ENDED placement (matched by CANDIDATE_NEXUS_ID + parent client name, latest by START_DATE).
- * Source priority: our own deal sheet tables (active + ended) first, then the domain run-rate table
- * for any placement still unmatched. Returns Map<PLACEMENT_ID string, {START_DATE, END_DATE}>.
+ * Source priority: our own ACTIVE deal sheet table first, then the domain run-rate table for any
+ * placement still unmatched. The _ended_deal_sheet archive tables are intentionally NOT referenced
+ * (per business rule: only the active deal-sheet table + run-rate history). Returns
+ * Map<PLACEMENT_ID string, {START_DATE, END_DATE}>.
  * @param {object[]} rows
  * @param {object} [options] - { datasetId, tableId } (tableId picks the domain run-rate fallback)
  */
@@ -1090,8 +1095,8 @@ async function fetchOfferRejectedExtensionEndedDatesByPlacementId(rows, options 
     return result;
   };
 
-  // Source 1: our own deal sheet tables (active + ended).
-  const dealTableIds = [...ACTIVE_DEAL_SHEET_TABLE_IDS, ...ENDED_DEAL_SHEET_TABLE_IDS];
+  // Source 1: our own ACTIVE deal sheet tables only (never the _ended_deal_sheet archive).
+  const dealTableIds = [...ACTIVE_DEAL_SHEET_TABLE_IDS];
   const dealUnionSql = dealTableIds
     .map(
       (t) =>
@@ -1153,7 +1158,7 @@ async function applyOfferRejectedExtensionEndedDatesForInsertRows(rows, options 
     return next;
   });
 
-  logLine(
+  logDetail(
     `[enriched sync] [BigQuery insertAll] offer-rejected EXTENSION ended-date override: eligible=${eligible.length} matched=${datesByPlacementId.size} overridden=${overridden}`
   );
   return out;
@@ -1223,7 +1228,7 @@ async function resolveNewHireDatesForEndedRows(rows, options = {}) {
     row.NEW_HIRE_DATE = fromActive;
     inheritedCount++;
   }
-  logLine(
+  logDetail(
     `[enriched sync] [BigQuery insertAll] ended NEW_HIRE_DATE inherit from active: inherited=${inheritedCount} stillEmpty=${stillEmptyCount}`
   );
   return rows;
@@ -1369,7 +1374,7 @@ async function insertAll(rows, options = {}) {
  */
 async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options = {}) {
   if (!combinedRows || combinedRows.length === 0) {
-    logLine(`[enriched sync] [BigQuery insertAll] SKIP: no rows to insert`);
+    logDetail(`[enriched sync] [BigQuery insertAll] SKIP: no rows to insert`);
     return { inserted: 0, attempted: 0, errorBatches: 0, insertedKeys: new Set() };
   }
 
@@ -1401,7 +1406,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     }
     rowsToInsert = filtered;
     if (droppedSameBatchPlacement > 0) {
-      logLine(
+      logDetail(
         `[enriched sync] [BigQuery insertAll] dedupe(same batch PLACEMENT_ID): dropped=${droppedSameBatchPlacement} remaining=${rowsToInsert.length}`
       );
     }
@@ -1433,7 +1438,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
         filtered.push(row);
       }
       rowsToInsert = filtered;
-      logLine(
+      logDetail(
         `[enriched sync] [BigQuery insertAll] dedupe(existing DEAL_SHEET_ID): skipped=${skipped} remaining=${rowsToInsert.length}`
       );
     }
@@ -1482,7 +1487,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
       }
 
       rowsToInsert = filtered;
-      logLine(
+      logDetail(
         `[enriched sync] [BigQuery insertAll] dedupe(existing PLACEMENT_ID): skippedByPlacementId=${skippedByPlacementId} skippedByDidNotAccept=${skippedByDidNotAccept} remaining=${rowsToInsert.length}`
       );
     }
@@ -1527,7 +1532,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
         filtered.push(row);
       }
       rowsToInsert = filtered;
-      logLine(
+      logDetail(
         `[enriched sync] [BigQuery insertAll] reject-existing(DEAL_SHEET_ID|PLACEMENT_ID): skippedExistingDealSheet=${skippedExistingDealSheet} skippedExistingPlacement=${skippedExistingPlacement} remaining=${rowsToInsert.length}`
       );
     }
@@ -1546,7 +1551,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     }
     rowsToInsert = filtered;
     if (skippedByPlacementStatus > 0) {
-      logLine(
+      logDetail(
         `[enriched sync] [BigQuery insertAll] insert-only first_insert_allowlist: skippedByPlacementStatus=${skippedByPlacementStatus} remaining=${rowsToInsert.length}`
       );
     }
@@ -1628,7 +1633,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
       unchangedSkipped++;
     }
     rowsToInsert = filtered;
-    logLine(
+    logDetail(
       `[enriched sync] [BigQuery insertAll] append-on-change(DEAL_SHEET_ID+PLACEMENT_ID): changedIncluded=${changedIncluded} noBaselineIncluded=${noBaselineIncluded} newRowSkippedByPlacementStatus=${newRowSkippedByPlacementStatus} missingPlacementIdCount=${missingPlacementIdCount} moveRunrateForcedFalse=${moveRunrateForcedFalse} moveRunrateKeptNull=${moveRunrateKeptNull} unchangedSkipped=${unchangedSkipped} remaining=${rowsToInsert.length}`
       + ` isRejectedResetCount=${isRejectedResetCount} manualColumnsCarriedTotal=${manualColumnsCarriedTotal}`
       + ` tentativeFrozenCount=${tentativeFrozenCount}`
@@ -1641,6 +1646,10 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
   // fetch below, which sources the chain from PREVIOUS_RECRUITER_EMAIL on a handover.
   rowsToInsert = applyPreviousRecruiterFillForInsertRows(rowsToInsert);
 
+  // EXTENSION rows: backfill PREVIOUS_RECRUITER from the legacy manual ownership tracker when still
+  // empty (historical recruiter handovers that predate this sync). Freeze-once-set.
+  rowsToInsert = await applyExtensionLegacyPreviousRecruiterForInsertRows(rowsToInsert);
+
   rowsToInsert = await applyExtensionInheritForInsertRows(
     rowsToInsert,
     resolveBqDatasetTable(options)
@@ -1652,7 +1661,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
   );
 
   if (!rowsToInsert || rowsToInsert.length === 0) {
-    logLine(`[enriched sync] [BigQuery insertAll] SKIP: all rows filtered by dedupe rules`);
+    logDetail(`[enriched sync] [BigQuery insertAll] SKIP: all rows filtered by dedupe rules`);
     return { inserted: 0, attempted: 0, errorBatches: 0, insertedKeys: new Set() };
   }
 
@@ -1660,19 +1669,19 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
   rowsToInsert = rowsToInsert.filter((r) => !shouldExcludeRowFromBigQuery(r));
   const droppedTraining = beforeTrainingFilter - rowsToInsert.length;
   if (droppedTraining > 0) {
-    logLine(
+    logDetail(
       `[enriched sync] [BigQuery insertAll] training/dummy filter: dropped=${droppedTraining} remaining=${rowsToInsert.length}`
     );
   }
 
   if (!rowsToInsert.length) {
-    logLine(`[enriched sync] [BigQuery insertAll] SKIP: all rows filtered by training/dummy rules`);
+    logDetail(`[enriched sync] [BigQuery insertAll] SKIP: all rows filtered by training/dummy rules`);
     return { inserted: 0, attempted: 0, errorBatches: 0, insertedKeys: new Set() };
   }
 
   if (options.skip_contract_id === true) {
     rowsToInsert = rowsToInsert.map((row) => ({ ...row, CONTRACT_ID: null }));
-    logLine(
+    logDetail(
       `[enriched sync] [BigQuery insertAll] skip_contract_id: CONTRACT_ID cleared for insert count=${rowsToInsert.length}`
     );
   } else {
@@ -1737,7 +1746,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     if (key) insertedKeys.add(key);
   }
 
-  logLine(
+  logDetail(
     `[enriched sync] [BigQuery insertAll] ${hasErrors ? "PARTIAL" : "OK"} attempted=${result.attempted} inserted=${result.inserted}`
   );
   return {
@@ -1756,7 +1765,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
  */
 async function insertEnrichedDealSheetBatchRouted(combinedRows, insertIdBase, options = {}) {
   if (!combinedRows || combinedRows.length === 0) {
-    logLine(`[enriched sync] [BigQuery insertAll] routed SKIP: no rows to insert`);
+    logDetail(`[enriched sync] [BigQuery insertAll] routed SKIP: no rows to insert`);
     return { inserted: 0, attempted: 0, errorBatches: 0, insertedKeys: new Set() };
   }
 
@@ -1789,7 +1798,7 @@ async function insertEnrichedDealSheetBatchRouted(combinedRows, insertIdBase, op
     }
   }
   if (groups.size > 1) {
-    logLine(`[enriched sync] [BigQuery insertAll] routed partitions: ${parts.join(", ")}`);
+    logDetail(`[enriched sync] [BigQuery insertAll] routed partitions: ${parts.join(", ")}`);
   }
 
   return { inserted, attempted, errorBatches, insertedKeys };
@@ -1800,7 +1809,7 @@ async function insertEnrichedDealSheetBatchRouted(combinedRows, insertIdBase, op
  */
 async function insertRateChangeLogBatch(logRows, insertIdBase, options = {}) {
   if (!logRows || logRows.length === 0) {
-    logLine(`[rate-change logs] [BigQuery insertAll] SKIP: no rows to insert`);
+    logDetail(`[rate-change logs] [BigQuery insertAll] SKIP: no rows to insert`);
     return { inserted: 0, attempted: 0, errorBatches: 0 };
   }
 
@@ -1822,10 +1831,10 @@ async function insertRateChangeLogBatch(logRows, insertIdBase, options = {}) {
   logRows = logRows.filter((r) => String(r?.RATE_CHANGE ?? "").trim().toUpperCase() === "YES");
   const droppedNonYes = beforeYesFilter - logRows.length;
   if (droppedNonYes > 0) {
-    logLine(`[rate-change logs] RATE_CHANGE=YES only: dropped=${droppedNonYes} non-YES row(s)`);
+    logDetail(`[rate-change logs] RATE_CHANGE=YES only: dropped=${droppedNonYes} non-YES row(s)`);
   }
   if (logRows.length === 0) {
-    logLine(`[rate-change logs] [BigQuery insertAll] SKIP: no YES rows after filter`);
+    logDetail(`[rate-change logs] [BigQuery insertAll] SKIP: no YES rows after filter`);
     return { inserted: 0, attempted: 0, errorBatches: 0 };
   }
 
@@ -1844,7 +1853,7 @@ async function insertRateChangeLogBatch(logRows, insertIdBase, options = {}) {
     deduped.push(row);
   }
   if (droppedDupBatch > 0) {
-    logLine(
+    logDetail(
       `[rate-change logs] dedupe(same batch CONTRACT_ID+EFFECTIVE_DATE): dropped=${droppedDupBatch} remaining=${deduped.length}`
     );
   }
@@ -1877,7 +1886,7 @@ async function insertRateChangeLogBatch(logRows, insertIdBase, options = {}) {
         filtered.push(row);
       }
       deduped = filtered;
-      logLine(
+      logDetail(
         `[rate-change logs] [BigQuery insertAll] dedupe(existing CONTRACT_ID+EFFECTIVE_DATE in log table): skipped=${skipped} remaining=${deduped.length}`
       );
     }
@@ -1887,13 +1896,13 @@ async function insertRateChangeLogBatch(logRows, insertIdBase, options = {}) {
   deduped = deduped.filter((r) => !shouldExcludeRowFromBigQuery(r));
   const droppedTraining = beforeTraining - deduped.length;
   if (droppedTraining > 0) {
-    logLine(
+    logDetail(
       `[rate-change logs] training/dummy filter: dropped=${droppedTraining} remaining=${deduped.length}`
     );
   }
 
   if (!deduped.length) {
-    logLine(`[rate-change logs] [BigQuery insertAll] SKIP: all rows filtered by training/dummy rules`);
+    logDetail(`[rate-change logs] [BigQuery insertAll] SKIP: all rows filtered by training/dummy rules`);
     return { inserted: 0, attempted: 0, errorBatches: 0 };
   }
 
@@ -1910,7 +1919,7 @@ async function insertRateChangeLogBatch(logRows, insertIdBase, options = {}) {
   });
   const hasErrors = result.errors && result.errors.length > 0;
 
-  logLine(
+  logDetail(
     `[rate-change logs] [BigQuery insertAll] ${hasErrors ? "PARTIAL" : "OK"} attempted=${result.attempted} inserted=${result.inserted}`
   );
   return { inserted: result.inserted, attempted: result.attempted, errorBatches: hasErrors ? 1 : 0 };
@@ -1921,7 +1930,7 @@ async function insertRateChangeLogBatch(logRows, insertIdBase, options = {}) {
  */
 async function insertAdditionalCostLogBatch(logRows, insertIdBase, options = {}) {
   if (!logRows || logRows.length === 0) {
-    logLine(`[additional-cost logs] [BigQuery insertAll] SKIP: no rows to insert`);
+    logDetail(`[additional-cost logs] [BigQuery insertAll] SKIP: no rows to insert`);
     return { inserted: 0, attempted: 0, errorBatches: 0 };
   }
 
@@ -1948,7 +1957,7 @@ async function insertAdditionalCostLogBatch(logRows, insertIdBase, options = {})
   });
   const hasErrors = result.errors && result.errors.length > 0;
 
-  logLine(
+  logDetail(
     `[additional-cost logs] [BigQuery insertAll] ${hasErrors ? "PARTIAL" : "OK"} attempted=${result.attempted} inserted=${result.inserted}`
   );
   return { inserted: result.inserted, attempted: result.attempted, errorBatches: hasErrors ? 1 : 0 };
@@ -1959,7 +1968,7 @@ async function insertAdditionalCostLogBatch(logRows, insertIdBase, options = {})
  */
 async function insertTerminationReasonLogBatch(logRows, insertIdBase, options = {}) {
   if (!logRows || logRows.length === 0) {
-    logLine(`[termination-reason logs] [BigQuery insertAll] SKIP: no rows to insert`);
+    logDetail(`[termination-reason logs] [BigQuery insertAll] SKIP: no rows to insert`);
     return { inserted: 0, attempted: 0, errorBatches: 0 };
   }
 
@@ -1986,7 +1995,7 @@ async function insertTerminationReasonLogBatch(logRows, insertIdBase, options = 
   });
   const hasErrors = result.errors && result.errors.length > 0;
 
-  logLine(
+  logDetail(
     `[termination-reason logs] [BigQuery insertAll] ${hasErrors ? "PARTIAL" : "OK"} attempted=${result.attempted} inserted=${result.inserted}`
   );
   return { inserted: result.inserted, attempted: result.attempted, errorBatches: hasErrors ? 1 : 0 };
@@ -2106,7 +2115,7 @@ async function fetchActiveDealSheetUpdateTargets(options = {}) {
     }
   }
 
-  logLine(
+  logDetail(
     `[BigQuery] fetchActiveDealSheetUpdateTargets dataset=${datasetId} tables=${ACTIVE_DEAL_SHEET_TABLE_IDS.length} targets=${out.length} byDealSheet=${seenDealSheets.size} placementFallback=${seenPlacementFallback.size}`
   );
   return out;
@@ -2163,7 +2172,7 @@ async function fetchDistinctPlacementIdsFromTable(options = {}) {
                WHERE PLACEMENT_ID IS NOT NULL
                ${whereLookback}
                ${limit > 0 ? `LIMIT ${limit}` : ""}`;
-  logLine(
+  logDetail(
     `[active->ended] [BigQuery] fetchDistinctPlacementIds table=${config.projectId}.${datasetId}.${tableId} lookbackDays=${lookbackDays || "none"} limit=${limit || "none"}`
   );
   const rows = await queryObjects(sql, limit > 0 ? limit : 200000);
@@ -2175,7 +2184,7 @@ async function fetchDistinctPlacementIdsFromTable(options = {}) {
     seen.add(pid);
     out.push(pid);
   }
-  logLine(`[active->ended] [BigQuery] fetchDistinctPlacementIds done count=${out.length}`);
+  logDetail(`[active->ended] [BigQuery] fetchDistinctPlacementIds done count=${out.length}`);
   return out;
 }
 
@@ -2194,7 +2203,7 @@ async function fetchLatestRowsByPlacementIds(placementIds, options = {}) {
     uniq.push(s);
   }
   if (!uniq.length) return [];
-  logLine(
+  logDetail(
     `[active->ended] [BigQuery] fetchLatestRowsByPlacementIds source=${config.projectId}.${datasetId}.${tableId} placementCount=${uniq.length}`
   );
   const out = [];
@@ -2217,7 +2226,7 @@ async function fetchLatestRowsByPlacementIds(placementIds, options = {}) {
     const rows = await queryObjects(sql, chunk.length * 2);
     out.push(...rows);
   }
-  logLine(`[active->ended] [BigQuery] fetchLatestRowsByPlacementIds done rows=${out.length}`);
+  logDetail(`[active->ended] [BigQuery] fetchLatestRowsByPlacementIds done rows=${out.length}`);
   return out;
 }
 
@@ -2227,7 +2236,7 @@ async function fetchLatestRowsByPlacementIds(placementIds, options = {}) {
  */
 async function upsertEndedRecordsByPlacementId(rows, insertIdBase, options = {}) {
   if (!rows || rows.length === 0) {
-    logLine(`[active->ended] [BigQuery] upsertEndedRecords SKIP: no rows`);
+    logDetail(`[active->ended] [BigQuery] upsertEndedRecords SKIP: no rows`);
     return { attempted: 0, inserted: 0, updated: 0, errors: [] };
   }
   const placementIds = [];
@@ -2259,7 +2268,7 @@ async function upsertEndedRecordsByPlacementId(rows, insertIdBase, options = {})
           tableId: options.tableId,
         })
       : { inserted: 0, attempted: 0, errors: [] };
-  logLine(
+  logDetail(
     `[active->ended] [BigQuery] upsertEndedRecords attempted=${rows.length} inserted=${insertedResult.inserted} updated=${updated} target=${config.projectId}.${options.datasetId || config.datasetId}.${options.tableId || config.tableId}`
   );
   return {
@@ -2300,7 +2309,7 @@ async function deleteActiveRowsMatchedInEnded(options = {}) {
                     ${whereAge}`;
   const countRows = await queryObjects(sqlCount, 1);
   const rowCount = Number(countRows?.[0]?.row_count || 0);
-  logLine(
+  logDetail(
     `[active->ended] [BigQuery] cleanup candidates source=${config.projectId}.${source.datasetId}.${source.tableId} target=${config.projectId}.${target.datasetId}.${target.tableId} safetyAgeHours=${safetyAgeHours || "none"} matched=${rowCount} dryRun=${dryRun ? "yes" : "no"}`
   );
   if (dryRun || rowCount === 0) return { attempted: rowCount, deleted: 0, dryRun };
@@ -2312,7 +2321,7 @@ async function deleteActiveRowsMatchedInEnded(options = {}) {
                      )
                      ${whereAge}`;
   await bigquery.query({ query: sqlDelete });
-  logLine(`[active->ended] [BigQuery] cleanup delete done deleted=${rowCount}`);
+  logDetail(`[active->ended] [BigQuery] cleanup delete done deleted=${rowCount}`);
   return { attempted: rowCount, deleted: rowCount, dryRun: false };
 }
 
@@ -3488,7 +3497,7 @@ async function resolveContractIdsForRunrateMatchedExtensions(rows, options = {},
 
   const sequenceOptions = tableId ? buildSequenceOptionsForTableFn(tableId) : null;
   if (!sequenceOptions) {
-    logLine(
+    logDetail(
       `[enriched sync] [BigQuery insertAll] EXTENSION runrate CONTRACT_ID allocation skipped: missing tableId sequence config (tableId=${tableId || "none"}, need=${stillUnresolved.length})`
     );
     return out;
@@ -3513,7 +3522,7 @@ async function resolveContractIdsForRunrateMatchedExtensions(rows, options = {},
   try {
     ids = await allocateContractIdsFn(totalToAllocate, sequenceOptions);
   } catch (err) {
-    logLine(
+    logDetail(
       `[enriched sync] [BigQuery insertAll] EXTENSION runrate CONTRACT_ID allocateContractIds(${totalToAllocate}) failed: ${String(err?.message || err).slice(0, 200)}`
     );
     return out;
@@ -3539,7 +3548,7 @@ async function resolveContractIdsForRunrateMatchedExtensions(rows, options = {},
     }
   }
 
-  logLine(
+  logDetail(
     `[enriched sync] [BigQuery insertAll] EXTENSION runrate CONTRACT_ID resolution: reused=${reusedCount} freshlyAllocated=${allocatedCount} unresolved=${stillUnresolved.length - allocatedCount}`
   );
 
@@ -3662,17 +3671,17 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
   });
 
   if (parentByPlacementId.size > 0) {
-    logLine(
+    logDetail(
       `[enriched sync] [BigQuery insertAll] EXTENSION parent-deal inherit: eligible=${eligible.length} matched=${parentByPlacementId.size} backfilled=${parentBackfilledCount}`
     );
   }
   if (priorExtensionByPlacementId.size > 0) {
-    logLine(
+    logDetail(
       `[enriched sync] [BigQuery insertAll] EXTENSION prior-extension inherit: eligible=${eligible.length} matched=${priorExtensionByPlacementId.size} backfilled=${priorExtensionBackfilledCount}`
     );
   }
   if (runrateByPlacementId.size > 0) {
-    logLine(
+    logDetail(
       `[enriched sync] [BigQuery insertAll] EXTENSION runrate backfill: eligible=${eligible.length} matched=${runrateByPlacementId.size} backfilled=${runrateBackfilledCount}`
     );
   }
@@ -3954,6 +3963,122 @@ function applyPreviousRecruiterFillForInsertRows(rows) {
   });
 }
 
+/** Legacy manual ownership tracker (recruiter/AM handovers logged before this sync existed). */
+const LEGACY_OWNERSHIP_DATASET =
+  process.env.LEGACY_OWNERSHIP_DATASET && process.env.LEGACY_OWNERSHIP_DATASET.trim() !== ""
+    ? process.env.LEGACY_OWNERSHIP_DATASET.trim()
+    : "Cluster_Data";
+const LEGACY_OWNERSHIP_TABLE =
+  process.env.LEGACY_OWNERSHIP_TABLE && process.env.LEGACY_OWNERSHIP_TABLE.trim() !== ""
+    ? process.env.LEGACY_OWNERSHIP_TABLE.trim()
+    : "ownership_data";
+
+/** EXTENSION row with no PREVIOUS_RECRUITER yet and a SKU to match against the legacy tracker. */
+function rowNeedsExtensionLegacyPreviousRecruiter(row) {
+  if (!row || typeof row !== "object") return false;
+  if (normalizeDealTypeKey(row.DEAL_TYPE) !== "EXTENSION") return false;
+  // Freeze-once-set: only fill when PREVIOUS_RECRUITER is currently empty (name + email both blank).
+  if (!isEmptyDateFieldValue(row.PREVIOUS_RECRUITER_NAME)) return false;
+  if (!isEmptyDateFieldValue(row.PREVIOUS_RECRUITER_EMAIL)) return false;
+  if (row.SKU_NUMBER == null || String(row.SKU_NUMBER).trim() === "") return false;
+  return true;
+}
+
+/**
+ * Backfill PREVIOUS_RECRUITER for EXTENSION rows from the legacy manual ownership tracker
+ * (Cluster_Data.ownership_data), matched by SKU_NUMBER + OWNERSHIP_UPDATE='Recruiter'. For each row
+ * pick the recruiter-change whose NEW_EMP_CODE equals the row's current RECRUITER_EMP_NO (the change
+ * that installed the current recruiter); fall back to the latest EFFECTIVE_DATE change. PREVIOUS_
+ * RECRUITER_NAME/EMP_NO come from OLD_ONE/OLD_EMP_CODE; the email (absent from the log) is resolved
+ * from MISC.directory_employees by employee_id (name fallback). No match / blank OLD -> left null.
+ * EXTENSION-only; DEAL rows use the submittal-handover logic instead. Freeze-once-set.
+ */
+async function applyExtensionLegacyPreviousRecruiterForInsertRows(rows, deps = {}) {
+  if (!rows || rows.length === 0) return rows;
+  const eligible = rows.filter(rowNeedsExtensionLegacyPreviousRecruiter);
+  if (eligible.length === 0) return rows;
+
+  const skuList = [...new Set(eligible.map((r) => String(r.SKU_NUMBER).trim()).filter(Boolean))];
+  if (skuList.length === 0) return rows;
+
+  const queryFn = deps.queryObjectsFn ?? queryObjects;
+  const emailFetchFn = deps.emailFetchFn ?? fetchDeliveryPocEmails;
+  const fqn = `\`${config.projectId}.${LEGACY_OWNERSHIP_DATASET}.${LEGACY_OWNERSHIP_TABLE}\``;
+
+  // sku -> [{ newEmp, oldName, oldEmp, eff }] of Recruiter-type ownership changes
+  const bySku = new Map();
+  for (let i = 0; i < skuList.length; i += 500) {
+    const chunk = skuList.slice(i, i + 500);
+    const inList = chunk.map((v) => `'${escapeSqlString(v)}'`).join(", ");
+    const sql = `
+      SELECT
+        TRIM(CAST(SKU_NO AS STRING)) AS sku,
+        TRIM(CAST(NEW_EMP_CODE AS STRING)) AS new_emp,
+        OLD_ONE AS old_name,
+        TRIM(CAST(OLD_EMP_CODE AS STRING)) AS old_emp,
+        CAST(EFFECTIVE_DATE AS STRING) AS eff
+      FROM ${fqn}
+      WHERE UPPER(TRIM(CAST(OWNERSHIP_UPDATE AS STRING))) = 'RECRUITER'
+        AND TRIM(CAST(SKU_NO AS STRING)) IN (${inList})`;
+    const bqRows = await queryFn(sql, chunk.length * 10);
+    for (const r of bqRows) {
+      const sku = r?.sku == null ? "" : String(r.sku).trim();
+      if (!sku) continue;
+      if (!bySku.has(sku)) bySku.set(sku, []);
+      bySku.get(sku).push({
+        newEmp: r?.new_emp == null ? "" : String(r.new_emp).trim(),
+        oldName: normalizeExtensionRunrateBackfillValue(r?.old_name),
+        oldEmp: r?.old_emp == null ? "" : String(r.old_emp).trim(),
+        eff: r?.eff == null ? "" : String(r.eff).trim(),
+      });
+    }
+  }
+  if (bySku.size === 0) return rows;
+
+  const isValidOld = (e) => e.oldEmp && e.oldEmp.toUpperCase() !== "NA";
+  const chosenByRow = new Map(); // row ref -> { name, emp }
+  const oldEmps = new Set();
+  const oldNames = new Set();
+  for (const row of eligible) {
+    const list = (bySku.get(String(row.SKU_NUMBER).trim()) || []).filter(isValidOld);
+    if (list.length === 0) continue;
+    const curEmp = row.RECRUITER_EMP_NO == null ? "" : String(row.RECRUITER_EMP_NO).trim();
+    // Prefer the change that installed the CURRENT recruiter (NEW_EMP_CODE = current); else latest.
+    const matches = curEmp ? list.filter((e) => e.newEmp && e.newEmp === curEmp) : [];
+    const pool = matches.length > 0 ? matches : list;
+    pool.sort((a, b) => (a.eff < b.eff ? 1 : a.eff > b.eff ? -1 : 0)); // latest EFFECTIVE_DATE first
+    const chosen = pool[0];
+    if (!chosen) continue;
+    chosenByRow.set(row, { name: chosen.oldName, emp: chosen.oldEmp });
+    if (chosen.oldEmp) oldEmps.add(chosen.oldEmp);
+    if (chosen.oldName) oldNames.add(chosen.oldName);
+  }
+  if (chosenByRow.size === 0) return rows;
+
+  const { byEmp, byName } = await emailFetchFn([...oldEmps], [...oldNames]);
+
+  let filled = 0;
+  const out = rows.map((row) => {
+    const chosen = chosenByRow.get(row);
+    if (!chosen) return row;
+    const email =
+      (chosen.emp && byEmp.get(chosen.emp)) ||
+      (chosen.name && byName.get(String(chosen.name).trim().toLowerCase())) ||
+      null;
+    filled++;
+    return {
+      ...row,
+      PREVIOUS_RECRUITER_NAME: chosen.name ?? null,
+      PREVIOUS_RECRUITER_EMP_NO: chosen.emp || null,
+      PREVIOUS_RECRUITER_EMAIL: email,
+    };
+  });
+  logDetail(
+    `[enriched sync] [BigQuery insertAll] extension legacy previous-recruiter: eligible=${eligible.length} skus=${skuList.length} filled=${filled}`
+  );
+  return out;
+}
+
 async function applyDealRecruiterHierarchyForInsertRows(rows, options = {}, deps = {}) {
   if (!rows || rows.length === 0) return rows;
 
@@ -3980,7 +4105,7 @@ async function applyDealRecruiterHierarchyForInsertRows(rows, options = {}, deps
   });
 
   if (hierarchyByPlacementId.size > 0) {
-    logLine(
+    logDetail(
       `[enriched sync] [BigQuery insertAll] DEAL recruiter-hierarchy backfill: eligible=${eligible.length} matched=${hierarchyByPlacementId.size} backfilled=${backfilledCount}`
     );
   }
@@ -4063,7 +4188,7 @@ async function applyOnsiteAmCsmHierarchyForRows(rows, options = {}, deps = {}) {
   });
 
   if (updatedCount > 0) {
-    logLine(`[enriched sync] [BigQuery insertAll] ONSITE_AM CSM hierarchy: updated=${updatedCount}/${rows.length}`);
+    logDetail(`[enriched sync] [BigQuery insertAll] ONSITE_AM CSM hierarchy: updated=${updatedCount}/${rows.length}`);
   }
   return out;
 }
@@ -4237,7 +4362,7 @@ async function applyDeliveryPocForInsertRows(rows, options = {}, deps = {}) {
     };
   });
 
-  logLine(`[enriched sync] [BigQuery insertAll] DELIVERY_POC derived: filled=${filledCount}/${rows.length}`);
+  logDetail(`[enriched sync] [BigQuery insertAll] DELIVERY_POC derived: filled=${filledCount}/${rows.length}`);
   return out;
 }
 
@@ -4280,7 +4405,7 @@ async function fetchCsmHierarchyDivergenceCandidates(options = {}, deps = {}) {
                WHERE rn = 1`;
 
   const rows = await queryObjects(sql, 100000);
-  logLine(`[inorganic hierarchy logs] fetchCsmHierarchyDivergenceCandidates latest rows scanned=${rows.length}`);
+  logDetail(`[inorganic hierarchy logs] fetchCsmHierarchyDivergenceCandidates latest rows scanned=${rows.length}`);
   if (rows.length === 0) return [];
 
   const directoryFetchFn = deps.directoryFetchFn ?? fetchEmployeeDirectoryByEmails;
@@ -4328,7 +4453,7 @@ async function fetchCsmHierarchyDivergenceCandidates(options = {}, deps = {}) {
     });
   });
 
-  logLine(`[inorganic hierarchy logs] fetchCsmHierarchyDivergenceCandidates diverged=${candidates.length}`);
+  logDetail(`[inorganic hierarchy logs] fetchCsmHierarchyDivergenceCandidates diverged=${candidates.length}`);
   return candidates;
 }
 
@@ -4378,7 +4503,7 @@ async function fetchRecruiterHierarchyReconciliation(options = {}, deps = {}) {
                  AND (${nonBlankPredicate})`;
 
   const rows = await queryObjects(sql, 100000);
-  logLine(`[inorganic hierarchy logs] fetchRecruiterHierarchyReconciliation latest active rows scanned=${rows.length}`);
+  logDetail(`[inorganic hierarchy logs] fetchRecruiterHierarchyReconciliation latest active rows scanned=${rows.length}`);
   if (rows.length === 0) return [];
 
   const directoryFetchFn = deps.directoryFetchFn ?? fetchEmployeeDirectoryByEmails;
@@ -4443,7 +4568,7 @@ async function fetchRecruiterHierarchyReconciliation(options = {}, deps = {}) {
 
   const withMoves = results.filter((r) => r.moves.length > 0).length;
   const withNew = results.filter((r) => r.newPersons.length > 0).length;
-  logLine(
+  logDetail(
     `[inorganic hierarchy logs] fetchRecruiterHierarchyReconciliation placements=${results.length} withMoves=${withMoves} withNewPersons=${withNew}`
   );
   return results;
@@ -4566,7 +4691,7 @@ async function applyRecruiterHierarchyMovesToDealSheet(reconResults, options = {
       const k = buildDealSheetPlacementCompositeKey(r.DEAL_SHEET_ID, r.PLACEMENT_ID);
       const full = k ? fullByKey.get(k) : null;
       if (!full) {
-        logLine(`[recruiter hierarchy moves] WARN full latest row not found placement=${r.PLACEMENT_ID} table=${tableId}`);
+        logDetail(`[recruiter hierarchy moves] WARN full latest row not found placement=${r.PLACEMENT_ID} table=${tableId}`);
         continue;
       }
       const next = sanitizeRowForBigQueryStreamingInsert(full);
@@ -4582,7 +4707,7 @@ async function applyRecruiterHierarchyMovesToDealSheet(reconResults, options = {
     const result = await insertAll(rowsToInsert, { insertIdBase: 0, datasetId, tableId });
     appended += result.inserted;
     const hasErrors = result.errors && result.errors.length > 0;
-    logLine(
+    logDetail(
       `[recruiter hierarchy moves] [BigQuery insertAll] ${hasErrors ? "PARTIAL" : "OK"} table=${tableId} attempted=${result.attempted} inserted=${result.inserted}`
     );
   }
@@ -4689,7 +4814,7 @@ async function fetchDealSheetRecruiterChangePairsFromActive(options = {}) {
     if (!pair.latest || !pair.previous) out.delete(key);
   }
 
-  logLine(
+  logDetail(
     `[inorganic hierarchy logs] fetchDealSheetRecruiterChangePairsFromActive dataset=${datasetId} pairs=${out.size}`
   );
   return out;
@@ -4925,7 +5050,7 @@ async function resolveInorganicHierarchyLogRows(candidates, options = {}, deps =
  */
 async function insertInorganicHierarchyLogBatch(logRows, insertIdBase, options = {}) {
   if (!logRows || logRows.length === 0) {
-    logLine(`[inorganic hierarchy logs] [BigQuery insertAll] SKIP: no rows to insert`);
+    logDetail(`[inorganic hierarchy logs] [BigQuery insertAll] SKIP: no rows to insert`);
     return { inserted: 0, attempted: 0, errorBatches: 0 };
   }
 
@@ -4956,7 +5081,7 @@ async function insertInorganicHierarchyLogBatch(logRows, insertIdBase, options =
     deduped.push(row);
   }
   if (droppedDupBatch > 0) {
-    logLine(
+    logDetail(
       `[inorganic hierarchy logs] dedupe(same batch DEAL_SHEET_ID+PLACEMENT_ID+RECRUITER_EMAIL_ID): dropped=${droppedDupBatch} remaining=${deduped.length}`
     );
   }
@@ -4979,14 +5104,14 @@ async function insertInorganicHierarchyLogBatch(logRows, insertIdBase, options =
         filtered.push(row);
       }
       deduped = filtered;
-      logLine(
+      logDetail(
         `[inorganic hierarchy logs] [BigQuery insertAll] dedupe(existing in log table): skipped=${skipped} remaining=${deduped.length}`
       );
     }
   }
 
   if (!deduped.length) {
-    logLine(`[inorganic hierarchy logs] [BigQuery insertAll] SKIP: nothing left after dedupe`);
+    logDetail(`[inorganic hierarchy logs] [BigQuery insertAll] SKIP: nothing left after dedupe`);
     return { inserted: 0, attempted: 0, errorBatches: 0 };
   }
 
@@ -5003,7 +5128,7 @@ async function insertInorganicHierarchyLogBatch(logRows, insertIdBase, options =
   });
   const hasErrors = result.errors && result.errors.length > 0;
 
-  logLine(
+  logDetail(
     `[inorganic hierarchy logs] [BigQuery insertAll] ${hasErrors ? "PARTIAL" : "OK"} attempted=${result.attempted} inserted=${result.inserted}`
   );
   return { inserted: result.inserted, attempted: result.attempted, errorBatches: hasErrors ? 1 : 0 };
@@ -5109,7 +5234,7 @@ async function fetchDealSheetOwnershipChangePairsFromActive(options = {}) {
     if (!pair.latest || !pair.previous) out.delete(key);
   }
 
-  logLine(
+  logDetail(
     `[ownership change logs] fetchDealSheetOwnershipChangePairsFromActive dataset=${datasetId} pairs=${out.size}`
   );
   return out;
@@ -5220,7 +5345,7 @@ async function fetchRecruiterHandoverOwnershipLogRows(options = {}, deps = {}) {
                  AND LOWER(TRIM(IFNULL(PREVIOUS_RECRUITER_EMAIL, ''))) != LOWER(TRIM(IFNULL(ASSIGNMENT_RECRUITER_EMAIL, '')))`;
 
   const rows = await queryObjects(sql, 100000);
-  logLine(`[ownership handover] latest DEAL rows with a previous recruiter=${rows.length}`);
+  logDetail(`[ownership handover] latest DEAL rows with a previous recruiter=${rows.length}`);
   return buildRecruiterHandoverOwnershipLogRows(rows, deps);
 }
 
@@ -5308,7 +5433,7 @@ async function buildRecruiterHandoverOwnershipLogRows(inputRows, deps = {}) {
     }
   });
 
-  logLine(`[ownership handover] built log rows=${out.length}`);
+  logDetail(`[ownership handover] built log rows=${out.length}`);
   return out;
 }
 
@@ -5364,7 +5489,7 @@ async function fetchExistingOwnershipChangeLogKeysSet(logRows, options = {}) {
 /** Insert ownership_change_logs rows (append-only; batch + existing-table dedupe). */
 async function insertOwnershipChangeLogBatch(logRows, insertIdBase, options = {}) {
   if (!logRows || logRows.length === 0) {
-    logLine(`[ownership change logs] [BigQuery insertAll] SKIP: no rows to insert`);
+    logDetail(`[ownership change logs] [BigQuery insertAll] SKIP: no rows to insert`);
     return { inserted: 0, attempted: 0, errorBatches: 0 };
   }
 
@@ -5390,7 +5515,7 @@ async function insertOwnershipChangeLogBatch(logRows, insertIdBase, options = {}
     deduped.push(row);
   }
   if (droppedDupBatch > 0) {
-    logLine(`[ownership change logs] dedupe(same batch): dropped=${droppedDupBatch} remaining=${deduped.length}`);
+    logDetail(`[ownership change logs] dedupe(same batch): dropped=${droppedDupBatch} remaining=${deduped.length}`);
   }
 
   const skipExisting = options.skipExistingOwnershipChangeLogs !== false;
@@ -5411,12 +5536,12 @@ async function insertOwnershipChangeLogBatch(logRows, insertIdBase, options = {}
         filtered.push(row);
       }
       deduped = filtered;
-      logLine(`[ownership change logs] [BigQuery insertAll] dedupe(existing in log table): skipped=${skipped} remaining=${deduped.length}`);
+      logDetail(`[ownership change logs] [BigQuery insertAll] dedupe(existing in log table): skipped=${skipped} remaining=${deduped.length}`);
     }
   }
 
   if (!deduped.length) {
-    logLine(`[ownership change logs] [BigQuery insertAll] SKIP: nothing left after dedupe`);
+    logDetail(`[ownership change logs] [BigQuery insertAll] SKIP: nothing left after dedupe`);
     return { inserted: 0, attempted: 0, errorBatches: 0 };
   }
 
@@ -5432,7 +5557,7 @@ async function insertOwnershipChangeLogBatch(logRows, insertIdBase, options = {}
     insertIdField: "_INSERT_ID",
   });
   const hasErrors = result.errors && result.errors.length > 0;
-  logLine(
+  logDetail(
     `[ownership change logs] [BigQuery insertAll] ${hasErrors ? "PARTIAL" : "OK"} attempted=${result.attempted} inserted=${result.inserted}`
   );
   return { inserted: result.inserted, attempted: result.attempted, errorBatches: hasErrors ? 1 : 0 };
@@ -5501,7 +5626,7 @@ async function overwriteOwnershipChangeLogCandidateInfoFromDealSheet(options = {
   await job.getQueryResults();
   const meta = job.metadata?.statistics?.query;
   const updated = meta?.dmlStats?.updatedRowCount ?? null;
-  logLine(
+  logDetail(
     `[ownership change logs] candidate name/email overwrite from deal sheet: updatedRows=${updated == null ? "n/a" : updated}`
   );
   return { updated: updated == null ? null : Number(updated) };
@@ -5546,8 +5671,79 @@ async function overwriteDealSheetEffectiveDatesFromExtensions(options = {}) {
     totalUpdated += Number(job.metadata?.statistics?.query?.dmlStats?.updatedRowCount ?? 0);
   }
 
-  logLine(`[deal sheet] EFFECTIVE_DATE overwrite from extensions: updatedRows=${totalUpdated}`);
+  logDetail(`[deal sheet] EFFECTIVE_DATE overwrite from extensions: updatedRows=${totalUpdated}`);
   return { updated: totalUpdated };
+}
+
+/**
+ * Keep ownership_change_logs' placement dates in sync with the placement's CURRENT (latest) deal-sheet
+ * row, matched by PLACEMENT_ID. When a placement's START_DATE or TENTATIVE_DATE changes, every
+ * ownership_change_logs row for that PLACEMENT_ID is overwritten:
+ *   START_DATE               = latest deal-sheet START_DATE
+ *   END_DATE_PREVIOUS_OWNER  = latest deal-sheet TENTATIVE_DATE
+ *   EFFECTIVE_DATE           = latest deal-sheet TENTATIVE_DATE + 1 day
+ * This replaces the older CONTRACT_ID -> extension-START_DATE EFFECTIVE_DATE overwrite for the log
+ * table (they would otherwise fight each run). Only rows whose stored dates actually differ are
+ * updated (IS DISTINCT FROM), so a steady state writes zero rows.
+ */
+async function overwriteOwnershipChangeLogDatesFromPlacements(options = {}) {
+  const dealSheetDatasetId =
+    typeof options.dealSheetDatasetId === "string" && options.dealSheetDatasetId.trim() !== ""
+      ? options.dealSheetDatasetId.trim()
+      : config.datasetId;
+  const logDatasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.ownershipChangeLogDatasetId;
+  const logTableId =
+    typeof options.tableId === "string" && options.tableId.trim() !== ""
+      ? options.tableId.trim()
+      : config.ownershipChangeLogTableId;
+
+  // START_DATE + PLACEMENT_ID are in the base union columns; TENTATIVE_DATE + DATE_AND_TIME are not.
+  const unionSql = buildActiveDealSheetsUnionSql(dealSheetDatasetId, undefined, [
+    "TENTATIVE_DATE",
+    "DATE_AND_TIME",
+  ]);
+
+  const sql = `
+    UPDATE \`${config.projectId}.${logDatasetId}.${logTableId}\` o
+    SET
+      START_DATE = p.start_date,
+      END_DATE_PREVIOUS_OWNER = p.tentative_date,
+      EFFECTIVE_DATE = p.effective_date
+    FROM (
+      SELECT * EXCEPT(rn) FROM (
+        SELECT
+          CAST(PLACEMENT_ID AS STRING) AS placement_id_norm,
+          START_DATE AS start_date,
+          TENTATIVE_DATE AS tentative_date,
+          DATE_ADD(TENTATIVE_DATE, INTERVAL 1 DAY) AS effective_date,
+          ROW_NUMBER() OVER (
+            PARTITION BY CAST(PLACEMENT_ID AS STRING)
+            ORDER BY DATE_AND_TIME DESC NULLS LAST
+          ) AS rn
+        FROM (${unionSql})
+        WHERE PLACEMENT_ID IS NOT NULL
+      )
+      WHERE rn = 1
+    ) p
+    WHERE o.PLACEMENT_ID IS NOT NULL
+      AND CAST(o.PLACEMENT_ID AS STRING) = p.placement_id_norm
+      AND (
+        o.START_DATE IS DISTINCT FROM p.start_date
+        OR o.END_DATE_PREVIOUS_OWNER IS DISTINCT FROM p.tentative_date
+        OR o.EFFECTIVE_DATE IS DISTINCT FROM p.effective_date
+      )
+  `;
+
+  const [job] = await bigquery.createQueryJob({ query: sql });
+  await job.getQueryResults();
+  const updated = job.metadata?.statistics?.query?.dmlStats?.updatedRowCount ?? null;
+  logDetail(
+    `[ownership change logs] date sync from placements (by PLACEMENT_ID): updatedRows=${updated == null ? "n/a" : updated}`
+  );
+  return { updated: updated == null ? null : Number(updated) };
 }
 
 async function overwriteOwnershipChangeLogEffectiveDatesFromExtensions(options = {}) {
@@ -5589,7 +5785,7 @@ async function overwriteOwnershipChangeLogEffectiveDatesFromExtensions(options =
   await job.getQueryResults();
   const meta = job.metadata?.statistics?.query;
   const updated = meta?.dmlStats?.updatedRowCount ?? null;
-  logLine(
+  logDetail(
     `[ownership change logs] effective-date overwrite from extensions: updatedRows=${updated == null ? "n/a" : updated}`
   );
   return { updated: updated == null ? null : Number(updated) };
@@ -5620,6 +5816,7 @@ async function finalizeDealSheetRowForResponse(row, baseline, options = {}) {
   }
   let arr = [current];
   arr = applyPreviousRecruiterFillForInsertRows(arr);
+  arr = await applyExtensionLegacyPreviousRecruiterForInsertRows(arr);
   arr = await applyExtensionInheritForInsertRows(arr, options);
   arr = await applyDealRecruiterHierarchyForInsertRows(arr, options);
   arr = applyExtensionStartDatesForInsertRows(arr);
@@ -5712,6 +5909,8 @@ module.exports = {
   fetchDealRecruiterHierarchyByPlacementId,
   applyDealRecruiterHierarchyForInsertRows,
   applyPreviousRecruiterFillForInsertRows,
+  applyExtensionLegacyPreviousRecruiterForInsertRows,
+  rowNeedsExtensionLegacyPreviousRecruiter,
   fetchHierarchyLevelChainsByKey,
   fetchDealSheetRecruiterChangePairsFromActive,
   buildInorganicHierarchyLogCandidate,
@@ -5737,6 +5936,7 @@ module.exports = {
   fetchExistingOwnershipChangeLogKeysSet,
   insertOwnershipChangeLogBatch,
   overwriteOwnershipChangeLogEffectiveDatesFromExtensions,
+  overwriteOwnershipChangeLogDatesFromPlacements,
   overwriteOwnershipChangeLogCandidateInfoFromDealSheet,
   overwriteDealSheetEffectiveDatesFromExtensions,
   applyPreviousRecruiterOnRecruiterChange,

@@ -18,6 +18,17 @@ function normPlacementType(v) {
 }
 
 /**
+ * Parse BILLABLE_ORIENTATION percent string to fraction (e.g. "70.00%" -> 0.70).
+ */
+function parseBillableOrientationFraction(value) {
+  if (value == null || String(value).trim() === "") return 0;
+  const raw = String(value).trim().replace(/%/g, "");
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 0;
+  return n / 100;
+}
+
+/**
  * @param {Record<string, *>} row Merged deal-sheet row before derived fields
  */
 function computeW2PayRateNew(row) {
@@ -120,10 +131,17 @@ function computeFinalBillRateNew(row) {
   return Number.isFinite(value) ? value : null;
 }
 
-function computeNewMargin(finalBillRateNew, finalCostNew) {
+function computeNewMargin(row, finalBillRateNew, finalCostNew) {
   if (finalBillRateNew == null) return null;
   if (finalCostNew == null) return null;
-  const value = finalBillRateNew - finalCostNew;
+
+  const po = toNumberOrZero(row?.PO_HOURS);
+  if (po === 0) return null;
+
+  const hrs = toNumberOrZero(row?.BILLABLE_ORIENTATION_HRS);
+  const pct = parseBillableOrientationFraction(row?.BILLABLE_ORIENTATION);
+  const adjustment = (finalBillRateNew * hrs * (1 - pct)) / po;
+  const value = finalBillRateNew - adjustment - finalCostNew;
   return Number.isFinite(value) ? value : null;
 }
 
@@ -132,7 +150,7 @@ function computeNewRateFamily(row) {
   const FINAL_PAY_RATE_NEW = computeFinalPayRateNew(row, W2_PAY_RATE_NEW);
   const FINAL_COST_NEW = computeFinalCostNew(row, FINAL_PAY_RATE_NEW);
   const FINAL_BILL_RATE_NEW = computeFinalBillRateNew(row);
-  const NEW_MARGIN = computeNewMargin(FINAL_BILL_RATE_NEW, FINAL_COST_NEW);
+  const NEW_MARGIN = computeNewMargin(row, FINAL_BILL_RATE_NEW, FINAL_COST_NEW);
   return {
     W2_PAY_RATE_NEW: round2(W2_PAY_RATE_NEW),
     FINAL_PAY_RATE_NEW: round2(FINAL_PAY_RATE_NEW),
@@ -149,4 +167,5 @@ module.exports = {
   computeFinalBillRateNew,
   computeNewMargin,
   computeNewRateFamily,
+  parseBillableOrientationFraction,
 };

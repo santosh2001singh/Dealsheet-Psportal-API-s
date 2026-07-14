@@ -13,6 +13,21 @@ function logLine(message) {
   console.log(`[${utcTimestamp()}] ${message}`);
 }
 
+// Detail (per-placement / per-batch insert-pipeline) logging. High-level progress always uses
+// logLine; the verbose sub-step summaries use logDetail so a caller processing rows ONE-AT-A-TIME
+// (e.g. the update trigger's per-placement loop) can silence the hundreds of near-identical lines
+// without touching the main progress logs. Batch callers (insert trigger) leave it on.
+let pipelineDetailQuiet = false;
+/** @param {boolean} quiet */
+function setPipelineDetailQuiet(quiet) {
+  pipelineDetailQuiet = quiet === true;
+}
+/** @param {string} message — suppressed while setPipelineDetailQuiet(true) is active. */
+function logDetail(message) {
+  if (pipelineDetailQuiet) return;
+  console.log(`[${utcTimestamp()}] ${message}`);
+}
+
 /**
  * @param {string} message
  * @param {unknown} [err]
@@ -71,6 +86,8 @@ async function withTimingAsync(label, fn) {
 module.exports = {
   utcTimestamp,
   logLine,
+  logDetail,
+  setPipelineDetailQuiet,
   logError,
   stringifyError,
   formatDuration,

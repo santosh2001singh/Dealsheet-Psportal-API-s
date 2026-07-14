@@ -45,8 +45,9 @@ const ACTIVE_UPDATE_SYNC_CHECKPOINT_KEY = "active-deal-sheet-update-cursor";
  *  processed the doc is deleted (clear_checkpoint_on_complete) so the next run rescans from page 1. */
 const ACTIVE_INSERT_SYNC_CHECKPOINT_KEY = "active-deal-sheet-insert-page-cursor";
 /** First-insert placement allowlist for new DEAL_SHEET_ID+PLACEMENT_ID baselines on active `dealSheetSyncTrigger`
- *  (STARTED/BOOKED, plus DID NOT ACCEPT for the offer-rejected VERBAL candidates admitted below). */
-const ACTIVE_BOOTSTRAP_FIRST_INSERT_PLACEMENT_STATUSES = "STARTED,BOOKED,DID NOT ACCEPT";
+ *  (STARTED/BOOKED, plus DID NOT ACCEPT for offer-rejected and DID NOT START for cancelled VERBAL
+ *  candidates admitted below). */
+const ACTIVE_BOOTSTRAP_FIRST_INSERT_PLACEMENT_STATUSES = "STARTED,BOOKED,DID NOT ACCEPT,DID NOT START";
 /** First-insert allowlist for `dealSheetSyncOfferRejected` ended tables (wider than active scheduled) */
 const ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES =
   "STARTED,BOOKED,ENDED,ENDED<30,DID NOT START,DID NOT ACCEPT";
@@ -57,9 +58,11 @@ const DEAL_SHEET_MIN_START_DATE_MS = Date.UTC(2026, 4, 1);
 const DEAL_SHEET_MIN_START_DATE_ISO = new Date(DEAL_SHEET_MIN_START_DATE_MS).toISOString().slice(0, 10);
 
 /** Nexus submittal filter for scheduled insert trigger (new deal sheets only).
- *  OFFER_REJECTED included so offer-rejected candidates (deal sheet only ever VERBAL) are picked up
- *  too — their VERBAL deal sheet is admitted via verbal_for_offer_rejected (see dealSheetSyncTrigger). */
-const ACTIVE_BOOTSTRAP_SUBMITTAL_CODES = "PERM_STARTS,ACTIVE,BOOKED,OFFER_REJECTED";
+ *  OFFER_REJECTED (-> DID NOT ACCEPT) and CANCELLED/CANCELED (-> DID NOT START) included so those
+ *  candidates (deal sheet often only VERBAL) are picked up into the ACTIVE tables too — their VERBAL
+ *  deal sheet is admitted via deal_sheet_status_codes=FINAL,VERBAL and the placement status is mapped
+ *  by mapSubmittalCodeToPlacementStatus. */
+const ACTIVE_BOOTSTRAP_SUBMITTAL_CODES = "PERM_STARTS,ACTIVE,BOOKED,OFFER_REJECTED,CANCELLED,CANCELED";
 
 function filterEnrichedRowsByDealSheetMinStartDate(rows) {
   return rows.filter((row) =>
@@ -393,6 +396,10 @@ exports.refreshDealSheetByPlacementId = onRequest(
         params.compare_ignore_fields = ["ID", "DATE_AND_TIME", "IS_REJECTED"];
         params.first_insert_placement_status_allowlist =
           ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES;
+        // Manual single-placement call: opt IN to the table-wide inorganic scan for full parity
+        // (pass ?run_inorganic_scan=false to skip the heavy scan). Scheduled triggers never set this,
+        // so their per-placement refreshes never trigger it (opt-in default OFF).
+        params.refresh_run_inorganic_scan = q.run_inorganic_scan !== "false";
 
         logLine(
           `[refreshDealSheetByPlacementId] method=${req.method} placement_id=${placementId || "none"} deal_sheet_id=${dealSheetId || "none"} job_id=${jobId || "none"} candidate_id=${candidateId || "none"} apply_update=${applyUpdate || "default:true"} bq_dataset=${bqDatasetRaw || "rr_project_data"} bq_table=${bqTableRaw || "domain-routed (from ASSIGNMENT_RECRUITER_EMAIL)"} first_insert_placement_status_allowlist=${ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES}`

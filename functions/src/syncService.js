@@ -5,7 +5,7 @@
 
 const config = require("./config");
 const admin = require("firebase-admin");
-const { logLine, formatDuration } = require("./logger");
+const { logLine, logDetail, setPipelineDetailQuiet, formatDuration } = require("./logger");
 const {
   buildUrl,
   getNexusAccessToken,
@@ -48,11 +48,12 @@ const {
   buildRecruiterHandoverOwnershipLogRows,
   buildOwnershipChangeLogRows,
   insertOwnershipChangeLogBatch,
-  overwriteOwnershipChangeLogEffectiveDatesFromExtensions,
+  overwriteOwnershipChangeLogDatesFromPlacements,
   overwriteOwnershipChangeLogCandidateInfoFromDealSheet,
   overwriteDealSheetEffectiveDatesFromExtensions,
   finalizeDealSheetRowForResponse,
   hasBusinessColumnChanges,
+  applyOfferRejectedExtensionEndedDatesForInsertRows,
   normalizeForCompare,
   resolveFirstInsertPlacementAllowlist,
   placementStatusAllowsFirstInsert,
@@ -68,6 +69,7 @@ const { normalizeContractIdOrNull } = require("./contractIdFormat");
 const { getCheckpointRef } = require("./firestoreWorkspace");
 const { isCynetHealthCanadaRecruiter, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
 const { isCynetLocumsRecruiter, LOCUMS_EXCLUDED_API_OWNED_COLUMNS } = require("./locumsDerivedPlacementFields");
+const { computeNewMargin } = require("./w2PayRateNew");
 const {
   resolveActiveDealSheetTableId,
   buildActiveDealSheetRoutingSentinel,
@@ -411,6 +413,25 @@ function numDiff(newVal, oldVal) {
 }
 
 /**
+ * NEW_MARGIN for rate-change snapshots — recompute from NEW rate family when possible.
+ */
+function resolveNewMarginForRateSnapshot(row) {
+  if (!row) return null;
+  const finalBillRateNew = toFloatOrNull(row.FINAL_BILL_RATE_NEW);
+  const finalCostNew = toFloatOrNull(row.FINAL_COST_NEW);
+  if (finalBillRateNew != null && finalCostNew != null) {
+    const computed = computeNewMargin(row, finalBillRateNew, finalCostNew);
+    if (computed != null) return computed;
+  }
+  return toFloatOrNull(row.NEW_MARGIN);
+}
+
+function formatBillableOrientationForRateSnapshot(value) {
+  if (value == null || String(value).trim() === "") return null;
+  return String(value).trim();
+}
+
+/**
  * Map deal-sheet row columns into OLD_* or NEW_* rate snapshot fields on the log row.
  * @param {object|null} row
  * @param {"OLD_"|"NEW_"} prefix
@@ -421,6 +442,8 @@ function extractRateSnapshotFields(row, prefix) {
       [`${prefix}GUARANTEED_HOURS`]: null,
       [`${prefix}INITIAL_PROJECT_DURATION_IN_WEEKS`]: null,
       [`${prefix}ORIENTATION_HOURS`]: null,
+      [`${prefix}BILLABLE_ORIENTATION_HRS`]: null,
+      [`${prefix}BILLABLE_ORIENTATION`]: null,
       [`${prefix}ADDITIONAL_BONUS`]: null,
       [`${prefix}PAY_RATE`]: null,
       [`${prefix}WEEKLY_PER_DIEM`]: null,
@@ -439,6 +462,8 @@ function extractRateSnapshotFields(row, prefix) {
     [`${prefix}GUARANTEED_HOURS`]: toFloatOrNull(row.GUARANTEED_HOURS),
     [`${prefix}INITIAL_PROJECT_DURATION_IN_WEEKS`]: toFloatOrNull(row.INITIAL_PROJECT_DURATION_IN_WEEKS),
     [`${prefix}ORIENTATION_HOURS`]: toFloatOrNull(row.ORIENTATION_HOURS),
+    [`${prefix}BILLABLE_ORIENTATION_HRS`]: toFloatOrNull(row.BILLABLE_ORIENTATION_HRS),
+    [`${prefix}BILLABLE_ORIENTATION`]: formatBillableOrientationForRateSnapshot(row.BILLABLE_ORIENTATION),
     [`${prefix}ADDITIONAL_BONUS`]: toFloatOrNull(row.ADDITIONAL_BONUS),
     [`${prefix}PAY_RATE`]: toFloatOrNull(row.PAY_RATE),
     [`${prefix}WEEKLY_PER_DIEM`]: toFloatOrNull(row.WEEKLY_PER_DIEM_NON_TAXED),
@@ -450,7 +475,7 @@ function extractRateSnapshotFields(row, prefix) {
     [`${prefix}NET_MARGIN`]: toFloatOrNull(row.NET_MARGIN),
     [`${prefix}GROSS_MARGIN`]: toFloatOrNull(row.GROSS_MARGIN),
     [`${prefix}CLIENT_MSP_FEE`]: toFloatOrNull(row.CLIENT_MSP_FEE),
-    [`${prefix}GM_BASED_ON_NEW_LOADING_COST`]: toFloatOrNull(row.NEW_MARGIN),
+    [`${prefix}GM_BASED_ON_NEW_LOADING_COST`]: resolveNewMarginForRateSnapshot(row),
   };
 }
 
@@ -835,8 +860,20 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     baseline = baselineMap.get(compositeKey) || null;
   }
 
-  const changed = hasBusinessColumnChanges(row, baseline, new Set(compareIgnoreFields));
-  const diffFields = computeChangedFields(row, baseline, compareIgnoreFields);
+  // DID NOT ACCEPT / DID NOT START EXTENSION rows have START_DATE/END_DATE overwritten inside the
+  // insert pipeline from the candidate's prior ENDED assignment (active deal-sheet + run-rate).
+  // Apply that override to the compare row FIRST so the change-gate sees the FINAL dates — otherwise
+  // the pre-override (job-derived) dates always differ from the stored (overridden) baseline, which
+  // both re-appends 0-diff rows forever AND blocks a stale value from ever being corrected. Cheap
+  // no-op for every other row (the applier filters to eligible rows before any lookup). We compare
+  // and insert this same row so the gate decision and the stored row stay consistent.
+  const [overriddenRow] = await applyOfferRejectedExtensionEndedDatesForInsertRows([row], {
+    datasetId: effectiveDatasetId,
+    tableId: effectiveTableId,
+  });
+  const compareRow = overriddenRow || row;
+  const changed = hasBusinessColumnChanges(compareRow, baseline, new Set(compareIgnoreFields));
+  const diffFields = computeChangedFields(compareRow, baseline, compareIgnoreFields);
   const allowFirstInsert = placementStatusAllowsFirstInsert(
     row?.PLACEMENT_STATUS,
     resolveFirstInsertPlacementAllowlist({
@@ -855,7 +892,7 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     action = "NO_CHANGE";
     reason = "First insert blocked by placement status allowlist";
   } else if (applyUpdate && updateOnlyExisting && baseline && changed) {
-    insertResult = await insertEnrichedDealSheetBatch([row], 0, {
+    insertResult = await insertEnrichedDealSheetBatch([compareRow], 0, {
       appendOnChangeByDealSheet: true,
       compareIgnoreFields,
       generatedUuidField,
@@ -870,7 +907,7 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
       reason = "Insert pipeline filtered row";
     }
   } else if (applyUpdate && !updateOnlyExisting && (changed || !baseline)) {
-    insertResult = await insertEnrichedDealSheetBatch([row], 0, {
+    insertResult = await insertEnrichedDealSheetBatch([compareRow], 0, {
       appendOnChangeByDealSheet: true,
       compareIgnoreFields,
       generatedUuidField,
@@ -947,12 +984,15 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   }
 
   // Full inorganic-hierarchy scan (recruiter-change + CSM-divergence + recruiter-hierarchy
-  // reconciliation incl. moves + ownership-from-moves) so the refresh endpoint has full parity with
-  // the scheduled triggers. NOTE: this is a table-WIDE reconciliation (not scoped to this placement),
-  // so it can also append move rows / logs for other placements — same as a trigger run. Non-fatal;
-  // gated by refresh_run_inorganic_scan !== false so callers can opt out of the heavy scan.
+  // reconciliation incl. moves + ownership-from-moves). NOTE: this is a table-WIDE reconciliation
+  // (~1300 rows, NOT scoped to this placement), so it must NEVER run per-placement inside a loop —
+  // doing so re-scans the whole table hundreds of times and the caller never finishes.
+  // OPT-IN ONLY: runs solely when the caller explicitly sets refresh_run_inorganic_scan === true
+  // (the manual refreshDealSheetByPlacementId HTTP endpoint). The scheduled triggers run this scan
+  // exactly once themselves (see dealSheetSyncUpdateTrigger / dealSheetSyncTrigger), so their
+  // per-placement refreshes leave it OFF by default. Non-fatal.
   let inorganicScanLog = null;
-  if (params.refresh_run_inorganic_scan !== false) {
+  if (params.refresh_run_inorganic_scan === true) {
     try {
       inorganicScanLog = await syncInorganicHierarchyLogsFromBigQuery({
         deal_sheet_bq_dataset: effectiveDatasetId,
@@ -2334,12 +2374,17 @@ async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
       : config.datasetId;
   const startMs = Date.now();
   logLine(`[ownership change logs] === syncOwnershipChangeLogEffectiveDatesFromExtensions START ===`);
-  const result = await overwriteOwnershipChangeLogEffectiveDatesFromExtensions({
+  // ownership_change_logs: keep START_DATE / END_DATE_PREVIOUS_OWNER / EFFECTIVE_DATE (= tentative+1)
+  // in sync with each placement's CURRENT deal-sheet row, matched by PLACEMENT_ID. This replaces the
+  // older CONTRACT_ID -> extension-START_DATE EFFECTIVE_DATE overwrite for the log table (both writing
+  // EFFECTIVE_DATE would fight every run).
+  const result = await overwriteOwnershipChangeLogDatesFromPlacements({
     dealSheetDatasetId,
     datasetId: params.bq_dataset,
     tableId: params.bq_table,
   });
-  // Same overwrite on the deal-sheet EFFECTIVE_DATE (recruiter-change rows: tentative+1 -> ext start).
+  // Deal-sheet EFFECTIVE_DATE overwrite (recruiter-change rows: tentative+1 -> ext start) is a
+  // SEPARATE table and left as-is.
   let dealSheetResult = { updated: null };
   try {
     dealSheetResult = await overwriteDealSheetEffectiveDatesFromExtensions({ datasetId: dealSheetDatasetId });
@@ -2489,6 +2534,11 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
         update_only_existing: true,
         generated_uuid_field: generatedUuidField,
         compare_ignore_fields: compareIgnoreFields,
+        // The inorganic-hierarchy scan is table-WIDE and identical for every placement — running it
+        // per-target here would re-scan ~1300 rows hundreds of times and the trigger would never
+        // finish. The trigger runs that scan exactly once at the end (see dealSheetSyncUpdateTrigger),
+        // so per-placement refreshes must skip it. (The manual refresh HTTP endpoint leaves it on.)
+        refresh_run_inorganic_scan: false,
         ...(minStartDateMs != null ? { min_start_date_ms: minStartDateMs } : {}),
       };
       const { params, skipReason } = buildActiveUpdateRefreshParams(target, baseParams);
@@ -2510,24 +2560,34 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
     }
   }
 
-  for (let i = 0; i < slice.length; i += concurrency) {
-    const batch = slice.slice(i, i + concurrency);
-    const results = await Promise.all(batch.map(processTarget));
-    for (const r of results) {
-      checked++;
-      if (r.action === "INSERTED") appended++;
-      else if (r.action === "NO_CHANGE" || r.action === "PREVIEW_CHANGE") no_change++;
-      else if (r.action === "NOT_FOUND") not_found++;
-      else if (r.action === "NO_BASELINE") no_baseline++;
-      else if (r.action === "SKIPPED_DATE") skipped_date++;
-      else if (r.action === "ERROR") errors++;
-      else no_change++;
+  // Silence the per-placement insert-pipeline DETAIL logs (contractId resolver, hierarchy/CSM/
+  // DELIVERY_POC/previous-recruiter sub-steps, etc.) during this loop — with hundreds of placements
+  // each processed one-row-at-a-time they'd be thousands of near-identical lines. Only the high-level
+  // [update sync] progress + the trigger-level summaries (in index.js) stay visible. Reset in finally
+  // so the end-of-run scans and any later work log normally.
+  setPipelineDetailQuiet(true);
+  try {
+    for (let i = 0; i < slice.length; i += concurrency) {
+      const batch = slice.slice(i, i + concurrency);
+      const results = await Promise.all(batch.map(processTarget));
+      for (const r of results) {
+        checked++;
+        if (r.action === "INSERTED") appended++;
+        else if (r.action === "NO_CHANGE" || r.action === "PREVIEW_CHANGE") no_change++;
+        else if (r.action === "NOT_FOUND") not_found++;
+        else if (r.action === "NO_BASELINE") no_baseline++;
+        else if (r.action === "SKIPPED_DATE") skipped_date++;
+        else if (r.action === "ERROR") errors++;
+        else no_change++;
+      }
+      if (checked > 0 && checked % 100 === 0) {
+        logLine(
+          `[update sync] progress checked=${checked}/${slice.length} appended=${appended} no_change=${no_change} not_found=${not_found} no_baseline=${no_baseline} skipped_date=${skipped_date} errors=${errors}`
+        );
+      }
     }
-    if (checked > 0 && checked % 100 === 0) {
-      logLine(
-        `[update sync] progress checked=${checked}/${slice.length} appended=${appended} no_change=${no_change} not_found=${not_found} no_baseline=${no_baseline} skipped_date=${skipped_date} errors=${errors}`
-      );
-    }
+  } finally {
+    setPipelineDetailQuiet(false);
   }
 
   const batchOffsetEnd = batchOffset + batchSlice.length;

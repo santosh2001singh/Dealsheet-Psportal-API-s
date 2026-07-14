@@ -19,7 +19,7 @@
  * table-scoped BigQuery lookup; never allocate a brand-new id for EXTENSION.
  */
 
-const { logLine } = require("./logger");
+const { logDetail } = require("./logger");
 const { allocateContractIds } = require("./contractIdSequence");
 const {
   normalizeContractIdOrNull,
@@ -140,7 +140,7 @@ async function fetchExtensionContractIdsByTable(unresolvedExtensions, fetchContr
       if (result instanceof Map) lookedUp = result;
       else if (result && typeof result === "object") lookedUp = new Map(Object.entries(result));
     } catch (err) {
-      logLine(
+      logDetail(
         `[contractId resolver] fetchContractIdsForExtensions(${lookupInput.length}, table=${tableId || "union"}) failed: ${String(err?.message || err).slice(0, 200)}`
       );
     }
@@ -192,7 +192,7 @@ async function resolveContractIdsForRows(rows, deps = {}) {
       const result = await fetchContractIdsByDealSheetIdsFn(dealSheetIds, deps.bqOptions);
       if (result instanceof Map) existingByDealSheetId = result;
     } catch (err) {
-      logLine(
+      logDetail(
         `[contractId resolver] fetchContractIdsByDealSheetIds failed (continuing without existing-by-dsid): ${String(err?.message || err).slice(0, 200)}`
       );
     }
@@ -257,7 +257,7 @@ async function resolveContractIdsForRows(rows, deps = {}) {
     const totalToAllocate = allocationKeys.length + noKeyAllocationRows.length;
     if (totalToAllocate > 0) {
       if (!sequenceOptions) {
-        logLine(
+        logDetail(
           `[contractId resolver] allocateContractIds skipped: missing tableId/sequenceOptions for ${totalToAllocate} DEAL row(s)`
         );
       } else {
@@ -266,7 +266,7 @@ async function resolveContractIdsForRows(rows, deps = {}) {
           const result = await allocateContractIdsFn(totalToAllocate, sequenceOptions);
           if (Array.isArray(result)) ids = result;
         } catch (err) {
-          logLine(
+          logDetail(
             `[contractId resolver] allocateContractIds(${totalToAllocate}) failed (DEAL rows will have null CONTRACT_ID): ${String(err?.message || err).slice(0, 200)}`
           );
         }
@@ -360,7 +360,7 @@ async function resolveContractIdsForRows(rows, deps = {}) {
   }
 
   const phaseLabel = skipAllocation ? "phaseA" : "phaseAB";
-  logLine(
+  logDetail(
     `[contractId resolver ${phaseLabel}] rows=${rows.length} allocated=${allocatedCount} deferred=${deferredAllocationCount} reusedExisting=${reusedExistingCount} reusedInBatch=${reusedInBatchCount} extensionFromBq=${extensionFromBqCount} extensionOrphan=${extensionOrphanCount}`
   );
 
@@ -410,7 +410,7 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
   if (totalToAllocate === 0) return rowsToInsert;
 
   if (!sequenceOptions) {
-    logLine(
+    logDetail(
       `[contractId allocator] skipped: missing tableId sequence config (tableId=${tableId || "none"}, need=${totalToAllocate})`
     );
     return rowsToInsert;
@@ -421,7 +421,7 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
     const result = await allocateContractIdsFn(totalToAllocate, sequenceOptions);
     if (Array.isArray(result)) ids = result;
   } catch (err) {
-    logLine(
+    logDetail(
       `[contractId allocator] allocateContractIds(${totalToAllocate}) failed (DEAL rows will have null CONTRACT_ID): ${String(err?.message || err).slice(0, 200)}`
     );
   }
@@ -463,7 +463,7 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
     }
   }
 
-  logLine(
+  logDetail(
     `[contractId allocator] table=${tableId || "none"} insertable=${rowsToInsert.length} allocated=${allocatedCount} uniqueKeys=${allocationKeys.length} noKey=${noKeyAllocationRows.length} extensionPropagated=${extensionPropagated}`
   );
 
