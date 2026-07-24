@@ -47,7 +47,7 @@ const ACTIVE_INSERT_SYNC_CHECKPOINT_KEY = "active-deal-sheet-insert-page-cursor"
 /** First-insert placement allowlist for new DEAL_SHEET_ID+PLACEMENT_ID baselines on active `dealSheetSyncTrigger`
  *  (STARTED/BOOKED, plus DID NOT ACCEPT for offer-rejected and DID NOT START for cancelled VERBAL
  *  candidates admitted below). */
-const ACTIVE_BOOTSTRAP_FIRST_INSERT_PLACEMENT_STATUSES = "STARTED,BOOKED,DID NOT ACCEPT,DID NOT START";
+const ACTIVE_BOOTSTRAP_FIRST_INSERT_PLACEMENT_STATUSES = "STARTED,BOOKED,ENDED,ENDED<30,DID NOT ACCEPT,DID NOT START,OFFERED";
 /** First-insert allowlist for `dealSheetSyncOfferRejected` ended tables (wider than active scheduled) */
 const ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES =
   "STARTED,BOOKED,ENDED,ENDED<30,DID NOT START,DID NOT ACCEPT";
@@ -61,8 +61,12 @@ const DEAL_SHEET_MIN_START_DATE_ISO = new Date(DEAL_SHEET_MIN_START_DATE_MS).toI
  *  OFFER_REJECTED (-> DID NOT ACCEPT) and CANCELLED/CANCELED (-> DID NOT START) included so those
  *  candidates (deal sheet often only VERBAL) are picked up into the ACTIVE tables too — their VERBAL
  *  deal sheet is admitted via deal_sheet_status_codes=FINAL,VERBAL and the placement status is mapped
- *  by mapSubmittalCodeToPlacementStatus. */
-const ACTIVE_BOOTSTRAP_SUBMITTAL_CODES = "PERM_STARTS,ACTIVE,BOOKED,OFFER_REJECTED,CANCELLED,CANCELED";
+ *  by mapSubmittalCodeToPlacementStatus.
+ *  COMPLETED (-> ENDED) and EARLY_TERM (-> ENDED / ENDED<30) included so ended placements are fetched
+ *  into the ACTIVE tables as well (admitted by the ENDED/ENDED<30 entries in
+ *  ACTIVE_BOOTSTRAP_FIRST_INSERT_PLACEMENT_STATUSES); they stay in the active tables (no move-to-ended
+ *  routing runs on this path). */
+const ACTIVE_BOOTSTRAP_SUBMITTAL_CODES = "PERM_STARTS,ACTIVE,BOOKED,OFFER_REJECTED,CANCELLED,CANCELED,OFFERED,COMPLETED,EARLY_TERM";
 
 function filterEnrichedRowsByDealSheetMinStartDate(rows) {
   return rows.filter((row) =>
@@ -751,11 +755,31 @@ exports.dealSheetSyncUpdateTrigger = onSchedule(
         logError("[dealSheetSyncUpdateTrigger] ownership change log scan FAILED (non-fatal)", ownershipErr);
       }
 
+      // Keep ownership_change_logs' placement dates (START_DATE / END_DATE_PREVIOUS_OWNER /
+      // EFFECTIVE_DATE) in sync with each placement's CURRENT deal-sheet row. Date changes (e.g. a
+      // placement going ENDED / ENDED<30, or START/TENTATIVE edits) happen on THIS update trigger,
+      // so the overwrite must run here too — not only on dealSheetSyncTrigger. Runs AFTER the
+      // ownership-change scan so freshly-inserted handover rows are re-dated as well. Non-fatal.
+      logLine("[dealSheetSyncUpdateTrigger] Invoking syncOwnershipChangeLogEffectiveDatesFromExtensions (placement date sync)");
+      let ownershipEffectiveDateResult = null;
+      try {
+        ownershipEffectiveDateResult = await syncOwnershipChangeLogEffectiveDatesFromExtensions({
+          deal_sheet_bq_dataset: bqDataset,
+          bq_table: "ownership_change_logs",
+        });
+        logLine(
+          `[dealSheetSyncUpdateTrigger] ownership date sync updated=${ownershipEffectiveDateResult.updated == null ? "n/a" : ownershipEffectiveDateResult.updated} dealSheetUpdated=${ownershipEffectiveDateResult.dealSheetUpdated == null ? "n/a" : ownershipEffectiveDateResult.dealSheetUpdated} elapsed=${ownershipEffectiveDateResult.elapsed || "n/a"}`
+        );
+      } catch (effErr) {
+        logError("[dealSheetSyncUpdateTrigger] ownership date sync FAILED (non-fatal)", effErr);
+      }
+
       return {
         success: true,
         result,
         inorganicHierarchyLog: inorganicHierarchyLogResult,
         ownershipChangeLog: ownershipChangeLogResult,
+        ownershipEffectiveDate: ownershipEffectiveDateResult,
       };
     });
   }

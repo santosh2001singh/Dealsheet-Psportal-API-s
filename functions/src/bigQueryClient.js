@@ -333,6 +333,54 @@ function stripRateChangeHistoryMetaFields(row) {
  * Returns Map<contractIdStr, { latest, previous }> for CONTRACT_IDs whose latest row
  * has RATE_CHANGE='YES' and at least one prior row exists (rate-change event).
  */
+/**
+ * Build schema-safe `SELECT ... UNION ALL` parts across the active domain deal-sheet tables. Those
+ * tables have divergent schemas, so a plain `SELECT *` UNION breaks on column-count mismatch. This
+ * projects the SUPERSET of columns (health table's ordinal order first, then any table-only columns)
+ * and emits `CAST(NULL AS <type>) AS col` for columns a table doesn't have — so every branch has the
+ * same columns in the same order, and downstream `SELECT *` code still sees every field.
+ * @param {string} datasetId
+ * @param {string} [whereClause] optional predicate appended per branch (e.g. "CONTRACT_ID IS NOT NULL")
+ * @returns {Promise<string[]>}
+ */
+async function buildActiveDealSheetSchemaSafeUnionParts(datasetId, whereClause = "") {
+  const inList = ACTIVE_DEAL_SHEET_TABLE_IDS.map((t) => `'${escapeSqlString(t)}'`).join(", ");
+  const metaSql = `SELECT table_name, column_name, data_type, ordinal_position
+                   FROM \`${config.projectId}.${datasetId}.INFORMATION_SCHEMA.COLUMNS\`
+                   WHERE table_name IN (${inList})`;
+  const metaRows = await queryObjects(metaSql, 100000);
+
+  const colsByTable = new Map();
+  const typeByCol = new Map();
+  const healthOrdinal = new Map();
+  for (const t of ACTIVE_DEAL_SHEET_TABLE_IDS) colsByTable.set(t, new Set());
+  for (const r of metaRows) {
+    const t = r?.table_name;
+    const c = r?.column_name;
+    if (t == null || c == null || !colsByTable.has(t)) continue;
+    colsByTable.get(t).add(c);
+    if (!typeByCol.has(c)) typeByCol.set(c, String(r.data_type || "STRING"));
+    if (t === ACTIVE_DEAL_SHEET_TABLE_IDS[0]) healthOrdinal.set(c, Number(r.ordinal_position));
+  }
+
+  const orderedCols = [...typeByCol.keys()].sort((a, b) => {
+    const oa = healthOrdinal.has(a) ? healthOrdinal.get(a) : Number.MAX_SAFE_INTEGER;
+    const ob = healthOrdinal.has(b) ? healthOrdinal.get(b) : Number.MAX_SAFE_INTEGER;
+    if (oa !== ob) return oa - ob;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+
+  const where = whereClause && whereClause.trim() !== "" ? ` WHERE ${whereClause}` : "";
+  return ACTIVE_DEAL_SHEET_TABLE_IDS.map((t) => {
+    const have = colsByTable.get(t);
+    const proj = orderedCols.map((c) =>
+      have.has(c) ? `\`${c}\`` : `CAST(NULL AS ${typeByCol.get(c)}) AS \`${c}\``
+    );
+    return `SELECT ${proj.join(", ")}, '${escapeSqlString(t)}' AS _src `
+      + `FROM \`${config.projectId}.${datasetId}.${t}\`${where}`;
+  });
+}
+
 async function fetchContractRateChangePairsFromActive(options = {}) {
   const out = new Map();
   const datasetId =
@@ -340,11 +388,11 @@ async function fetchContractRateChangePairsFromActive(options = {}) {
       ? options.datasetId.trim()
       : config.datasetId;
 
-  const unionParts = ACTIVE_DEAL_SHEET_TABLE_IDS.map((tableId) => {
-    const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
-    const src = escapeSqlString(tableId);
-    return `SELECT *, '${src}' AS _src FROM ${fqn} WHERE CONTRACT_ID IS NOT NULL`;
-  });
+  // The 3 active domain tables have DIVERGENT schemas (different column sets/counts), so a plain
+  // `SELECT *` UNION ALL fails with a column-count mismatch. Build a schema-safe union: project the
+  // SUPERSET of columns (health ordinal order), and for any column a given table lacks, emit a typed
+  // NULL so every UNION branch has identical columns. Robust to future per-table schema drift.
+  const unionParts = await buildActiveDealSheetSchemaSafeUnionParts(datasetId, "CONTRACT_ID IS NOT NULL");
 
   const sql = `WITH all_rows AS (
                  ${unionParts.join("\n                 UNION ALL\n                 ")}
@@ -875,6 +923,14 @@ function applyTentativeDateFreeze(incomingRow, baselineRow) {
  * recruiter's identity onto PREVIOUS_RECRUITER_NAME/EMAIL/EMP_NO from the baseline row. When the
  * recruiter is unchanged these columns are left as-is (they are MANUAL_COLUMNS, so already carried
  * forward from baseline by applyManualColumnsCarryForward before this runs).
+ *
+ * Also VACATES any frozen hierarchy role the NEW recruiter used to hold on this placement: if the
+ * new recruiter's RECRUITER_EMP_NO matches a hierarchy role's emp-no on the baseline row (e.g. they
+ * were the TEAM_LEAD), that column + its *_EMP_NO are set to "NA" — one person must not hold two
+ * designations at once, and hierarchy is otherwise carried forward frozen. This mirrors the
+ * vacated-role rows buildOwnershipChangeLogRows writes to ownership_change_logs (same
+ * DEAL_RECRUITER_HIERARCHY_TARGETS, same emp-no match, same "NA"), keeping the deal sheet and the
+ * ownership log in lock-step. Roles the new recruiter did NOT hold are left unchanged.
  */
 function applyPreviousRecruiterOnRecruiterChange(incomingRow, baselineRow) {
   if (!incomingRow || typeof incomingRow !== "object") return { row: incomingRow, changed: false };
@@ -883,19 +939,26 @@ function applyPreviousRecruiterOnRecruiterChange(incomingRow, baselineRow) {
   const incEmail = normEmail(incomingRow.ASSIGNMENT_RECRUITER_EMAIL);
   const baseEmail = normEmail(baselineRow.ASSIGNMENT_RECRUITER_EMAIL);
   if (baseEmail === "" || incEmail === baseEmail) return { row: incomingRow, changed: false };
-  return {
-    row: {
-      ...incomingRow,
-      PREVIOUS_RECRUITER_NAME: baselineRow.ASSIGNMENT_RECRUITER ?? null,
-      PREVIOUS_RECRUITER_EMAIL: baselineRow.ASSIGNMENT_RECRUITER_EMAIL ?? null,
-      PREVIOUS_RECRUITER_EMP_NO: baselineRow.RECRUITER_EMP_NO ?? null,
-      // Recruiter changed -> stamp EFFECTIVE_DATE = TENTATIVE_DATE + 1 (temporary), the same value
-      // the ownership_change_logs RECRUITER row gets; both are later overwritten to the extension's
-      // START_DATE (see the effective-date overwrite in the insert trigger).
-      EFFECTIVE_DATE: addOneDayToDateOnly(incomingRow.TENTATIVE_DATE),
-    },
-    changed: true,
+  const next = {
+    ...incomingRow,
+    PREVIOUS_RECRUITER_NAME: baselineRow.ASSIGNMENT_RECRUITER ?? null,
+    PREVIOUS_RECRUITER_EMAIL: baselineRow.ASSIGNMENT_RECRUITER_EMAIL ?? null,
+    PREVIOUS_RECRUITER_EMP_NO: baselineRow.RECRUITER_EMP_NO ?? null,
+    // Recruiter changed -> stamp EFFECTIVE_DATE = TENTATIVE_DATE + 1 (temporary), the same value
+    // the ownership_change_logs RECRUITER row gets; both are later overwritten to the extension's
+    // START_DATE (see the effective-date overwrite in the insert trigger).
+    EFFECTIVE_DATE: addOneDayToDateOnly(incomingRow.TENTATIVE_DATE),
   };
+  const newRecruiterEmp = normalizeOwnershipValueForCompare(incomingRow.RECRUITER_EMP_NO);
+  if (newRecruiterEmp !== "") {
+    for (const target of DEAL_RECRUITER_HIERARCHY_TARGETS) {
+      const prevEmp = normalizeOwnershipValueForCompare(baselineRow[target.empNoColumn]);
+      if (prevEmp === "" || prevEmp !== newRecruiterEmp) continue;
+      next[target.column] = "NA";
+      next[target.empNoColumn] = "NA";
+    }
+  }
+  return { row: next, changed: true };
 }
 
 /**
@@ -3854,13 +3917,10 @@ async function fetchDealRecruiterHierarchyByPlacementId(rows, options = {}, deps
   const out = new Map();
   if (!rows || rows.length === 0) return out;
 
-  // Hierarchy is resolved from the PREVIOUS recruiter's chain on a handover DEAL (so the deal keeps
-  // its original delivery hierarchy), else from the current/Assignment recruiter. Also remember the
-  // current recruiter's emp-no per placement so we can vacate the slot the new recruiter used to hold.
+  // Hierarchy is resolved from the DEAL-SHEET (current/Assignment) recruiter's chain. (Previously it
+  // preferred PREVIOUS_RECRUITER on a submittal handover; that handover path was removed — the
+  // deal-sheet recruiter is the owner, so its chain is the hierarchy.)
   const hierarchyEmailForRow = (row) => {
-    const prev = row?.PREVIOUS_RECRUITER_EMAIL;
-    const prevNorm = prev == null ? "" : String(prev).trim().toLowerCase();
-    if (prevNorm) return prevNorm;
     const cur = row?.ASSIGNMENT_RECRUITER_EMAIL;
     return cur == null ? "" : String(cur).trim().toLowerCase();
   };

@@ -162,3 +162,77 @@ test("applyPreviousRecruiterOnRecruiterChange: no-op when baseline recruiter ema
   const { changed } = applyPreviousRecruiterOnRecruiterChange(incoming, baseline);
   assert.equal(changed, false);
 });
+
+test("applyPreviousRecruiterOnRecruiterChange: vacates the hierarchy role the NEW recruiter used to hold (TEAM_LEAD -> NA), matched by emp-no on baseline", () => {
+  // Baseline: XYZ is the recruiter; Rohit (CY777) is the TEAM_LEAD.
+  const baseline = {
+    ASSIGNMENT_RECRUITER: "XYZ",
+    ASSIGNMENT_RECRUITER_EMAIL: "xyz@cynethealth.com",
+    RECRUITER_EMP_NO: "CY100",
+    TEAM_LEAD: "Rohit",
+    TEAM_LEAD_EMP_NO: "CY777",
+    RM: "Alex",
+    RM_EMP_NO: "CY888",
+  };
+  // Incoming: Rohit (CY777) is now the recruiter; hierarchy carried forward from baseline.
+  const incoming = {
+    ASSIGNMENT_RECRUITER: "Rohit",
+    ASSIGNMENT_RECRUITER_EMAIL: "rohit@cynethealth.com",
+    RECRUITER_EMP_NO: "CY777",
+    TENTATIVE_DATE: "2026-05-15",
+    TEAM_LEAD: "Rohit",
+    TEAM_LEAD_EMP_NO: "CY777",
+    RM: "Alex",
+    RM_EMP_NO: "CY888",
+  };
+  const { row, changed } = applyPreviousRecruiterOnRecruiterChange(incoming, baseline);
+  assert.equal(changed, true);
+  // Recruiter handover fields (existing behavior)
+  assert.equal(row.PREVIOUS_RECRUITER_NAME, "XYZ");
+  assert.equal(row.PREVIOUS_RECRUITER_EMP_NO, "CY100");
+  assert.equal(row.EFFECTIVE_DATE, "2026-05-16"); // tentative + 1
+  // TEAM_LEAD vacated because Rohit (CY777) is now the recruiter
+  assert.equal(row.TEAM_LEAD, "NA");
+  assert.equal(row.TEAM_LEAD_EMP_NO, "NA");
+  // RM (Alex, CY888) untouched — a different person
+  assert.equal(row.RM, "Alex");
+  assert.equal(row.RM_EMP_NO, "CY888");
+});
+
+test("applyPreviousRecruiterOnRecruiterChange: no hierarchy vacated when the new recruiter held no role on baseline", () => {
+  const baseline = {
+    ASSIGNMENT_RECRUITER_EMAIL: "xyz@cynethealth.com",
+    RECRUITER_EMP_NO: "CY100",
+    TEAM_LEAD: "Rohit",
+    TEAM_LEAD_EMP_NO: "CY777",
+  };
+  const incoming = {
+    ASSIGNMENT_RECRUITER_EMAIL: "brandnew@cynethealth.com",
+    RECRUITER_EMP_NO: "CY999", // matches no baseline hierarchy emp-no
+    TENTATIVE_DATE: "2026-05-15",
+    TEAM_LEAD: "Rohit",
+    TEAM_LEAD_EMP_NO: "CY777",
+  };
+  const { row } = applyPreviousRecruiterOnRecruiterChange(incoming, baseline);
+  assert.equal(row.TEAM_LEAD, "Rohit");
+  assert.equal(row.TEAM_LEAD_EMP_NO, "CY777");
+});
+
+test("applyPreviousRecruiterOnRecruiterChange: emp-no match is trim/case-insensitive", () => {
+  const baseline = {
+    ASSIGNMENT_RECRUITER_EMAIL: "xyz@cynethealth.com",
+    RECRUITER_EMP_NO: "CY100",
+    ACCOUNT_MANAGER: "Rohit",
+    ACCOUNT_MANAGER_EMP_NO: " cy777 ",
+  };
+  const incoming = {
+    ASSIGNMENT_RECRUITER_EMAIL: "rohit@cynethealth.com",
+    RECRUITER_EMP_NO: "CY777",
+    TENTATIVE_DATE: "2026-05-15",
+    ACCOUNT_MANAGER: "Rohit",
+    ACCOUNT_MANAGER_EMP_NO: " cy777 ",
+  };
+  const { row } = applyPreviousRecruiterOnRecruiterChange(incoming, baseline);
+  assert.equal(row.ACCOUNT_MANAGER, "NA");
+  assert.equal(row.ACCOUNT_MANAGER_EMP_NO, "NA");
+});

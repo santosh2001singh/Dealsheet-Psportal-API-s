@@ -35,7 +35,6 @@ const {
   fetchContractRateChangePairsFromActive,
   fetchDealSheetRecruiterChangePairsFromActive,
   buildInorganicHierarchyLogCandidate,
-  fetchCsmHierarchyDivergenceCandidates,
   fetchRecruiterHierarchyReconciliation,
   buildInorganicCandidateFromReconciliation,
   buildOwnershipChangeLogRowsForHierarchyMoves,
@@ -2225,7 +2224,11 @@ async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
     if (candidate) recruiterCandidates.push(candidate);
   }
 
-  const csmCandidates = await fetchCsmHierarchyDivergenceCandidates({ datasetId: dealSheetDatasetId });
+  // ONSITE_AM hierarchy (LEVEL_2/3/4_CSM) is deliberately NOT logged inorganic. Its organic columns
+  // already track the current ONSITE_AM continuously on the deal sheet (applyOnsiteAmCsmHierarchyForRows,
+  // never frozen), so a change in the onsite AM or its chain shows up directly on the deal sheet — and
+  // the change is still captured in ownership_change_logs (OWNERSHIP_CHANGE_DIFF_ROLES includes
+  // ONSITE_AM + the CSM levels). Business rule: no INORGANIC_ONSITE_AM / INORGANIC_LEVEL_*_CSM.
 
   // Single person-centric reconciliation drives THREE outputs: (1) new people -> inorganic log,
   // (2) existing-person role changes -> moved regular fields (appended deal-sheet rows), and
@@ -2238,7 +2241,9 @@ async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
     if (candidate) recruiterHierarchyCandidates.push(candidate);
   }
 
-  const candidates = mergeInorganicHierarchyLogCandidates(recruiterCandidates, csmCandidates, recruiterHierarchyCandidates);
+  // Second arg (CSM divergence candidates) is intentionally empty — see note above; ONSITE_AM
+  // hierarchy is never written to the inorganic log.
+  const candidates = mergeInorganicHierarchyLogCandidates(recruiterCandidates, [], recruiterHierarchyCandidates);
   const rows = await resolveInorganicHierarchyLogRows(candidates);
 
   const result = await insertInorganicHierarchyLogBatch(rows, 0, {
@@ -2275,13 +2280,13 @@ async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
 
   const elapsedStr = formatDuration(Date.now() - startMs);
   logLine(
-    `[inorganic hierarchy logs BQ scan] DONE inserted=${result.inserted} recruiterChangePairs=${pairs.size} csmDivergences=${csmCandidates.length} reconPlacements=${reconResults.length} newPersonCandidates=${recruiterHierarchyCandidates.length} moveAppends=${movesResult.appended} moveOwnershipRows=${ownershipMovesInserted} candidates=${candidates.length} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
+    `[inorganic hierarchy logs BQ scan] DONE inserted=${result.inserted} recruiterChangePairs=${pairs.size} csmDivergences=0(disabled) reconPlacements=${reconResults.length} newPersonCandidates=${recruiterHierarchyCandidates.length} moveAppends=${movesResult.appended} moveOwnershipRows=${ownershipMovesInserted} candidates=${candidates.length} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
   );
 
   return {
     inserted: result.inserted,
     total: pairs.size,
-    csmDivergences: csmCandidates.length,
+    csmDivergences: 0, // ONSITE_AM hierarchy never logged inorganic (shown organically instead)
     recruiterHierarchyDivergences: recruiterHierarchyCandidates.length,
     hierarchyMoveAppends: movesResult.appended,
     hierarchyMoveOwnershipRows: ownershipMovesInserted,

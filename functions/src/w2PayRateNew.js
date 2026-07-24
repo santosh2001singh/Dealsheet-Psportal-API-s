@@ -29,6 +29,17 @@ function parseBillableOrientationFraction(value) {
 }
 
 /**
+ * CA and AK use REGULAR_HOURS_1/2 vs schedule hours for the NEW-rate OT split.
+ * All other states use the 40-hour weekly OT threshold.
+ * @param {string|null|undefined} clientState
+ * @returns {boolean}
+ */
+function usesRegularHoursOtSplit(clientState) {
+  const s = clientState == null ? "" : String(clientState).trim().toUpperCase();
+  return s === "CA" || s === "AK";
+}
+
+/**
  * @param {Record<string, *>} row Merged deal-sheet row before derived fields
  */
 function computeW2PayRateNew(row) {
@@ -36,8 +47,7 @@ function computeW2PayRateNew(row) {
   if (placement === "") return { W2_PAY_RATE_NEW: null };
   if (placement === "FT" || placement === "INTERNAL") return { W2_PAY_RATE_NEW: 0 };
 
-  const isCa =
-    row?.CLIENT_STATE != null && String(row.CLIENT_STATE).trim().toUpperCase() === "CA";
+  const useRegularHours = usesRegularHoursOtSplit(row?.CLIENT_STATE);
 
   const sh1 = toNumberOrZero(row?.SCHEDULE_HOURS_1);
   const sh2 = toNumberOrZero(row?.SCHEDULE_HOURS_2);
@@ -52,7 +62,7 @@ function computeW2PayRateNew(row) {
   const po = toNumberOrZero(row?.PO_HOURS);
   const orient = toNumberOrZero(row?.ORIENTATION_HOURS);
 
-  const stateBranch = isCa
+  const stateBranch = useRegularHours
     ? rh1 * fwh * pay
       + (sh1 - rh1) * ot * fwh
       + rh2 * swh * pay
@@ -116,10 +126,9 @@ function computeFinalBillRateNew(row) {
   const fwh = toNumberOrZero(row?.FIRST_WEEK_HOURS);
   const swh = toNumberOrZero(row?.SECOND_WEEK_HOURS);
 
-  const isCa =
-    row?.CLIENT_STATE != null && String(row.CLIENT_STATE).trim().toUpperCase() === "CA";
+  const useRegularHours = usesRegularHoursOtSplit(row?.CLIENT_STATE);
 
-  const gross = isCa
+  const gross = useRegularHours
     ? rh1 * fwh * br
       + (sh1 - rh1) * cot * fwh
       + rh2 * swh * br
@@ -161,6 +170,7 @@ function computeNewRateFamily(row) {
 }
 
 module.exports = {
+  usesRegularHoursOtSplit,
   computeW2PayRateNew,
   computeFinalPayRateNew,
   computeFinalCostNew,

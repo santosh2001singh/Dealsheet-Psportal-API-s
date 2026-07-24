@@ -13,6 +13,7 @@ const {
   computeLocumsDerivedPlacementFields,
 } = require("./locumsDerivedPlacementFields");
 const { normalizeContractIdOrNull } = require("./contractIdFormat");
+const { usesRegularHoursOtSplit } = require("./w2PayRateNew");
 
 /**
  * Convert value to number or null
@@ -314,33 +315,21 @@ function mapCandidateCandidateTypesToBq(rows) {
 function mapDealSheetUsersToBq(dealSheet, recruiterUser, salesRepUser, submittalRow) {
   const recruiterFromSubmittal = normalizeRecruiterFromSubmittal(submittalRow);
   const recruiterIdFromDealSheet = toIntOrNull(dealSheet?.recruiter);
-  // ASSIGNMENT_RECRUITER (current owner) = the deal-sheet's recruiter (via /api/users), falling back
-  // to the submittal's recruiter when the user lookup is missing.
+  // ASSIGNMENT_RECRUITER (current owner) = the DEAL-SHEET's recruiter (via /api/users), falling back
+  // to the submittal's recruiter ONLY when the user lookup is missing (so the field is never blank).
   const recruiterObj = recruiterUser ?? recruiterFromSubmittal;
   const salesRepIdFromSubmittal = toIntOrNull(submittalRow?.sales_rep);
 
-  // Recruiter handover: on a DEAL, the job-submittal's recruiter is the PREVIOUS owner while the
-  // deal-sheet's recruiter is the current/Assignment owner. When they differ we capture the previous
-  // recruiter here (emp-no is resolved from the directory later in the enricher). Only for DEAL rows
-  // (EXTENSION rows use the across-append PREVIOUS_RECRUITER logic instead).
-  const currentEmail = recruiterObj?.email ? String(recruiterObj.email).trim().toLowerCase() : "";
-  const submittalEmail = recruiterFromSubmittal?.email
-    ? String(recruiterFromSubmittal.email).trim().toLowerCase()
-    : "";
-  const isDeal = String(dealSheet?.type ?? "").trim().toUpperCase() === "DEAL";
-  const hasPreviousRecruiter =
-    isDeal && currentEmail !== "" && submittalEmail !== "" && currentEmail !== submittalEmail;
+  // PREVIOUS_RECRUITER is NO LONGER derived from the job-submittal recruiter. Business rule: only the
+  // deal-sheet's recruiter is the owner; a "previous recruiter" is recorded solely when the deal-sheet
+  // recruiter actually CHANGES across an update-append (applyPreviousRecruiterOnRecruiterChange), i.e.
+  // new recruiter -> current, the outgoing one -> previous. (EXTENSION rows can also backfill previous
+  // from the legacy ownership tracker.) So no __PREV_RECRUITER_* is captured from the submittal here.
 
   return {
     RECRUITER_ID: recruiterIdFromDealSheet ?? recruiterFromSubmittal?.id ?? null,
     ASSIGNMENT_RECRUITER: mapUserToFullName(recruiterObj),
     ASSIGNMENT_RECRUITER_EMAIL: recruiterObj?.email ?? null,
-    // Stashed in "__"-prefixed temp fields (stripped before insert). PREVIOUS_RECRUITER_* is a MANUAL
-    // column that carry-forward would overwrite with the baseline, so it's filled from these temps
-    // only when currently empty (applyPreviousRecruiterFillForInsertRows) — freeze-once-set, but
-    // still backfills on an existing deal that never had a previous recruiter stored.
-    __PREV_RECRUITER_NAME: hasPreviousRecruiter ? mapUserToFullName(recruiterFromSubmittal) : null,
-    __PREV_RECRUITER_EMAIL: hasPreviousRecruiter ? recruiterFromSubmittal.email : null,
     CLIENT_SALES_REP: mapUserToFullName(salesRepUser),
     CLIENT_SALES_REP_ID:
       toIntOrNull(dealSheet?.sales_rep) ?? salesRepIdFromSubmittal ?? null,
@@ -568,6 +557,21 @@ function resolveClientOfferingForEnrich(submittalRow, clientOfferingsFromApi, jo
 }
 
 /**
+ * Bucket a raw CLIENT_TYPE (e.g. "VMS", "State/Local Direct", "Federal VMS") into TYPE_OF_CLIENT.
+ * Keyword-based so new variants map too. NOTE: "Goverment" spelling matches the business reference
+ * table verbatim (their column value) — change the string here if the correct "Government" is wanted.
+ * Unmatched non-empty types (VMS/Direct/Practice/…) default to "Commercial".
+ */
+function mapClientTypeToTypeOfClient(clientType) {
+  if (clientType == null || String(clientType).trim() === "") return null;
+  const k = String(clientType).trim().toLowerCase();
+  if (k.includes("school")) return "School";
+  if (k.includes("federal")) return "Federal";
+  if (k.includes("state") || k.includes("local") || k.includes("goverment") || k.includes("government")) return "Goverment";
+  return "Commercial";
+}
+
+/**
  * Map MSP from client offering row
  */
 function mapMspFromClientOfferingRow(row) {
@@ -583,17 +587,18 @@ function mapMspFromClientOfferingRow(row) {
 
   const msp = row.msp;
   if (!msp || typeof msp !== "object") {
-    return { CLIENT_TYPE: clientType };
+    return { CLIENT_TYPE: clientType, TYPE_OF_CLIENT: mapClientTypeToTypeOfClient(clientType) };
   }
   const mid = msp.id;
   const n = mid == null || mid === "" ? null : Number(mid);
   const name = msp.name != null ? String(msp.name).trim() || null : null;
-  
+
   return {
     MSP_ID: n != null && Number.isFinite(n) ? Math.trunc(n) : null,
     MSP_NAME: name,
     LINE_OF_BUSINESS: name,
     CLIENT_TYPE: clientType,
+    TYPE_OF_CLIENT: mapClientTypeToTypeOfClient(clientType),
   };
 }
 
@@ -620,15 +625,11 @@ function mapJobProfessionSpecialtyFromJob(job) {
  * Map deal sheet hours details to BigQuery schema.
  * SCHEDULE_HOURS_1 / SCHEDULE_HOURS_2 default to 0 when source value is null/blank
  * so BigQuery always stores a number (not NULL).
- * REGULAR_HOURS_* are populated only when clientState is CA;
+ * REGULAR_HOURS_* are populated when clientState is CA or AK (regular-hours OT split);
  * all other states (and blank/null state) get 0 for those two columns.
  */
 function mapDealSheetHoursDetailsToBq(hoursRow, clientState) {
-  const stateNorm =
-    clientState == null || String(clientState).trim() === ""
-      ? null
-      : String(clientState).trim().toUpperCase();
-  const isCa = stateNorm === "CA";
+  const useRegularHours = usesRegularHoursOtSplit(clientState);
 
   if (!hoursRow) {
     return {
@@ -642,8 +643,8 @@ function mapDealSheetHoursDetailsToBq(hoursRow, clientState) {
     PO_HOURS: toNumberOrNull(hoursRow.total_assignment_hrs),
     SCHEDULE_HOURS_1: toNumberOrNull(hoursRow.scheduled_hrs_1) ?? 0,
     SCHEDULE_HOURS_2: toNumberOrNull(hoursRow.scheduled_hrs_2) ?? 0,
-    REGULAR_HOURS_1: isCa ? (toNumberOrNull(hoursRow.regular_hrs_1) ?? 0) : 0,
-    REGULAR_HOURS_2: isCa ? (toNumberOrNull(hoursRow.regular_hrs_2) ?? 0) : 0,
+    REGULAR_HOURS_1: useRegularHours ? (toNumberOrNull(hoursRow.regular_hrs_1) ?? 0) : 0,
+    REGULAR_HOURS_2: useRegularHours ? (toNumberOrNull(hoursRow.regular_hrs_2) ?? 0) : 0,
   };
 }
 
@@ -925,6 +926,7 @@ function mapSubmittalStatusToPlacementStatus(rawStatus) {
   if (key === "perm starts") return "STARTED";
   if (key === "cancelled" || key === "canceled") return "DID NOT START";
   if (key === "booked") return "BOOKED";
+  if (key === "offered/contract sent" || key === "offered") return "OFFERED";
   return s;
 }
 
@@ -941,6 +943,7 @@ function mapSubmittalCodeToPlacementStatus(rawCode, fallbackLabel = null) {
   if (code === "ACTIVE" || code === "PERM_STARTS") return "STARTED";
   if (code === "CANCELLED" || code === "CANCELED") return "DID NOT START";
   if (code === "BOOKED") return "BOOKED";
+  if (code === "OFFERED") return "OFFERED";
   return mapSubmittalStatusToPlacementStatus(fallbackLabel != null ? fallbackLabel : code);
 }
 
@@ -1122,7 +1125,6 @@ function computeDerivedPlacementFields(row) {
  * Map early term placement status
  */
 function mapEarlyTermPlacementStatus(submittalRow, jobObj) {
-  // Job first, submittal fallback (matches START_DATE / END_DATE resolution order).
   const nonBlank = (...vals) => {
     for (const v of vals) {
       if (v == null) continue;
@@ -1130,8 +1132,12 @@ function mapEarlyTermPlacementStatus(submittalRow, jobObj) {
     }
     return null;
   };
+  // ENDED vs ENDED<30 = how long the candidate ACTUALLY worked, i.e. start -> ACTUAL end. The actual
+  // (early-term) end is on the SUBMITTAL (same source as END_DATE); the job carries only the planned
+  // end. Using the job's planned end here would call a 2-week early-term "ENDED" (89 planned days)
+  // instead of "ENDED<30" (14 worked days). Start stays job-first.
   const startStr = nonBlank(jobObj?.start_date, submittalRow?.start_date);
-  const endStr = nonBlank(jobObj?.end_date, submittalRow?.end_date);
+  const endStr = nonBlank(submittalRow?.end_date, jobObj?.end_date);
   const days = dateDiffDaysEndMinusStart(startStr, endStr);
   if (days == null) return null;
   if (days < 30) return "ENDED<30";
@@ -1168,11 +1174,13 @@ function computeBqEndDateFromSubmittal(submittalRow, jobObj) {
     code === "ACTIVE" ||
     code === "PERM_STARTS" ||
     code === "BOOKED" ||
+    code === "OFFERED" ||
     label === "active" ||
     label === "perm starts" ||
-    label === "booked";
+    label === "booked" ||
+    label === "offered/contract sent" ||
+    label === "offered";
 
-  // Job first, submittal fallback (reversed per business rule); treat blank/"" as empty too.
   const nonBlank = (...vals) => {
     for (const v of vals) {
       if (v == null) continue;
@@ -1180,19 +1188,18 @@ function computeBqEndDateFromSubmittal(submittalRow, jobObj) {
     }
     return null;
   };
-  const endRaw = nonBlank(jobObj?.end_date, submittalRow?.end_date);
+  // START comes job-first (planned start). For END_DATE the ACTUAL end lives on the SUBMITTAL
+  // (early-term / completion date) — the job carries only the planned/tentative end (which becomes
+  // TENTATIVE_DATE elsewhere). So the ended date is submittal-first, job as fallback.
   const startRaw = nonBlank(jobObj?.start_date, submittalRow?.start_date);
+  const endedDate = nonBlank(submittalRow?.end_date, jobObj?.end_date);
 
-  if (isEnded) return formatDateStringForBq(endRaw);
-  if (isCancelled) return formatDateStringForBq(startRaw);
-  if (isActiveBooked) {
-    const endMs = parseDateStringForDiff(endRaw);
-    const todayMs = startOfTodayMs();
-    if (endMs != null && todayMs != null && endMs <= todayMs) {
-      return formatDateStringForBq(endRaw);
-    }
-    return null;
-  }
+  // END_DATE is populated ONLY once the placement has actually ended (ENDED / ENDED<30) — then it is
+  // the submittal's real end date. While STARTED/BOOKED/ACTIVE it stays null (not ended yet); the
+  // planned end is captured as TENTATIVE_DATE, not END_DATE.
+  if (isEnded) return formatDateStringForBq(endedDate);
+  if (isCancelled) return formatDateStringForBq(startRaw); // DID NOT ACCEPT/START: never worked -> end = start
+  if (isActiveBooked) return null;
 
   return computeBqEndDateFromJob(jobObj);
 }
@@ -1230,13 +1237,16 @@ function mapJobSubmittalToBq(submittalRow, jobObj) {
   const submitted = submittalRow.submitted_date;
   const submittedStr = submitted == null || String(submitted).trim() === ""
     ? null : String(submitted).trim();
-  // START_DATE: job's start_date first, falling back to the submittal's start_date when the job has
-  // none/blank. (Reversed from the old submittal-first order per business rule — the job carries the
-  // authoritative start; the submittal is the fallback.) Mirrors the END_DATE / TENTATIVE_DATE order.
-  const startRaw = firstNonEmptyDate(jobObj?.start_date, submittalRow?.start_date);
+  // START_DATE: the submittal's start_date wins, falling back to the job's start_date only when the
+  // submittal has none/blank. (Business rule: START_DATE + END_DATE come from the job-submittal API;
+  // the job is only a fallback for START.) END_DATE stays submittal-first too (see
+  // computeBqEndDateFromSubmittal) and is populated only once the placement has actually ENDED.
+  const startRaw = firstNonEmptyDate(submittalRow?.start_date, jobObj?.start_date);
   const startDate =
     startRaw == null ? null : (formatDateStringForBq(startRaw) ?? String(startRaw).trim());
-  const tentativeRaw = firstNonEmptyDate(jobObj?.end_date, submittalRow?.end_date);
+  // TENTATIVE_DATE (planned/tentative end): the JOB's end_date ONLY — no submittal fallback (business
+  // rule: tentative end comes from the job). Blank/absent job end_date -> null.
+  const tentativeRaw = jobObj?.end_date;
   const tentativeDate = formatDateStringForBq(tentativeRaw) ?? (
     tentativeRaw == null || String(tentativeRaw).trim() === ""
       ? null
@@ -1551,6 +1561,7 @@ const API_OWNED_COLUMNS = new Set([
   "MSP_NAME",
   "LINE_OF_BUSINESS",
   "CLIENT_TYPE",
+  "TYPE_OF_CLIENT",
   "CATEGORIZATION_OF_POSITION",
   "CATEGORIZATION_OF_POSITION_ID",
   "POSITION",
@@ -1676,7 +1687,6 @@ const MANUAL_COLUMNS = new Set([
   "EDITED_BY",
   "EFFECTIVE_DATE",
   "ENTITY",
-  "FINAL_INVOICE_PENDING",
   "FIFTYTWO_TENURE_CANDIDATE_STATUS",
   "FIFTYTWO_TENURE_RTO_LASTDATE",
   "GROUP_DIRECTOR",
@@ -1747,6 +1757,7 @@ module.exports = {
   clientOfferingHasClientTypeText,
   resolveClientOfferingForEnrich,
   mapMspFromClientOfferingRow,
+  mapClientTypeToTypeOfClient,
   mapJobProfessionSpecialtyFromJob,
   mapDealSheetHoursDetailsToBq,
   mapDealSheetRevenueDetailsToBq,

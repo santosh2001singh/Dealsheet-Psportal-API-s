@@ -2,38 +2,52 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const { mapDealSheetUsersToBq } = require("./columnMappings");
-const { applyPreviousRecruiterFillForInsertRows } = require("./bigQueryClient");
+const {
+  applyPreviousRecruiterFillForInsertRows,
+  applyPreviousRecruiterOnRecruiterChange,
+} = require("./bigQueryClient");
 
 const currentRecruiterUser = { id: 561722, first_name: "Sonam", last_name: "Chaudhary (R4A)", email: "sonam.c@cynethealth.com" };
-const submittalWithPrevRecruiter = {
+const submittalWithDifferentRecruiter = {
   recruiter: { id: 256183, first_name: "Shim", last_name: "Kashung (R2N)", email: "shim.k@cynethealth.com" },
   sales_rep: 2959734,
 };
 
-test("mapDealSheetUsersToBq: DEAL handover stashes previous recruiter in temp fields, ASSIGNMENT stays current", () => {
+// ---------------------------------------------------------------------------
+// Rule: ASSIGNMENT_RECRUITER is ALWAYS the deal-sheet's recruiter. The
+// job-submittal recruiter is NEVER used to derive a PREVIOUS_RECRUITER — it is
+// only a last-resort fallback for the ASSIGNMENT name when the user lookup is
+// missing. A previous recruiter is recorded solely when the deal-sheet
+// recruiter changes across an update-append (Mechanism B, tested below).
+// ---------------------------------------------------------------------------
+
+test("mapDealSheetUsersToBq: DEAL uses deal-sheet recruiter, never stashes previous from a differing submittal recruiter", () => {
   const out = mapDealSheetUsersToBq(
     { type: "DEAL", recruiter: 561722 },
     currentRecruiterUser,
     { first_name: "Elisa", last_name: "An", email: "elisa.a@cynethealth.com" },
-    submittalWithPrevRecruiter
+    submittalWithDifferentRecruiter
   );
   assert.equal(out.ASSIGNMENT_RECRUITER, "Sonam Chaudhary (R4A)");
   assert.equal(out.ASSIGNMENT_RECRUITER_EMAIL, "sonam.c@cynethealth.com");
-  assert.equal(out.__PREV_RECRUITER_NAME, "Shim Kashung (R2N)");
-  assert.equal(out.__PREV_RECRUITER_EMAIL, "shim.k@cynethealth.com");
-  // Never sets the real (manual) column directly — that's filled when-empty later.
+  // Nothing about the submittal recruiter leaks into a previous-recruiter field.
+  assert.equal(out.__PREV_RECRUITER_NAME, undefined);
+  assert.equal(out.__PREV_RECRUITER_EMAIL, undefined);
+  assert.equal(out.PREVIOUS_RECRUITER_NAME, undefined);
   assert.equal(out.PREVIOUS_RECRUITER_EMAIL, undefined);
 });
 
-test("mapDealSheetUsersToBq: no previous when submittal recruiter == current recruiter", () => {
+test("mapDealSheetUsersToBq: falls back to submittal recruiter for ASSIGNMENT only when the user lookup is missing", () => {
   const out = mapDealSheetUsersToBq(
     { type: "DEAL", recruiter: 561722 },
-    currentRecruiterUser,
+    null, // no user lookup
     null,
-    { recruiter: { id: 561722, first_name: "Sonam", last_name: "Chaudhary (R4A)", email: "sonam.c@cynethealth.com" } }
+    submittalWithDifferentRecruiter
   );
-  assert.equal(out.__PREV_RECRUITER_NAME, null);
-  assert.equal(out.__PREV_RECRUITER_EMAIL, null);
+  assert.equal(out.ASSIGNMENT_RECRUITER, "Shim Kashung (R2N)");
+  assert.equal(out.ASSIGNMENT_RECRUITER_EMAIL, "shim.k@cynethealth.com");
+  assert.equal(out.__PREV_RECRUITER_EMAIL, undefined);
+  assert.equal(out.PREVIOUS_RECRUITER_EMAIL, undefined);
 });
 
 test("mapDealSheetUsersToBq: EXTENSION never stashes previous recruiter from submittal", () => {
@@ -41,11 +55,62 @@ test("mapDealSheetUsersToBq: EXTENSION never stashes previous recruiter from sub
     { type: "EXTENSION", recruiter: 561722 },
     currentRecruiterUser,
     null,
-    submittalWithPrevRecruiter
+    submittalWithDifferentRecruiter
   );
-  assert.equal(out.__PREV_RECRUITER_NAME, null);
-  assert.equal(out.__PREV_RECRUITER_EMAIL, null);
+  assert.equal(out.ASSIGNMENT_RECRUITER, "Sonam Chaudhary (R4A)");
+  assert.equal(out.__PREV_RECRUITER_NAME, undefined);
+  assert.equal(out.__PREV_RECRUITER_EMAIL, undefined);
+  assert.equal(out.PREVIOUS_RECRUITER_EMAIL, undefined);
 });
+
+// ---------------------------------------------------------------------------
+// Mechanism B — the ONLY source of a previous recruiter: the deal-sheet's
+// recruiter actually changes between the baseline row and the incoming row.
+// ---------------------------------------------------------------------------
+
+test("applyPreviousRecruiterOnRecruiterChange: deal-sheet recruiter change -> outgoing recruiter becomes previous", () => {
+  const { row, changed } = applyPreviousRecruiterOnRecruiterChange(
+    {
+      ASSIGNMENT_RECRUITER: "Sonam Chaudhary (R4A)",
+      ASSIGNMENT_RECRUITER_EMAIL: "sonam.c@cynethealth.com",
+      TENTATIVE_DATE: "2026-06-08",
+    },
+    {
+      ASSIGNMENT_RECRUITER: "Shim Kashung (R2N)",
+      ASSIGNMENT_RECRUITER_EMAIL: "shim.k@cynethealth.com",
+      RECRUITER_EMP_NO: "CY1554",
+    }
+  );
+  assert.equal(changed, true);
+  assert.equal(row.PREVIOUS_RECRUITER_NAME, "Shim Kashung (R2N)");
+  assert.equal(row.PREVIOUS_RECRUITER_EMAIL, "shim.k@cynethealth.com");
+  assert.equal(row.PREVIOUS_RECRUITER_EMP_NO, "CY1554");
+  // Current owner stays the new recruiter.
+  assert.equal(row.ASSIGNMENT_RECRUITER_EMAIL, "sonam.c@cynethealth.com");
+});
+
+test("applyPreviousRecruiterOnRecruiterChange: same recruiter -> no previous, unchanged", () => {
+  const { row, changed } = applyPreviousRecruiterOnRecruiterChange(
+    { ASSIGNMENT_RECRUITER_EMAIL: "sonam.c@cynethealth.com" },
+    { ASSIGNMENT_RECRUITER_EMAIL: "Sonam.C@cynethealth.com" } // case-insensitive match
+  );
+  assert.equal(changed, false);
+  assert.equal(row.PREVIOUS_RECRUITER_EMAIL, undefined);
+});
+
+test("applyPreviousRecruiterOnRecruiterChange: no baseline recruiter (first insert) -> no previous", () => {
+  const { row, changed } = applyPreviousRecruiterOnRecruiterChange(
+    { ASSIGNMENT_RECRUITER_EMAIL: "sonam.c@cynethealth.com" },
+    { ASSIGNMENT_RECRUITER_EMAIL: null }
+  );
+  assert.equal(changed, false);
+  assert.equal(row.PREVIOUS_RECRUITER_EMAIL, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// applyPreviousRecruiterFillForInsertRows — fills the frozen manual column from
+// a captured temp value (used by the EXTENSION legacy backfill path). Kept as-is.
+// ---------------------------------------------------------------------------
 
 test("applyPreviousRecruiterFillForInsertRows: fills PREVIOUS_RECRUITER when empty (existing deal backfill)", () => {
   const out = applyPreviousRecruiterFillForInsertRows([
