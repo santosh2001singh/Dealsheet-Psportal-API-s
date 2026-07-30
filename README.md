@@ -54,7 +54,7 @@ Runs **hourly at :00** Eastern from **9:00 AM through 7:00 PM** (`09:00`–`19:0
 - **`append_on_change_by_dealsheet` is off** — no updates on this trigger; insert-only.
 - Nexus submittals: **`PERM_STARTS,ACTIVE,BOOKED`** only; **full** job-submittals pagination each run (no Firestore page checkpoint).
 - **First row** for net-new keys: **`STARTED` or `BOOKED`** only (`first_insert_placement_status_allowlist`).
-- **Row filter:** `START_DATE >= 2026-05-01` (UTC).
+- **Row filter:** `START_DATE >= 2026-01-01` (UTC).
 
 Does **not** refresh existing deal sheets — use **`dealSheetSyncUpdateTrigger`** (runs **30 minutes later** each hour, 9:30 AM–7:30 PM Eastern).
 
@@ -65,7 +65,7 @@ Runs **hourly at :30** Eastern from **9:30 AM through 7:30 PM** (30 minutes afte
 1. Loads one target per **`DEAL_SHEET_ID`** from all three active domain tables (latest row per deal sheet). Rows with null deal sheet use **`PLACEMENT_ID`** as fallback only.
 2. For each target (batched, env `DEAL_SHEET_UPDATE_TRIGGER_MAX_PAIRS` per run, default **500**): Nexus refresh by **deal sheet id** (or placement fallback) → enrich → compare **all business columns** to the **latest BigQuery row for that deal sheet** → **append** if different (ignores `ID`, `DATE_AND_TIME`, `IS_REJECTED`). Does not create first rows.
 3. Firestore checkpoint **`active-deal-sheet-update-cursor`** stores pair index when more composites remain; cleared after a full pass.
-4. Same **`START_DATE >= 2026-05-01`** rule as insert.
+4. Same **`START_DATE >= 2026-01-01`** rule as insert.
 
 ### 3. `dealSheetSyncOfferRejected` (HTTP — manual)
 
@@ -110,6 +110,30 @@ Override parent path via `FIRESTORE_WORKSPACE_COLLECTION` / `FIRESTORE_WORKSPACE
 **BigQuery migration (run before deploying functions):** [`sql/migrate_contract_id_to_string.sql`](sql/migrate_contract_id_to_string.sql) — changes `CONTRACT_ID` from `INT64` to `STRING` on active/ended deal sheet tables and log tables.
 
 **Clear values only (after STRING migration):** [`sql/migrate_contract_id_column.sql`](sql/migrate_contract_id_column.sql).
+
+## EXTENSION_REHIRE ("Extension/Rehire")
+
+Derived column on all 6 domain deal sheet tables (active + ended). A BigQuery identifier cannot contain `/`, so the column is `EXTENSION_REHIRE`; the `/` only appears in a value.
+
+| `DEAL_TYPE` | Value | When |
+|---|---|---|
+| `DEAL` | *(blank)* | First deal, nothing after it yet |
+| `DEAL` | `EXTENSION` | This deal has since been extended (same client) |
+| `DEAL` | `REHIRED` | Candidate already existed (deal sheet **or** run-rate) at a **different parent client**, and this deal has no extension yet |
+| `EXTENSION` | `REOFFERED` | 1st extension of the deal, not started (`BOOKED`/`OFFERED`; stays `REOFFERED` if it becomes `DID NOT START` / `DID NOT ACCEPT`) |
+| `EXTENSION` | `REBOOKED` | 1st extension that started (stays `REBOOKED` once `ENDED` / `ENDED<30`) |
+| `EXTENSION` | `REBOOKED/EXTENSION` | 2nd+ extension of the same deal (extension on extension), whatever its placement status |
+
+- **Same client** = candidate (`CANDIDATE_NEXUS_ID`, else `CANDIDATE_EMAIL`) + client (`CLIENT_ID`, else `PARENT_CLIENT_NAME`) — the same identity `CONTRACT_ID` is allocated on, so it groups a DEAL with its EXTENSIONs exactly like `CONTRACT_ID` while also covering run-rate-only placements that have no parent DEAL row here.
+- **Extension on extension** is counted per **deal generation**: each DEAL opens a generation, so a chain whose deal only exists in the legacy run-rate table still treats the first extension we hold as the 1st extension (`REOFFERED`/`REBOOKED`).
+- The deal sheet is append-only, so every row of one deal/extension event (`DEAL_SHEET_ID`, else `PLACEMENT_ID`) gets the same value, and the placement status is **sticky** — `STARTED` at any point in a unit's history wins.
+- Recomputed by an idempotent post-sync pass (`backfillExtensionRehireForDealSheets`, run from both scheduled triggers): a brand-new extension must flip its **parent DEAL** row from blank to `EXTENSION`, which no insert-time rule can do. Steady state updates 0 rows.
+
+Rules + SQL: [`functions/src/extensionRehire.js`](functions/src/extensionRehire.js).
+
+**BigQuery migration (run before deploying functions):** [`sql/migrate_add_extension_rehire_column.sql`](sql/migrate_add_extension_rehire_column.sql) — the recompute pass fails while the column is missing.
+
+**Fill immediately without waiting for a sync:** [`sql/backfill_extension_rehire.sql`](sql/backfill_extension_rehire.sql) (generated from the same builder; returns rows changed per table).
 
 ## Setup
 

@@ -1006,8 +1006,13 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     const notesForPlacement = placementIdForNotes != null
       ? notesByPlacementId.get(String(placementIdForNotes)) ?? []
       : [];
-    const newHireDate = resolveNewHireDateForDealRow(dealSheetPart?.DEAL_TYPE, notesForPlacement);
-    const extensionDate = resolveExtensionDateForExtensionRow(dealSheetPart?.DEAL_TYPE, submittalRow);
+    const newHireDate = resolveNewHireDateForDealRow(
+      dealSheetPart?.DEAL_TYPE,
+      notesForPlacement,
+      submittalPart?.PLACEMENT_STATUS,
+      submittalRow
+    );
+    const extensionDate = resolveExtensionDateForExtensionRow(dealSheetPart?.DEAL_TYPE, notesForPlacement);
 
     const canadaTypePart = isCanadaRecruiter
       ? { TYPE: mapCanadaTypeFromTenNintyNine(detail) }

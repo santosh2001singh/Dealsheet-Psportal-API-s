@@ -8,15 +8,32 @@ const {
 } = require("./bigQueryClient");
 const { resolveExtensionDateForExtensionRow } = require("./columnMappings");
 
-test("resolveExtensionDateForExtensionRow uses submittal created_date for EXTENSION", () => {
-  const ts = resolveExtensionDateForExtensionRow("EXTENSION", {
-    created_date: "2026-04-27T19:48:37Z",
-  });
-  assert.equal(ts, "2026-04-27T19:48:37.000Z");
+function bookedNote(createdDate, modifiedDate = createdDate) {
+  return {
+    org_submittal_status: { code: "BOOKED" },
+    created_date: createdDate,
+    modified_date: modifiedDate,
+  };
+}
 
-  assert.equal(resolveExtensionDateForExtensionRow("DEAL", { created_date: "2026-04-27T19:48:37Z" }), null);
-  assert.equal(resolveExtensionDateForExtensionRow("EXTENSION", {}), null);
+test("resolveExtensionDateForExtensionRow uses earliest BOOKED note for EXTENSION", () => {
+  const notes = [
+    bookedNote("2026-07-29T14:15:54Z"),
+    {
+      org_submittal_status: { code: "OFFERED" },
+      created_date: "2026-07-21T19:18:04Z",
+      modified_date: "2026-07-21T19:18:04Z",
+    },
+    bookedNote("2026-07-30T10:00:00Z"),
+  ];
+  assert.equal(resolveExtensionDateForExtensionRow("EXTENSION", notes), "2026-07-29T14:15:54Z");
+
+  assert.equal(resolveExtensionDateForExtensionRow("EXTENSION", []), null);
   assert.equal(resolveExtensionDateForExtensionRow("EXTENSION", null), null);
+  assert.equal(
+    resolveExtensionDateForExtensionRow("DEAL", [bookedNote("2026-07-29T14:15:54Z")]),
+    null
+  );
 });
 
 test("applyExtensionStartDateForRow copies START_DATE for EXTENSION rows", () => {
@@ -54,9 +71,9 @@ test("applyExtensionStartDatesForInsertRows sets EXTENSION_START_DATE only", () 
     {
       DEAL_TYPE: "EXTENSION",
       START_DATE: "2026-04-01",
-      EXTENSION_DATE: "2026-04-27T19:48:37.000Z",
+      EXTENSION_DATE: "2026-07-29T14:15:54Z",
     },
   ]);
   assert.equal(out[0].EXTENSION_START_DATE, "2026-04-01");
-  assert.equal(out[0].EXTENSION_DATE, "2026-04-27T19:48:37.000Z");
+  assert.equal(out[0].EXTENSION_DATE, "2026-07-29T14:15:54Z");
 });

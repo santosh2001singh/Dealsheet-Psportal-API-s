@@ -1,8 +1,9 @@
 -- One-time backfill: EXTENSION_START_DATE on all 6 domain deal sheet tables.
 --
--- EXTENSION_DATE is NOT backfilled here — it comes from job-submittal created_date
--- during Nexus enrich/sync. Re-run sync or bulkBackfillByPlacementId for extension
--- placements after code deploy.
+-- EXTENSION_DATE is NOT backfilled here — it comes from the earliest BOOKED
+-- job-submittal-note (same source as NEW_HIRE_DATE for DEAL) during Nexus enrich/sync.
+-- Re-run sync or bulkBackfillByPlacementId for extension placements after code deploy
+-- (only empty baseline EXTENSION_DATE will fill; already-set values stay frozen).
 --
 -- EXTENSION_START_DATE = START_DATE when DEAL_TYPE = EXTENSION, else NULL
 --

@@ -20,6 +20,9 @@ test("resolveHierarchyColumnForTitle handles real '<role> - Delivery' title suff
   assert.equal(resolveHierarchyColumnForTitle("Delivery Director"), "DELIVERY_DIRECTOR");
   assert.equal(resolveHierarchyColumnForTitle("Recruitment Manager"), "RM");
   assert.equal(resolveHierarchyColumnForTitle("Associate Delivery Manager"), "ASSOCIATE_AM");
+  // Group-director titles whose suffix is NOT in the trailing-qualifier allowlist.
+  assert.equal(resolveHierarchyColumnForTitle("Director - Business Operations"), "GRP_DIR_ASSOC_GRP_DIR");
+  assert.equal(resolveHierarchyColumnForTitle("Director delivery for Public Sector"), "GRP_DIR_ASSOC_GRP_DIR");
   // Non-roles still resolve to null (suffix strip must not create false matches).
   assert.equal(resolveHierarchyColumnForTitle("Chief Growth Officer (CGO)"), null);
   assert.equal(resolveHierarchyColumnForTitle("Some Team - Delivery"), null);

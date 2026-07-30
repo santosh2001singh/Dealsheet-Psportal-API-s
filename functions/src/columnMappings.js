@@ -1188,10 +1188,15 @@ function computeBqEndDateFromSubmittal(submittalRow, jobObj) {
     }
     return null;
   };
-  // START comes job-first (planned start). For END_DATE the ACTUAL end lives on the SUBMITTAL
-  // (early-term / completion date) — the job carries only the planned/tentative end (which becomes
-  // TENTATIVE_DATE elsewhere). So the ended date is submittal-first, job as fallback.
-  const startRaw = nonBlank(jobObj?.start_date, submittalRow?.start_date);
+  // START is submittal-first, job as fallback — it MUST use the same precedence as START_DATE in
+  // mapJobSubmittalToBq. A cancelled row's END_DATE mirrors START_DATE, so job-first here made
+  // END_DATE disagree with START_DATE on any start-date pushback (job 06-01 -> submittal 06-15):
+  // DAYS_WORKED came out negative, and the change-gate saw the pre-override END_DATE differ from the
+  // stored (overridden) one on every refresh, re-appending a 0-diff row forever.
+  // For END_DATE the ACTUAL end lives on the SUBMITTAL (early-term / completion date) — the job
+  // carries only the planned/tentative end (which becomes TENTATIVE_DATE elsewhere). So the ended
+  // date is submittal-first, job as fallback.
+  const startRaw = nonBlank(submittalRow?.start_date, jobObj?.start_date);
   const endedDate = nonBlank(submittalRow?.end_date, jobObj?.end_date);
 
   // END_DATE is populated ONLY once the placement has actually ended (ENDED / ENDED<30) — then it is
@@ -1424,29 +1429,38 @@ function resolveNewHireDateFromSubmittalNotes(notes) {
 
 /**
  * NEW_HIRE_DATE from submittal notes for DEAL rows only; EXTENSION always null.
+ * For DID NOT START (cancelled) DEAL rows without a BOOKED note, falls back to the
+ * submittal top-level modified_date (fill-if-empty). This value is frozen thereafter
+ * by applyNewHireDateFreeze once it lands on the baseline row.
+ * @param {string|null|undefined} dealType
+ * @param {object[]} notes
+ * @param {string|null|undefined} placementStatus
+ * @param {object|null|undefined} submittalRow
+ * @returns {string|null}
+ */
+function resolveNewHireDateForDealRow(dealType, notes, placementStatus, submittalRow) {
+  const key = dealType == null ? "" : String(dealType).trim().toUpperCase();
+  if (key !== "DEAL") return null;
+  const fromNotes = resolveNewHireDateFromSubmittalNotes(notes);
+  if (fromNotes != null) return fromNotes;
+  if (!isDidNotStartPlacementStatus(placementStatus)) return null;
+  const raw = submittalRow?.modified_date;
+  if (raw == null || String(raw).trim() === "") return null;
+  const ms = Date.parse(String(raw).trim());
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : String(raw).trim();
+}
+
+/**
+ * EXTENSION_DATE from earliest BOOKED job-submittal-note for EXTENSION rows only
+ * (same notes source as NEW_HIRE_DATE for DEAL). DEAL rows always null.
  * @param {string|null|undefined} dealType
  * @param {object[]} notes
  * @returns {string|null}
  */
-function resolveNewHireDateForDealRow(dealType, notes) {
-  const key = dealType == null ? "" : String(dealType).trim().toUpperCase();
-  if (key !== "DEAL") return null;
-  return resolveNewHireDateFromSubmittalNotes(notes);
-}
-
-/**
- * EXTENSION_DATE from job-submittal created_date for EXTENSION rows only.
- * @param {string|null|undefined} dealType
- * @param {object|null|undefined} submittalRow
- * @returns {string|null}
- */
-function resolveExtensionDateForExtensionRow(dealType, submittalRow) {
+function resolveExtensionDateForExtensionRow(dealType, notes) {
   const key = dealType == null ? "" : String(dealType).trim().toUpperCase();
   if (key !== "EXTENSION") return null;
-  const raw = submittalRow?.created_date;
-  if (raw == null || String(raw).trim() === "") return null;
-  const ms = Date.parse(String(raw).trim());
-  return Number.isFinite(ms) ? new Date(ms).toISOString() : String(raw).trim();
+  return resolveNewHireDateFromSubmittalNotes(notes);
 }
 
 /**
@@ -1618,7 +1632,7 @@ Object.freeze(API_OWNED_COLUMNS);
  * `NEW_HIRE_DATE` is set from job-submittal-notes (earliest BOOKED modified_date) for DEAL rows when baseline is empty;
  * EXTENSION rows are not set from API on enrich; once baseline has a value it is frozen on update-append (DEAL or EXTENSION)
  * unless `NEW_HIRE_DATE_FREEZE_ENABLED=false` (one-time migration to rewrite legacy insert-time stamps).
- * `EXTENSION_DATE` is submittal created_date for EXTENSION rows (TIMESTAMP); frozen once set.
+ * `EXTENSION_DATE` is earliest BOOKED job-submittal-note date for EXTENSION rows (TIMESTAMP); frozen once set.
  * `EXTENSION_START_DATE` mirrors START_DATE for EXTENSION rows (null for DEAL); updates with START_DATE.
  */
 const SYSTEM_CONTROLLED_COLUMNS = new Set([
@@ -1687,6 +1701,10 @@ const MANUAL_COLUMNS = new Set([
   "EDITED_BY",
   "EFFECTIVE_DATE",
   "ENTITY",
+  // "Extension/Rehire" — derived, but owned by the post-sync recompute pass (extensionRehire.js), not
+  // by enrich. Listed here only so an update-append carries the last computed value forward instead of
+  // blanking the row until the next pass runs.
+  "EXTENSION_REHIRE",
   "FIFTYTWO_TENURE_CANDIDATE_STATUS",
   "FIFTYTWO_TENURE_RTO_LASTDATE",
   "GROUP_DIRECTOR",

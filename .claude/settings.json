@@ -7,7 +7,13 @@
       "Bash(awk '/API_OWNED_COLUMNS = /,/\\\\]\\\\\\)/' src/columnMappings.js)",
       "Bash(bq query --use_legacy_sql=false --format=json --project_id=cynetdatabase ' *)",
       "Bash(node -e 'const cm=require\\(\"./src/columnMappings.js\"\\); console.log\\(\"SKU_NUMBER:\", cm.API_OWNED_COLUMNS.has\\(\"SKU_NUMBER\"\\), \"| CONTRACT_ID:\", cm.API_OWNED_COLUMNS.has\\(\"CONTRACT_ID\"\\)\\);')",
-      "Bash(node -e 'const cm=require\\(\"./src/columnMappings.js\"\\); console.log\\(\"MANUAL:\", cm.MANUAL_COLUMNS.has\\(\"IS_REJECTED\"\\), \"| API_OWNED:\", cm.API_OWNED_COLUMNS.has\\(\"IS_REJECTED\"\\)\\);')"
+      "Bash(node -e 'const cm=require\\(\"./src/columnMappings.js\"\\); console.log\\(\"MANUAL:\", cm.MANUAL_COLUMNS.has\\(\"IS_REJECTED\"\\), \"| API_OWNED:\", cm.API_OWNED_COLUMNS.has\\(\"IS_REJECTED\"\\)\\);')",
+      "Bash(echo \"no new errors in bigQueryClient \\(exit $?\\)\")",
+      "Bash(git -C .. diff --stat)",
+      "Bash(node -e \"require\\('./functions/src/index.js'\\); console.log\\('index.js OK'\\)\")",
+      "Bash(perl -i -pe \"s/all_Locums_data_Runrate \\\\\\(TODO: placeholder — swap once the real table exists\\\\\\)/all_locums_runrate/; s/'all_Locums_data_Runrate'/'all_locums_runrate'/g\" sql/migrate_backfill_extension_runrate_hierarchy.sql)",
+      "Bash(node -e \"require\\('./functions/src/index.js'\\); console.log\\('OK'\\)\")",
+      "Bash(grep -n \"EXTENSION_RUNRATE_HIERARCHY_COLUMNS,$\" functions/src/bigQueryClient.js)"
     ]
   }
 }

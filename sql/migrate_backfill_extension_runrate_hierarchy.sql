@@ -11,7 +11,7 @@
 -- Domain run-rate tables (one per target table's domain):
 --   cynet_health_*         -> all_CH_data_runrate
 --   cynet_health_canada_*  -> all_Health_Canada_data_Runrate
---   cynet_locums_*         -> all_Locums_data_Runrate (TODO: placeholder — swap once the real table exists)
+--   cynet_locums_*         -> all_locums_runrate
 --
 -- Hierarchy columns intentionally EXCLUDE recruiter identity (ASSIGNMENT_RECRUITER*,
 -- SECONDARY_RECRUITER, RECRUITER_ID/EMP_NO, PREVIOUS_RECRUITER_*) — the sync-assigned current
@@ -52,8 +52,8 @@ DECLARE target_tables ARRAY<STRUCT<tbl STRING, runrate_tbl STRING>> DEFAULT [
   STRUCT('cynet_health_ended_deal_sheet', 'all_CH_data_runrate'),
   STRUCT('cynet_health_canada_deal_sheet', 'all_Health_Canada_data_Runrate'),
   STRUCT('cynet_health_canada_ended_deal_sheet', 'all_Health_Canada_data_Runrate'),
-  STRUCT('cynet_locums_deal_sheet', 'all_Locums_data_Runrate'),
-  STRUCT('cynet_locums_ended_deal_sheet', 'all_Locums_data_Runrate')
+  STRUCT('cynet_locums_deal_sheet', 'all_locums_runrate'),
+  STRUCT('cynet_locums_ended_deal_sheet', 'all_locums_runrate')
 ];
 
 FOR rec IN (SELECT tbl, runrate_tbl FROM UNNEST(target_tables))

@@ -33,14 +33,15 @@ const {
   fetchLatestAdditionalCostLogRowsByKeys,
   fetchLatestTerminationReasonLogRowsByKeys,
   fetchContractRateChangePairsFromActive,
-  fetchDealSheetRecruiterChangePairsFromActive,
-  buildInorganicHierarchyLogCandidate,
   fetchRecruiterHierarchyReconciliation,
-  buildInorganicCandidateFromReconciliation,
   buildOwnershipChangeLogRowsForHierarchyMoves,
   applyRecruiterHierarchyMovesToDealSheet,
-  mergeInorganicHierarchyLogCandidates,
+  fetchActiveExtensionRowsForInorganic,
+  resolveExtensionInorganicLogRows,
+  fetchDealSheetRecruiterChangePairsFromActive,
+  buildInorganicHierarchyLogCandidate,
   resolveInorganicHierarchyLogRows,
+  filterInorganicHierarchyAgainstFrozenOrganic,
   insertInorganicHierarchyLogBatch,
   fetchDealSheetOwnershipChangePairsFromActive,
   fetchRecruiterHandoverOwnershipLogRows,
@@ -49,10 +50,14 @@ const {
   insertOwnershipChangeLogBatch,
   overwriteOwnershipChangeLogDatesFromPlacements,
   overwriteOwnershipChangeLogCandidateInfoFromDealSheet,
-  overwriteDealSheetEffectiveDatesFromExtensions,
+  overwriteDealSheetEffectiveDatesFromTentative,
+  backfillHierarchyEmpNoNaForActive,
+  backfillDeliveryPocForActive,
+  backfillExtensionRehireForDealSheets,
+  backfillExtensionLegacyPreviousRecruiterForActive,
   finalizeDealSheetRowForResponse,
   hasBusinessColumnChanges,
-  applyOfferRejectedExtensionEndedDatesForInsertRows,
+  applyDidNotAcceptDateOverrides,
   normalizeForCompare,
   resolveFirstInsertPlacementAllowlist,
   placementStatusAllowsFirstInsert,
@@ -162,6 +167,34 @@ function hasTerminationReasonLogChange(incoming, existing) {
 }
 
 /**
+ * Drop same-batch duplicate composite keys (keep first) and rows with a missing key.
+ * Missing keys would otherwise bypass append-on-change and re-insert every run.
+ * @param {object[]} rows
+ * @param {(row: object) => string} getKey
+ * @returns {{ kept: object[], sameBatchDropped: number, skippedMissingKey: number }}
+ */
+function dedupeLogRowsByCompositeKey(rows, getKey) {
+  const kept = [];
+  const seen = new Set();
+  let sameBatchDropped = 0;
+  let skippedMissingKey = 0;
+  for (const row of rows || []) {
+    const key = typeof getKey === "function" ? getKey(row) : "";
+    if (!key) {
+      skippedMissingKey++;
+      continue;
+    }
+    if (seen.has(key)) {
+      sameBatchDropped++;
+      continue;
+    }
+    seen.add(key);
+    kept.push(row);
+  }
+  return { kept, sameBatchDropped, skippedMissingKey };
+}
+
+/**
  * Write termination-reason log rows with append-on-change dedupe (no duplicate unchanged snapshots).
  */
 async function writeTerminationReasonLogRows(terminationLogRows, insertIdBase, params = {}, options = {}) {
@@ -200,6 +233,25 @@ async function writeTerminationReasonLogRows(terminationLogRows, insertIdBase, p
     return { inserted: 0 };
   }
 
+  const {
+    kept: uniqueRows,
+    sameBatchDropped,
+    skippedMissingKey,
+  } = dedupeLogRowsByCompositeKey(rowsToWrite, (row) =>
+    buildTerminationReasonLogCompositeKey(row?.PLACEMENT_ID, row?.TERMINATION_DETAIL_ID)
+  );
+  rowsToWrite = uniqueRows;
+  if (sameBatchDropped > 0 || skippedMissingKey > 0) {
+    logLine(
+      `[termination-reason logs] same-batch dedupe: sameBatchDropped=${sameBatchDropped} skippedMissingKey=${skippedMissingKey} remaining=${rowsToWrite.length}`
+    );
+  }
+
+  if (rowsToWrite.length === 0) {
+    logLine(`[termination-reason logs] SKIP: no rows survive same-batch/missing-key filter`);
+    return { inserted: 0 };
+  }
+
   try {
     const logTarget = resolveTerminationReasonLogTarget(params);
 
@@ -222,11 +274,8 @@ async function writeTerminationReasonLogRows(terminationLogRows, insertIdBase, p
     let changedIncluded = 0;
     for (const row of rowsToWrite) {
       const key = buildTerminationReasonLogCompositeKey(row?.PLACEMENT_ID, row?.TERMINATION_DETAIL_ID);
-      if (!key) {
-        filtered.push(row);
-        newIncluded++;
-        continue;
-      }
+      // Missing keys already dropped above; keep defensive skip.
+      if (!key) continue;
       const existing = latestByKey.get(key);
       if (!existing) {
         filtered.push(row);
@@ -306,6 +355,25 @@ async function writeAdditionalCostLogRows(additionalCostLogRows, insertIdBase, p
     return { inserted: 0 };
   }
 
+  const {
+    kept: uniqueRows,
+    sameBatchDropped,
+    skippedMissingKey,
+  } = dedupeLogRowsByCompositeKey(rowsToWrite, (row) =>
+    buildAdditionalCostLogCompositeKey(row?.DEAL_SHEET_ID, row?.PLACEMENT_ID, row?.ADDITIONAL_COST_ID)
+  );
+  rowsToWrite = uniqueRows;
+  if (sameBatchDropped > 0 || skippedMissingKey > 0) {
+    logLine(
+      `[additional-cost logs] same-batch dedupe: sameBatchDropped=${sameBatchDropped} skippedMissingKey=${skippedMissingKey} remaining=${rowsToWrite.length}`
+    );
+  }
+
+  if (rowsToWrite.length === 0) {
+    logLine(`[additional-cost logs] SKIP: no rows survive same-batch/missing-key filter`);
+    return { inserted: 0 };
+  }
+
   try {
     const logTarget = resolveAdditionalCostLogTarget(params);
 
@@ -332,11 +400,7 @@ async function writeAdditionalCostLogRows(additionalCostLogRows, insertIdBase, p
         row?.PLACEMENT_ID,
         row?.ADDITIONAL_COST_ID
       );
-      if (!key) {
-        filtered.push(row);
-        newIncluded++;
-        continue;
-      }
+      if (!key) continue;
       const existing = latestByKey.get(key);
       if (!existing) {
         filtered.push(row);
@@ -859,18 +923,15 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     baseline = baselineMap.get(compositeKey) || null;
   }
 
-  // DID NOT ACCEPT / DID NOT START EXTENSION rows have START_DATE/END_DATE overwritten inside the
-  // insert pipeline from the candidate's prior ENDED assignment (active deal-sheet + run-rate).
-  // Apply that override to the compare row FIRST so the change-gate sees the FINAL dates — otherwise
-  // the pre-override (job-derived) dates always differ from the stored (overridden) baseline, which
-  // both re-appends 0-diff rows forever AND blocks a stale value from ever being corrected. Cheap
-  // no-op for every other row (the applier filters to eligible rows before any lookup). We compare
-  // and insert this same row so the gate decision and the stored row stay consistent.
-  const [overriddenRow] = await applyOfferRejectedExtensionEndedDatesForInsertRows([row], {
-    datasetId: effectiveDatasetId,
-    tableId: effectiveTableId,
-  });
-  const compareRow = overriddenRow || row;
+  // DID NOT ACCEPT rows have END_DATE/TENTATIVE_DATE overwritten inside the insert pipeline (END_DATE
+  // = START_DATE, TENTATIVE_DATE blank). Apply that to the compare row FIRST so the change-gate sees
+  // the FINAL dates — otherwise the pre-override dates always differ from the stored (overridden)
+  // baseline, which both re-appends 0-diff rows forever AND blocks a stale value from ever being
+  // corrected. We compare and insert this same row so the gate decision and the stored row stay
+  // consistent. EXTENSION rows are NOT date-overridden from a prior ended placement any more, so
+  // there is nothing further to pre-apply here.
+  const [didNotAcceptRow] = applyDidNotAcceptDateOverrides([row]);
+  const compareRow = didNotAcceptRow || row;
   const changed = hasBusinessColumnChanges(compareRow, baseline, new Set(compareIgnoreFields));
   const diffFields = computeChangedFields(compareRow, baseline, compareIgnoreFields);
   const allowFirstInsert = placementStatusAllowsFirstInsert(
@@ -897,6 +958,7 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
       generatedUuidField,
       datasetId: effectiveDatasetId,
       tableId: effectiveTableId,
+      ...(minStartDateMs != null ? { min_start_date_ms: minStartDateMs } : {}),
     });
     if (insertResult.inserted > 0) {
       action = "INSERTED";
@@ -913,6 +975,7 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
       datasetId: effectiveDatasetId,
       tableId: effectiveTableId,
       first_insert_placement_status_allowlist: params.first_insert_placement_status_allowlist,
+      ...(minStartDateMs != null ? { min_start_date_ms: minStartDateMs } : {}),
     });
     if (insertResult.inserted > 0) {
       action = "INSERTED";
@@ -1503,6 +1566,12 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
     ? (row) => resolveEndedDealSheetTableId(row?.ASSIGNMENT_RECRUITER_EMAIL)
     : undefined;
   const transformRowsFn = typeof params.transform_rows_fn === "function" ? params.transform_rows_fn : null;
+  // Same lower bound as transformRowsFn, but re-checked inside the insert pipeline against the FINAL
+  // START_DATE (the pipeline's offer-rejected/extension steps rewrite it after transformRowsFn ran).
+  const insertMinStartDateMs =
+    params.min_start_date_ms != null && Number.isFinite(Number(params.min_start_date_ms))
+      ? Number(params.min_start_date_ms)
+      : null;
   const insertBatchFn =
     typeof params.insert_batch_fn === "function"
       ? params.insert_batch_fn
@@ -1693,15 +1762,13 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
   async function flushBuffer(label) {
     if (buffer.length === 0) return;
     logLine(`[enriched sync] STEP 4/5 ENRICH: ${label} ${buffer.length} candidates`);
-    const { rows: combined, additionalCostLogRows } = await buildEnrichedRowsFromDealSheetCandidates(
-      buffer,
-      submittalByJobCandidate,
-      {
+    const { rows: combined, additionalCostLogRows, terminationLogRows } =
+      await buildEnrichedRowsFromDealSheetCandidates(buffer, submittalByJobCandidate, {
         allowedSubmittalCodes: allowedSubmittalCodes,
         persistDealSheetStatusFromCandidate: includeVerbalDealSheets,
         skip_contract_id: skipContractId,
-      }
-    );
+        fetchTerminationDetails: true,
+      });
     const rowsForInsert = transformRowsFn ? await transformRowsFn(combined) : combined;
     totalRowsAfterTransform += rowsForInsert.length;
     logLine(
@@ -1720,19 +1787,31 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
         : {}),
       ...bqWriteOptions,
       ...(skipContractId ? { skip_contract_id: true } : {}),
+      ...(insertMinStartDateMs != null ? { min_start_date_ms: insertMinStartDateMs } : {}),
       ...(insertRoutedResolveTableId ? { resolveTableId: insertRoutedResolveTableId } : {}),
     });
     totalRowsInserted += result.inserted;
     totalCandidatesProcessed += buffer.length;
     errorBatches += result.errorBatches;
+    const insertedKeysForLogs =
+      result.insertedKeys instanceof Set ? result.insertedKeys : new Set();
     if (additionalCostLogRows.length > 0) {
       const logResult = await writeAdditionalCostLogRows(
         additionalCostLogRows,
         totalRowsInserted,
         params,
-        { insertedKeys: result.insertedKeys instanceof Set ? result.insertedKeys : new Set() }
+        { insertedKeys: insertedKeysForLogs }
       );
       errorBatches += logResult.errorBatches || 0;
+    }
+    if (terminationLogRows && terminationLogRows.length > 0) {
+      const termResult = await writeTerminationReasonLogRows(
+        terminationLogRows,
+        totalRowsInserted,
+        params,
+        { insertedKeys: insertedKeysForLogs }
+      );
+      errorBatches += termResult.errorBatches || 0;
     }
     buffer = [];
   }
@@ -2191,10 +2270,11 @@ async function syncRateChangeLogsFromBigQuery(params = {}) {
 }
 
 /**
- * Scans active deal-sheet tables for placements whose ASSIGNMENT_RECRUITER_EMAIL just changed
- * (latest row vs the one before it); for each, resolves the new recruiter's identity + manager
- * hierarchy (as of the placement's hire/extension date) and logs it to inorganic_hierarchy_logs.
- * The deal sheet rows themselves are never modified by this scan.
+ * Seeds inorganic_hierarchy_logs from:
+ * 1) EXTENSION run-rate INORGANIC_* (Department_Data Active/Inactive resolution), and
+ * 2) DEAL+EXTENSION recruiter-email changes: live directory hierarchy for the new recruiter,
+ *    filtered against the latest row's frozen organic TL/RM/AM — insert only when roles diverge.
+ * The deal sheet rows themselves are never modified by this scan (moves/ownership are separate).
  */
 async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
   const logDatasetId =
@@ -2215,41 +2295,59 @@ async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
     `[inorganic hierarchy logs BQ scan] === syncInorganicHierarchyLogsFromBigQuery START === dealSheetDataset=${dealSheetDatasetId} logTable=${config.projectId}.${logDatasetId}.${logTableId}`
   );
 
-  const pairs = await fetchDealSheetRecruiterChangePairsFromActive({ datasetId: dealSheetDatasetId });
-  logLine(`[inorganic hierarchy logs BQ scan] recruiter-change pairs=${pairs.size}`);
+  // (1a) EXTENSION run-rate seed: domain run-rate INORGANIC_* validated via Department_Data.
+  const extensionRows = await fetchActiveExtensionRowsForInorganic({ datasetId: dealSheetDatasetId });
+  logLine(`[inorganic hierarchy logs BQ scan] active EXTENSION rows=${extensionRows.length}`);
+  const runrateRows = await resolveExtensionInorganicLogRows(extensionRows, {
+    datasetId: dealSheetDatasetId,
+  });
+  logLine(`[inorganic hierarchy logs BQ scan] runrateRows=${runrateRows.length}`);
 
-  const recruiterCandidates = [];
-  for (const [, { latest, previous }] of pairs) {
-    const candidate = buildInorganicHierarchyLogCandidate(latest, previous);
-    if (candidate) recruiterCandidates.push(candidate);
+  // (1b) Recruiter-change path (DEAL + EXTENSION): live directory chain vs frozen organic.
+  const recruiterChangePairs = await fetchDealSheetRecruiterChangePairsFromActive({
+    datasetId: dealSheetDatasetId,
+  });
+  const recruiterChangeCandidates = [];
+  const candidateFrozenLatest = [];
+  for (const pair of recruiterChangePairs.values()) {
+    const candidate = buildInorganicHierarchyLogCandidate(pair.latest, pair.previous);
+    if (!candidate) continue;
+    recruiterChangeCandidates.push(candidate);
+    candidateFrozenLatest.push(pair.latest);
   }
+  logLine(
+    `[inorganic hierarchy logs BQ scan] recruiterChangePairs=${recruiterChangePairs.size} recruiterChangeCandidates=${recruiterChangeCandidates.length}`
+  );
 
-  // ONSITE_AM hierarchy (LEVEL_2/3/4_CSM) is deliberately NOT logged inorganic. Its organic columns
-  // already track the current ONSITE_AM continuously on the deal sheet (applyOnsiteAmCsmHierarchyForRows,
-  // never frozen), so a change in the onsite AM or its chain shows up directly on the deal sheet — and
-  // the change is still captured in ownership_change_logs (OWNERSHIP_CHANGE_DIFF_ROLES includes
-  // ONSITE_AM + the CSM levels). Business rule: no INORGANIC_ONSITE_AM / INORGANIC_LEVEL_*_CSM.
-
-  // Single person-centric reconciliation drives THREE outputs: (1) new people -> inorganic log,
-  // (2) existing-person role changes -> moved regular fields (appended deal-sheet rows), and
-  // (3) ownership_change_logs vacate+fill rows for those moves.
-  const reconResults = await fetchRecruiterHierarchyReconciliation({ datasetId: dealSheetDatasetId });
-
-  const recruiterHierarchyCandidates = [];
-  for (const r of reconResults) {
-    const candidate = buildInorganicCandidateFromReconciliation(r);
-    if (candidate) recruiterHierarchyCandidates.push(candidate);
+  const resolvedRecruiterChange = await resolveInorganicHierarchyLogRows(recruiterChangeCandidates, {
+    datasetId: dealSheetDatasetId,
+  });
+  const recruiterChangeRows = [];
+  for (let i = 0; i < resolvedRecruiterChange.length; i++) {
+    const frozen = candidateFrozenLatest[i] || null;
+    const { row, hasDivergence } = filterInorganicHierarchyAgainstFrozenOrganic(
+      resolvedRecruiterChange[i],
+      frozen
+    );
+    if (hasDivergence) recruiterChangeRows.push(row);
   }
+  logLine(
+    `[inorganic hierarchy logs BQ scan] afterOrganicFilter=${recruiterChangeRows.length} (droppedSameHierarchy=${resolvedRecruiterChange.length - recruiterChangeRows.length})`
+  );
 
-  // Second arg (CSM divergence candidates) is intentionally empty — see note above; ONSITE_AM
-  // hierarchy is never written to the inorganic log.
-  const candidates = mergeInorganicHierarchyLogCandidates(recruiterCandidates, [], recruiterHierarchyCandidates);
-  const rows = await resolveInorganicHierarchyLogRows(candidates);
-
+  const rows = [...runrateRows, ...recruiterChangeRows];
   const result = await insertInorganicHierarchyLogBatch(rows, 0, {
     datasetId: logDatasetId,
     tableId: logTableId,
   });
+
+  // ONSITE_AM hierarchy (LEVEL_2/3/4_CSM) is deliberately NOT logged inorganic — its organic columns
+  // already track the current ONSITE_AM continuously on the deal sheet, and the change is captured in
+  // ownership_change_logs. Business rule: no INORGANIC_ONSITE_AM / INORGANIC_LEVEL_*_CSM.
+
+  // Reconciliation still drives the hierarchy MOVE (RM<->AM interchange) appends and the
+  // ownership_change_logs vacate+fill rows below; its newPersons are no longer routed to inorganic.
+  const reconResults = await fetchRecruiterHierarchyReconciliation({ datasetId: dealSheetDatasetId });
 
   // (2) Apply hierarchy MOVES back to the deal sheet (append-only) ...
   let movesResult = { appended: 0, placements: 0 };
@@ -2280,17 +2378,21 @@ async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
 
   const elapsedStr = formatDuration(Date.now() - startMs);
   logLine(
-    `[inorganic hierarchy logs BQ scan] DONE inserted=${result.inserted} recruiterChangePairs=${pairs.size} csmDivergences=0(disabled) reconPlacements=${reconResults.length} newPersonCandidates=${recruiterHierarchyCandidates.length} moveAppends=${movesResult.appended} moveOwnershipRows=${ownershipMovesInserted} candidates=${candidates.length} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
+    `[inorganic hierarchy logs BQ scan] DONE inserted=${result.inserted} runrateRows=${runrateRows.length} recruiterChangePairs=${recruiterChangePairs.size} afterOrganicFilter=${recruiterChangeRows.length} inorganicLogRows=${rows.length} csmDivergences=0(disabled) reconPlacements=${reconResults.length} moveAppends=${movesResult.appended} moveOwnershipRows=${ownershipMovesInserted} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
   );
 
   return {
     inserted: result.inserted,
-    total: pairs.size,
+    total: rows.length,
     csmDivergences: 0, // ONSITE_AM hierarchy never logged inorganic (shown organically instead)
-    recruiterHierarchyDivergences: recruiterHierarchyCandidates.length,
+    recruiterHierarchyDivergences: recruiterChangeRows.length,
+    runrateRows: runrateRows.length,
+    recruiterChangePairs: recruiterChangePairs.size,
+    recruiterChangeCandidates: recruiterChangeCandidates.length,
+    afterOrganicFilter: recruiterChangeRows.length,
     hierarchyMoveAppends: movesResult.appended,
     hierarchyMoveOwnershipRows: ownershipMovesInserted,
-    candidates: candidates.length,
+    candidates: rows.length,
     errorBatches: result.errorBatches,
     elapsed: elapsedStr,
   };
@@ -2369,8 +2471,8 @@ async function syncOwnershipChangeLogsFromBigQuery(params = {}) {
 }
 
 /**
- * Overwrites EFFECTIVE_DATE on ownership_change_logs from the matching CONTRACT_ID's extension
- * start date. Runs in the insert trigger (where extensions are created).
+ * Keeps ownership_change_logs + deal-sheet EFFECTIVE_DATE in sync with each placement's current
+ * TENTATIVE_DATE (+1). Runs from the insert trigger after extensions/updates land.
  */
 async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
   const dealSheetDatasetId =
@@ -2388,24 +2490,120 @@ async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
     datasetId: params.bq_dataset,
     tableId: params.bq_table,
   });
-  // Deal-sheet EFFECTIVE_DATE overwrite (recruiter-change rows: tentative+1 -> ext start) is a
-  // SEPARATE table and left as-is.
+  // Deal-sheet recruiter-change rows: same rule as ownership — EFFECTIVE_DATE = TENTATIVE_DATE + 1
+  // (repairs rows previously overwritten to a wrong CONTRACT_ID MIN(extension START_DATE)).
   let dealSheetResult = { updated: null };
   try {
-    dealSheetResult = await overwriteDealSheetEffectiveDatesFromExtensions({ datasetId: dealSheetDatasetId });
+    dealSheetResult = await overwriteDealSheetEffectiveDatesFromTentative({ datasetId: dealSheetDatasetId });
   } catch (dsErr) {
     logLine(`[deal sheet] effective-date overwrite failed (non-fatal): ${String(dsErr?.message || dsErr).slice(0, 200)}`);
   }
+
+  // Idempotent maintenance backfills (steady state -> 0 rows):
+  //  1) hierarchy NAME "NA"/blank -> its EMP_NO also "NA" (name is master).
+  //  2) DELIVERY_POC recompute with the corrected priority (now includes AVP + DELIVERY_DIRECTOR).
+  //  3) EXTENSION PREVIOUS_RECRUITER from Cluster_Data.ownership_data when still empty.
+  //  4) EXTENSION_REHIRE ("Extension/Rehire") recompute across active + ended tables — a new
+  //     extension has to flip its PARENT DEAL row to 'EXTENSION', which insert-time rules cannot do.
+  let empNoNaResult = { updated: null };
+  try {
+    empNoNaResult = await backfillHierarchyEmpNoNaForActive({ datasetId: dealSheetDatasetId });
+  } catch (bfErr) {
+    logLine(`[deal sheet] emp-no NA backfill failed (non-fatal): ${String(bfErr?.message || bfErr).slice(0, 200)}`);
+  }
+  let pocResult = { updated: null };
+  try {
+    pocResult = await backfillDeliveryPocForActive({ datasetId: dealSheetDatasetId });
+  } catch (pocErr) {
+    logLine(`[deal sheet] DELIVERY_POC backfill failed (non-fatal): ${String(pocErr?.message || pocErr).slice(0, 200)}`);
+  }
+  let prevRecruiterResult = { updated: null };
+  try {
+    prevRecruiterResult = await backfillExtensionLegacyPreviousRecruiterForActive({
+      datasetId: dealSheetDatasetId,
+    });
+  } catch (prevErr) {
+    logLine(
+      `[deal sheet] extension previous-recruiter backfill failed (non-fatal): ${String(prevErr?.message || prevErr).slice(0, 200)}`
+    );
+  }
+
+  let extensionRehireResult = { updated: null };
+  try {
+    extensionRehireResult = await backfillExtensionRehireForDealSheets({
+      datasetId: dealSheetDatasetId,
+    });
+  } catch (erErr) {
+    logLine(
+      `[deal sheet] EXTENSION_REHIRE recompute failed (non-fatal): ${String(erErr?.message || erErr).slice(0, 200)}`
+    );
+  }
+
   const elapsedStr = formatDuration(Date.now() - startMs);
-  logLine(`[ownership change logs] effective-date overwrite DONE ownershipUpdated=${result.updated == null ? "n/a" : result.updated} dealSheetUpdated=${dealSheetResult.updated == null ? "n/a" : dealSheetResult.updated} elapsed=${elapsedStr}`);
-  return { updated: result.updated, dealSheetUpdated: dealSheetResult.updated, elapsed: elapsedStr };
+  logLine(`[ownership change logs] effective-date overwrite DONE ownershipUpdated=${result.updated == null ? "n/a" : result.updated} dealSheetUpdated=${dealSheetResult.updated == null ? "n/a" : dealSheetResult.updated} empNoNaFixed=${empNoNaResult.updated == null ? "n/a" : empNoNaResult.updated} deliveryPocFixed=${pocResult.updated == null ? "n/a" : pocResult.updated} prevRecruiterFixed=${prevRecruiterResult.updated == null ? "n/a" : prevRecruiterResult.updated} extensionRehireFixed=${extensionRehireResult.updated == null ? "n/a" : extensionRehireResult.updated} elapsed=${elapsedStr}`);
+  return {
+    updated: result.updated,
+    dealSheetUpdated: dealSheetResult.updated,
+    empNoNaFixed: empNoNaResult.updated,
+    deliveryPocFixed: pocResult.updated,
+    prevRecruiterFixed: prevRecruiterResult.updated,
+    extensionRehireFixed: extensionRehireResult.updated,
+    elapsed: elapsedStr,
+  };
 }
 
 const UPDATE_SYNC_PRIORITY_PLACEMENT_STATUSES = new Set(["STARTED", "BOOKED", "ACTIVE"]);
 
+// Terminal (stable) statuses eligible for the staleness cutoff in the scheduled update trigger.
+const UPDATE_SYNC_TERMINAL_STALE_STATUSES = new Set([
+  "ENDED",
+  "ENDED<30",
+  "DID NOT START",
+  "DID NOT ACCEPT",
+]);
+
+const DEFAULT_TERMINAL_STALE_CUTOFF_DAYS = Number.isFinite(
+  Number(process.env.UPDATE_SYNC_TERMINAL_CUTOFF_DAYS)
+)
+  ? Number(process.env.UPDATE_SYNC_TERMINAL_CUTOFF_DAYS)
+  : 20;
+
 function normalizeUpdateSyncPlacementStatusKey(status) {
   if (status == null) return "";
   return String(status).trim().toUpperCase();
+}
+
+/**
+ * Drop terminal-status batch targets whose latest DATE_AND_TIME is older than cutoffDays.
+ * Only the four named terminal statuses are subject to the cutoff; every other target is kept.
+ * cutoffDays <= 0 disables filtering. Missing/unparseable dates are kept (safe side).
+ * @param {Array<{placement_status?: string|null, latest_date_ms?: number|null}>} batchTargets
+ * @param {{cutoffDays?: number, nowMs?: number}} [options]
+ * @returns {{kept: Array, staleSkipped: number}}
+ */
+function filterStaleTerminalBatchTargets(batchTargets, options = {}) {
+  const cutoffDays = Number.isFinite(Number(options.cutoffDays))
+    ? Number(options.cutoffDays)
+    : DEFAULT_TERMINAL_STALE_CUTOFF_DAYS;
+  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  if (!(cutoffDays > 0)) return { kept: batchTargets || [], staleSkipped: 0 };
+  const cutoffMs = nowMs - cutoffDays * 24 * 60 * 60 * 1000;
+  const kept = [];
+  let staleSkipped = 0;
+  for (const t of batchTargets || []) {
+    const key = normalizeUpdateSyncPlacementStatusKey(t?.placement_status);
+    if (!UPDATE_SYNC_TERMINAL_STALE_STATUSES.has(key)) {
+      kept.push(t);
+      continue;
+    }
+    const ms = t?.latest_date_ms;
+    if (ms == null || !Number.isFinite(ms) || ms >= cutoffMs) {
+      kept.push(t);
+      continue;
+    }
+    staleSkipped++;
+  }
+  return { kept, staleSkipped };
 }
 
 /**
@@ -2476,10 +2674,18 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
       : "ID";
 
   const allTargets = await fetchActiveDealSheetUpdateTargets({ datasetId: effectiveDatasetId });
-  const { priorityTargets, batchTargets } = splitActiveDealSheetUpdateTargetsByPlacementStatus(allTargets);
+  const { priorityTargets, batchTargets: allBatchTargets } =
+    splitActiveDealSheetUpdateTargetsByPlacementStatus(allTargets);
+  const staleCutoffDays = isPositiveInt(params.terminal_stale_cutoff_days)
+    ? Math.floor(Number(params.terminal_stale_cutoff_days))
+    : DEFAULT_TERMINAL_STALE_CUTOFF_DAYS;
+  const { kept: batchTargets, staleSkipped: batchStaleSkipped } = filterStaleTerminalBatchTargets(
+    allBatchTargets,
+    { cutoffDays: staleCutoffDays }
+  );
   const priorityTotal = priorityTargets.length;
   const batchTotal = batchTargets.length;
-  const targetTotal = allTargets.length;
+  const targetTotal = priorityTotal + batchTotal;
 
   let batchOffset = 0;
   const checkpointRef = resumeFromCheckpoint ? getCheckpointRef(checkpointKey) : null;
@@ -2516,7 +2722,7 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
   const batchCheckedPlanned = batchSlice.length;
 
   logLine(
-    `[update sync] === syncExistingActiveDealSheetUpdatesFromBigQuery START === dataset=${effectiveDatasetId} maxPairsPerRun=${maxPairsPerRun} checkpointKey=${checkpointKey} resume=${resumeFromCheckpoint ? "yes" : "no"} priority=${priorityTotal} batch=${batchTotal} batchOffset=${batchOffset} slice=${slice.length} (priorityAll=${priorityCheckedPlanned} batchThisRun=${batchCheckedPlanned})`
+    `[update sync] === syncExistingActiveDealSheetUpdatesFromBigQuery START === dataset=${effectiveDatasetId} maxPairsPerRun=${maxPairsPerRun} checkpointKey=${checkpointKey} resume=${resumeFromCheckpoint ? "yes" : "no"} priority=${priorityTotal} batch=${batchTotal} staleCutoffDays=${staleCutoffDays} batchStaleSkipped=${batchStaleSkipped} batchOffset=${batchOffset} slice=${slice.length} (priorityAll=${priorityCheckedPlanned} batchThisRun=${batchCheckedPlanned})`
   );
 
   const concurrency = Math.max(1, Math.min(Number(config.fetchAllMax) || 20, 20));
@@ -2626,7 +2832,7 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
 
   const elapsed = formatDuration(Date.now() - startMs);
   logLine(
-    `[update sync] === DONE === checked=${checked} appended=${appended} no_change=${no_change} not_found=${not_found} no_baseline=${no_baseline} skipped_date=${skipped_date} errors=${errors} priorityTotal=${priorityTotal} priorityChecked=${priorityChecked} batchTotal=${batchTotal} batchCheckedThisRun=${batchCheckedThisRun} batchOffset=${batchOffset} batchOffsetEnd=${batchOffsetEnd} targetTotal=${targetTotal} hasMore=${hasMore ? "yes" : "no"} elapsed=${elapsed}`
+    `[update sync] === DONE === checked=${checked} appended=${appended} no_change=${no_change} not_found=${not_found} no_baseline=${no_baseline} skipped_date=${skipped_date} errors=${errors} priorityTotal=${priorityTotal} priorityChecked=${priorityChecked} batchTotal=${batchTotal} batchStaleSkipped=${batchStaleSkipped} batchCheckedThisRun=${batchCheckedThisRun} batchOffset=${batchOffset} batchOffsetEnd=${batchOffsetEnd} targetTotal=${targetTotal} hasMore=${hasMore ? "yes" : "no"} elapsed=${elapsed}`
   );
 
   return {
@@ -2640,6 +2846,7 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
     priorityTotal,
     priorityChecked,
     batchTotal,
+    batchStaleSkipped,
     batchCheckedThisRun,
     batchOffset,
     batchOffsetEnd,
@@ -2672,6 +2879,7 @@ module.exports = {
   buildRefreshAdditionalCostLogsSummary,
   buildActiveUpdateRefreshParams,
   splitActiveDealSheetUpdateTargetsByPlacementStatus,
+  filterStaleTerminalBatchTargets,
   buildRateChangeLogRow,
   parseBooleanLike,
   computeChangedFields,
@@ -2684,4 +2892,5 @@ module.exports = {
   additionalCostLogValueEquals,
   additionalCostLogStringEquals,
   ADDITIONAL_COST_LOG_VALUE_TOLERANCE,
+  dedupeLogRowsByCompositeKey,
 };

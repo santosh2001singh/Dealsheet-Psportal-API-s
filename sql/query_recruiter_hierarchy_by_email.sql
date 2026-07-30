@@ -60,7 +60,7 @@ mapped AS (             -- manager_title -> role (strip trailing dept qualifier,
       WHEN 'associate delivery manager' THEN 'ASSOCIATE_AM'
       WHEN 'delivery manager' THEN 'ACCOUNT_MANAGER' WHEN 'sr. delivery manager' THEN 'ACCOUNT_MANAGER' WHEN 'sr delivery manager' THEN 'ACCOUNT_MANAGER' WHEN 'senior delivery manager' THEN 'ACCOUNT_MANAGER'
       WHEN 'delivery director' THEN 'DELIVERY_DIRECTOR'
-      WHEN 'director' THEN 'GRP_DIR_ASSOC_GRP_DIR' WHEN 'associate director' THEN 'GRP_DIR_ASSOC_GRP_DIR' WHEN 'assoc director' THEN 'GRP_DIR_ASSOC_GRP_DIR' WHEN 'associate group director' THEN 'GRP_DIR_ASSOC_GRP_DIR' WHEN 'associate group directeor' THEN 'GRP_DIR_ASSOC_GRP_DIR'
+      WHEN 'director' THEN 'GRP_DIR_ASSOC_GRP_DIR' WHEN 'associate director' THEN 'GRP_DIR_ASSOC_GRP_DIR' WHEN 'assoc director' THEN 'GRP_DIR_ASSOC_GRP_DIR' WHEN 'associate group director' THEN 'GRP_DIR_ASSOC_GRP_DIR' WHEN 'associate group directeor' THEN 'GRP_DIR_ASSOC_GRP_DIR' WHEN 'director - business operations' THEN 'GRP_DIR_ASSOC_GRP_DIR' WHEN 'director delivery for public sector' THEN 'GRP_DIR_ASSOC_GRP_DIR'
       WHEN 'avp' THEN 'AVP' WHEN 'associate vice president' THEN 'AVP' WHEN 'associate vice president delivery' THEN 'AVP'
       WHEN 'vice president' THEN 'VP_SRVP' WHEN 'vp' THEN 'VP_SRVP' WHEN 'sr vp' THEN 'VP_SRVP' WHEN 'sr. vp' THEN 'VP_SRVP' WHEN 'svp' THEN 'VP_SRVP' WHEN 'srvp' THEN 'VP_SRVP' WHEN 'vp srvp' THEN 'VP_SRVP' WHEN 'vp/srvp' THEN 'VP_SRVP'
       ELSE NULL

@@ -42,20 +42,30 @@ const HIERARCHY_DESIGNATION_SYNONYMS = {
     "associate recruiterment manager",
   ],
   SECONDARY_AM: ["secondary am", "secondary account manager", "secondary delivery manager"],
-  ASSOCIATE_AM: ["associate delivery manager"],
+  ASSOCIATE_AM: ["associate delivery manager", "associate account manager"],
   ACCOUNT_MANAGER: [
     "delivery manager",
     "sr. delivery manager",
     "sr delivery manager",
     "senior delivery manager",
+    "account manager",
+    "sr. account manager",
+    "sr account manager",
+    "senior account manager",
   ],
-  DELIVERY_DIRECTOR: ["delivery director"],
+  DELIVERY_DIRECTOR: ["delivery director", "director - delivery", "director delivery"],
   GRP_DIR_ASSOC_GRP_DIR: [
     "director",
     "associate director",
     "assoc director",
     "associate group director",
     "associate group directeor",
+    "associate director - delivery",
+    "associate director delivery",
+    // Real Workspace titles that are not stripped by DESIGNATION_TITLE_TRAILING_QUALIFIER
+    // (qualifier allowlist is only delivery/rec/recruitment/staffing), e.g. Anup Bhel.
+    "director - business operations",
+    "director delivery for public sector",
   ],
   VP_SRVP: [
     "vice president",

@@ -14,8 +14,7 @@ const config = {
    */
   runrateTableId: process.env.RUNRATE_TABLE_ID || "all_CH_data_runrate",
   runrateCanadaTableId: process.env.RUNRATE_CANADA_TABLE_ID || "all_Health_Canada_data_Runrate",
-  /** TODO: placeholder — swap once the real Locums run-rate table exists */
-  runrateLocumsTableId: process.env.RUNRATE_LOCUMS_TABLE_ID || "all_Locums_data_Runrate",
+  runrateLocumsTableId: process.env.RUNRATE_LOCUMS_TABLE_ID || "all_locums_runrate",
   rateChangeLogDatasetId: process.env.BQ_RATE_CHANGE_LOG_DATASET || "rr_project_data",
   rateChangeLogTableId: process.env.BQ_RATE_CHANGE_LOG_TABLE || "ch_rate_change_logs",
   additionalCostLogDatasetId: process.env.BQ_ADDITIONAL_COST_LOG_DATASET || "rr_project_data",
@@ -118,6 +117,14 @@ const config = {
   directoryEmployeeHierarchy: {
     datasetId: process.env.DIRECTORY_EMPLOYEE_HIERARCHY_DATASET || "MISC",
     tableId: process.env.DIRECTORY_EMPLOYEE_HIERARCHY_TABLE || "directory_employee_hierarchy",
+  },
+
+  /** Employee master used to check STATUS (Active/Inactive) + IMMEDIATE_MANAGER + DESIGNATION by
+   * name for EXTENSION inorganic hierarchy resolution. Table name contains a space ("Ph and India")
+   * so it must be backtick-quoted in SQL. */
+  departmentData: {
+    datasetId: process.env.DEPARTMENT_DATA_DATASET || "Department_Data",
+    tableId: process.env.DEPARTMENT_DATA_TABLE || "Ph and India",
   },
 
   peoplestrong: {

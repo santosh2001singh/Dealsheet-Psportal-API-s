@@ -4,6 +4,8 @@ const assert = require("node:assert/strict");
 const {
   applyExtensionLegacyPreviousRecruiterForInsertRows,
   rowNeedsExtensionLegacyPreviousRecruiter,
+  chooseLegacyPreviousRecruiter,
+  bqCellString,
 } = require("./bigQueryClient");
 
 // Legacy tracker rows for SKU H14218 (Recruiter handover Rashmi -> Neelesh).
@@ -74,4 +76,117 @@ test("falls back to latest EFFECTIVE_DATE when no NEW_EMP matches current recrui
   const [out] = await applyExtensionLegacyPreviousRecruiterForInsertRows(rows, { queryObjectsFn: multi, emailFetchFn: fakeEmails });
   assert.equal(out.PREVIOUS_RECRUITER_NAME, "Rashmi Lakhmani"); // latest eff wins
   assert.equal(out.PREVIOUS_RECRUITER_EMP_NO, "CY3933");
+});
+
+// --- H13614: Neelesh current, future Aug-30 ownership still counts -> previous = Shim ---
+
+const H13614_OWNERSHIP = [
+  {
+    sku: "H13614",
+    new_emp: "CY1554",
+    old_name: "Philaso Angkang",
+    old_emp: "CY4380",
+    eff: "2026-07-19",
+  },
+  {
+    sku: "H13614",
+    new_emp: "CY1615",
+    old_name: "Shim Kashung",
+    old_emp: "CY1554",
+    eff: "2026-08-30", // future / Upcoming Extension — still counts
+  },
+];
+
+test("chooseLegacyPreviousRecruiter H13614: NEW=Neelesh -> previous Shim (future eff counts)", () => {
+  const chosen = chooseLegacyPreviousRecruiter(H13614_OWNERSHIP, "CY1615");
+  assert.deepEqual(chosen, { name: "Shim Kashung", emp: "CY1554" });
+});
+
+test("H13614 apply: PREVIOUS_RECRUITER = Shim Kashung / CY1554", async () => {
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      SKU_NUMBER: "H13614",
+      RECRUITER_EMP_NO: "CY1615",
+      PREVIOUS_RECRUITER_NAME: null,
+      PREVIOUS_RECRUITER_EMAIL: null,
+      PREVIOUS_RECRUITER_EMP_NO: null,
+    },
+  ];
+  const deps = {
+    queryObjectsFn: async () => H13614_OWNERSHIP,
+    emailFetchFn: async (emps) => ({
+      byEmp: new Map(emps.includes("CY1554") ? [["CY1554", "shim.k@cynethealth.com"]] : []),
+      byName: new Map(),
+    }),
+  };
+  const [out] = await applyExtensionLegacyPreviousRecruiterForInsertRows(rows, deps);
+  assert.equal(out.PREVIOUS_RECRUITER_NAME, "Shim Kashung");
+  assert.equal(out.PREVIOUS_RECRUITER_EMP_NO, "CY1554");
+  assert.equal(out.PREVIOUS_RECRUITER_EMAIL, "shim.k@cynethealth.com");
+});
+
+test("case-insensitive emp match still picks Shim", () => {
+  const chosen = chooseLegacyPreviousRecruiter(H13614_OWNERSHIP, "cy1615");
+  assert.equal(chosen.emp, "CY1554");
+  assert.equal(chosen.name, "Shim Kashung");
+});
+
+test("bqCellString handles {value} wrappers and alternate casing", () => {
+  assert.equal(bqCellString({ sku: { value: "H13614" } }, "sku"), "H13614");
+  assert.equal(bqCellString({ SKU: "H13614" }, "sku"), "H13614");
+  assert.equal(bqCellString({ eff: { value: "2026-08-30" } }, "eff"), "2026-08-30");
+});
+
+test("H13614 apply still fills when BQ returns value wrappers + uppercase keys", async () => {
+  const wrapped = [
+    {
+      SKU: { value: "H13614" },
+      NEW_EMP: { value: "CY1554" },
+      OLD_ONE: "Philaso Angkang",
+      OLD_EMP: { value: "CY4380" },
+      EFFECTIVE_DATE: { value: "2026-07-19" },
+    },
+    {
+      SKU: { value: "H13614" },
+      NEW_EMP: { value: "CY1615" },
+      OLD_ONE: "Shim Kashung",
+      OLD_EMP: { value: "CY1554" },
+      EFFECTIVE_DATE: { value: "2026-08-30" },
+    },
+  ];
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      SKU_NUMBER: "H13614",
+      RECRUITER_EMP_NO: "CY1615",
+      PREVIOUS_RECRUITER_NAME: null,
+      PREVIOUS_RECRUITER_EMAIL: null,
+    },
+  ];
+  const [out] = await applyExtensionLegacyPreviousRecruiterForInsertRows(rows, {
+    queryObjectsFn: async () => wrapped,
+    emailFetchFn: async () => ({ byEmp: new Map(), byName: new Map() }),
+  });
+  assert.equal(out.PREVIOUS_RECRUITER_NAME, "Shim Kashung");
+  assert.equal(out.PREVIOUS_RECRUITER_EMP_NO, "CY1554");
+});
+
+test("ownership query failure is non-fatal (rows unchanged)", async () => {
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      SKU_NUMBER: "H13614",
+      RECRUITER_EMP_NO: "CY1615",
+      PREVIOUS_RECRUITER_NAME: null,
+      PREVIOUS_RECRUITER_EMAIL: null,
+    },
+  ];
+  const [out] = await applyExtensionLegacyPreviousRecruiterForInsertRows(rows, {
+    queryObjectsFn: async () => {
+      throw new Error("permission denied");
+    },
+    emailFetchFn: fakeEmails,
+  });
+  assert.equal(out.PREVIOUS_RECRUITER_NAME ?? null, null);
 });

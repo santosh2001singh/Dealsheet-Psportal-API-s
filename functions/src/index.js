@@ -11,6 +11,7 @@
  * 6. rateChangeLogSyncTrigger — scheduled rate-change logs (BigQuery CONTRACT_ID scan)
  * 7. bulkBackfillByPlacementId — HTTP bulk Nexus backfill (no BQ baseline checks)
  * 8. inorganicHierarchyLogSync — HTTP manual/debug trigger for the audit log scan (see 4.)
+ * 9. backfillExtensionDateFromNotes — HTTP one-time EXTENSION_DATE rewrite from earliest BOOKED note
  */
 
 const { onRequest } = require("firebase-functions/v2/https");
@@ -28,6 +29,7 @@ const {
   resolveBulkBackfillMaxPlacementIds,
 } = require("./syncService");
 const { syncPeopleStrongEmployeeDetailsToBigQuery } = require("./peoplestrongEmployeeDetailsService");
+const { backfillExtensionDateFromBookedNotes } = require("./extensionDateBackfill");
 const { logLine, logError, withTimingAsync } = require("./logger");
 const { startDateOnOrAfterUtcMin, effectiveMinFilterDate } = require("./columnMappings");
 const { transformOfferRejectedEndedRowsForBigQuery } = require("./offerRejectedRowTransform");
@@ -52,7 +54,7 @@ const ACTIVE_BOOTSTRAP_FIRST_INSERT_PLACEMENT_STATUSES = "STARTED,BOOKED,ENDED,E
 const ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES =
   "STARTED,BOOKED,ENDED,ENDED<30,DID NOT START,DID NOT ACCEPT";
 /** Active HTTP/trigger + scheduled update: only insert rows with START_DATE on or after this day (UTC). */
-const DEAL_SHEET_MIN_START_DATE_MS = Date.UTC(2026, 4, 1);
+const DEAL_SHEET_MIN_START_DATE_MS = Date.UTC(2026, 0, 1);
 /** Same lower bound as YYYY-MM-DD, pushed to the Nexus job-submittals list as start_date_from so the
  *  scan fetches only relevant submittals. Derived from the ms constant so the two never drift. */
 const DEAL_SHEET_MIN_START_DATE_ISO = new Date(DEAL_SHEET_MIN_START_DATE_MS).toISOString().slice(0, 10);
@@ -110,7 +112,7 @@ const SCHEDULE_MEMORY = "1GiB";
  *        checkpoint_use_submittal_page=true (Firestore saves next submittal list page),
  *        use_ended_domain_routing=true (three ended tables by recruiter email; requires no bq_table)
  *
- * Inserts are limited to rows with START_DATE >= 2026-05-01 (see DEAL_SHEET_MIN_START_DATE_MS).
+ * Inserts are limited to rows with START_DATE >= 2026-01-01 (see DEAL_SHEET_MIN_START_DATE_MS).
  */
 exports.dealSheetSync = onRequest(
   {
@@ -134,7 +136,7 @@ exports.dealSheetSync = onRequest(
         const onlyNew = q.only_new !== "false";
         const dedupeByPlacementId = q.dedupe_by_placement_id !== "false";
         logLine(
-          `[dealSheetSync] HTTP Gen2 region=${REGION} timeoutSeconds=${HTTP_TIMEOUT_SEC} method=${req.method} only_new=${onlyNew ? "true" : "false"} dedupe_by_placement_id=${dedupeByPlacementId ? "true" : "false"} max_candidates=${q.max_candidates || "none"} test_limit=${q.test_limit || "none"} max_pages=${q.max_pages || "none"} resume=${q.resume || "false"} reset_checkpoint=${q.reset_checkpoint || "false"} checkpoint_key=${q.checkpoint_key || "default"} submittal_codes=${submittalCodesRaw || "default"} bq_table=${bqTableRaw || "default"} bq_dataset=${bqDatasetRaw || "default"} START_DATE>=2026-05-01 only`
+          `[dealSheetSync] HTTP Gen2 region=${REGION} timeoutSeconds=${HTTP_TIMEOUT_SEC} method=${req.method} only_new=${onlyNew ? "true" : "false"} dedupe_by_placement_id=${dedupeByPlacementId ? "true" : "false"} max_candidates=${q.max_candidates || "none"} test_limit=${q.test_limit || "none"} max_pages=${q.max_pages || "none"} resume=${q.resume || "false"} reset_checkpoint=${q.reset_checkpoint || "false"} checkpoint_key=${q.checkpoint_key || "default"} submittal_codes=${submittalCodesRaw || "default"} bq_table=${bqTableRaw || "default"} bq_dataset=${bqDatasetRaw || "default"} START_DATE>=${DEAL_SHEET_MIN_START_DATE_ISO} only`
         );
 
         const maxCandidates = parseInt(q.max_candidates || "0", 10);
@@ -164,6 +166,9 @@ exports.dealSheetSync = onRequest(
         if (q.use_ended_domain_routing === "true") params.use_ended_domain_routing = true;
 
         params.transform_rows_fn = filterEnrichedRowsByDealSheetMinStartDate;
+        // Re-checked inside the insert pipeline against the FINAL START_DATE (pipeline steps rewrite
+        // it after transform_rows_fn), so no pre-cutoff row can slip through.
+        params.min_start_date_ms = DEAL_SHEET_MIN_START_DATE_MS;
 
         logLine(`[dealSheetSync] Params object: ${JSON.stringify(params)}`);
         logLine(
@@ -579,7 +584,7 @@ exports.dealSheetSyncTrigger = onSchedule(
       const insertMaxPages = resolveDealSheetInsertTriggerMaxPages();
 
       logLine(
-        `[dealSheetSyncTrigger] Scheduled insert-only: ${organizationSubmittalCodes} -> cynetdatabase.${bqDataset}; skip if DEAL_SHEET_ID or PLACEMENT_ID exists in BQ; START_DATE>=2026-05-01; first_insert_allowlist=${firstInsertPlacementStatuses}; no append-on-change; checkpoint_key=${ACTIVE_INSERT_SYNC_CHECKPOINT_KEY} (resume-on-error/timeout by submittal page, clear-on-complete); max_pages_per_run=${insertMaxPages || "none"}`
+        `[dealSheetSyncTrigger] Scheduled insert-only: ${organizationSubmittalCodes} -> cynetdatabase.${bqDataset}; skip if DEAL_SHEET_ID or PLACEMENT_ID exists in BQ; START_DATE>=${DEAL_SHEET_MIN_START_DATE_ISO}; first_insert_allowlist=${firstInsertPlacementStatuses}; no append-on-change; checkpoint_key=${ACTIVE_INSERT_SYNC_CHECKPOINT_KEY} (resume-on-error/timeout by submittal page, clear-on-complete); max_pages_per_run=${insertMaxPages || "none"}`
       );
       logLine("[dealSheetSyncTrigger] Invoking syncEnrichedDealSheetCandidatesToBigQuery");
 
@@ -596,12 +601,15 @@ exports.dealSheetSyncTrigger = onSchedule(
         first_insert_placement_status_allowlist: firstInsertPlacementStatuses,
         // Bring in BOTH FINAL and VERBAL deal sheets (no longer FINAL-only).
         deal_sheet_status_codes: "FINAL,VERBAL",
-        // Push the START_DATE >= 2026-05-01 lower bound to the Nexus list (server-side) so we fetch
+        // Push the START_DATE >= 2026-01-01 lower bound to the Nexus list (server-side) so we fetch
         // ~1k relevant submittals instead of scanning every page (~3k+) and discarding old ones —
         // this is the real cut to the socket-hangup / timeout load. No upper bound (future starts).
         // filterEnrichedRowsByDealSheetMinStartDate stays below as the in-code safety net.
         submittal_start_date_from: DEAL_SHEET_MIN_START_DATE_ISO,
         transform_rows_fn: filterEnrichedRowsByDealSheetMinStartDate,
+        // Final gate inside the insert pipeline, against the FINAL START_DATE (the offer-rejected /
+        // extension steps rewrite it from a prior ended assignment after transform_rows_fn ran).
+        min_start_date_ms: DEAL_SHEET_MIN_START_DATE_MS,
         // Page-level Firestore checkpoint: on a thrown socket-hangup (ECONNRESET after retries) the
         // failed submittal page is saved and the next run resumes from it; on a fully-successful pass
         // the doc is deleted so the next run rescans from page 1 to pick up newly-added deal sheets.
@@ -703,7 +711,7 @@ exports.dealSheetSyncUpdateTrigger = onSchedule(
       const maxPairsPerRun = resolveDealSheetUpdateTriggerMaxPairs();
 
       logLine(
-        `[dealSheetSyncUpdateTrigger] Scheduled update: cynetdatabase.${bqDataset}; BQ deal_sheet targets -> Nexus refresh; baseline=deal_sheet_id; priority=STARTED,BOOKED,ACTIVE (all each run); batch=ENDED,ENDED<30,DID NOT START,DID NOT ACCEPT+unknown; max_pairs_per_run=${maxPairsPerRun} (batch only); checkpoint_key=${ACTIVE_UPDATE_SYNC_CHECKPOINT_KEY}; START_DATE>=2026-05-01`
+        `[dealSheetSyncUpdateTrigger] Scheduled update: cynetdatabase.${bqDataset}; BQ deal_sheet targets -> Nexus refresh; baseline=deal_sheet_id; priority=STARTED,BOOKED,ACTIVE (all each run); batch=ENDED,ENDED<30,DID NOT START,DID NOT ACCEPT+unknown; max_pairs_per_run=${maxPairsPerRun} (batch only); terminal_stale_cutoff_days=20 (ENDED/ENDED<30/DID NOT START/DID NOT ACCEPT, latest DATE_AND_TIME older than cutoff dropped); checkpoint_key=${ACTIVE_UPDATE_SYNC_CHECKPOINT_KEY}; START_DATE>=${DEAL_SHEET_MIN_START_DATE_ISO}`
       );
       logLine("[dealSheetSyncUpdateTrigger] Invoking syncExistingActiveDealSheetUpdatesFromBigQuery");
 
@@ -719,7 +727,7 @@ exports.dealSheetSyncUpdateTrigger = onSchedule(
       });
 
       logLine(
-        `[dealSheetSyncUpdateTrigger] Pipeline result checked=${result.checked} appended=${result.appended} no_change=${result.no_change} not_found=${result.not_found} no_baseline=${result.no_baseline ?? 0} skipped_date=${result.skipped_date} errors=${result.errors} priorityTotal=${result.priorityTotal ?? "n/a"} priorityChecked=${result.priorityChecked ?? "n/a"} batchTotal=${result.batchTotal ?? "n/a"} batchCheckedThisRun=${result.batchCheckedThisRun ?? "n/a"} batchOffsetEnd=${result.batchOffsetEnd ?? result.targetOffsetEnd ?? "n/a"} targetTotal=${result.targetTotal ?? result.pairTotal ?? "n/a"} hasMore=${result.hasMore ? "yes" : "no"} elapsed=${result.elapsed || "n/a"}`
+        `[dealSheetSyncUpdateTrigger] Pipeline result checked=${result.checked} appended=${result.appended} no_change=${result.no_change} not_found=${result.not_found} no_baseline=${result.no_baseline ?? 0} skipped_date=${result.skipped_date} errors=${result.errors} priorityTotal=${result.priorityTotal ?? "n/a"} priorityChecked=${result.priorityChecked ?? "n/a"} batchTotal=${result.batchTotal ?? "n/a"} batchStaleSkipped=${result.batchStaleSkipped ?? "n/a"} batchCheckedThisRun=${result.batchCheckedThisRun ?? "n/a"} batchOffsetEnd=${result.batchOffsetEnd ?? result.targetOffsetEnd ?? "n/a"} targetTotal=${result.targetTotal ?? result.pairTotal ?? "n/a"} hasMore=${result.hasMore ? "yes" : "no"} elapsed=${result.elapsed || "n/a"}`
       );
 
       logLine(
@@ -890,6 +898,68 @@ exports.dealSheetSyncOfferRejected = onRequest(
       const executionTimeMs = Date.now() - wallStartMs;
       logError(`[dealSheetSyncOfferRejected] FAILED after ${executionTimeMs}ms`, error);
 
+      res.status(500).json({
+        success: false,
+        error: error.message,
+        executionTimeMs,
+      });
+    }
+  }
+);
+
+/**
+ * HTTP: one-time EXTENSION_DATE backfill from earliest BOOKED job-submittal-note.
+ * Default dry_run (apply=false). Pass apply=true to UPDATE latest EXTENSION rows in active tables.
+ * Does not wipe data or touch inorganic/ownership logs.
+ *
+ * Query: apply, bq_dataset, max_rows_per_table, concurrency
+ */
+exports.backfillExtensionDateFromNotes = onRequest(
+  {
+    region: REGION,
+    timeoutSeconds: HTTP_TIMEOUT_SEC,
+    memory: HTTP_MEMORY,
+  },
+  async (req, res) => {
+    const wallStartMs = Date.now();
+    try {
+      const result = await withTimingAsync("backfillExtensionDateFromNotes", async () => {
+        const q = req.query || {};
+        const body = req.body && typeof req.body === "object" ? req.body : {};
+        const applyRaw = body.apply != null ? body.apply : q.apply;
+        const apply = applyRaw === true || applyRaw === "true";
+        const bqDataset =
+          typeof body.bq_dataset === "string"
+            ? body.bq_dataset.trim()
+            : typeof q.bq_dataset === "string"
+              ? q.bq_dataset.trim()
+              : "rr_project_data";
+        const maxRows =
+          body.max_rows_per_table != null
+            ? body.max_rows_per_table
+            : q.max_rows_per_table != null
+              ? q.max_rows_per_table
+              : undefined;
+        const concurrency =
+          body.concurrency != null ? body.concurrency : q.concurrency != null ? q.concurrency : undefined;
+
+        logLine(
+          `[backfillExtensionDateFromNotes] method=${req.method} apply=${apply ? "true" : "dry_run"} bq_dataset=${bqDataset} max_rows_per_table=${maxRows ?? "default"} concurrency=${concurrency ?? "default"}`
+        );
+
+        return backfillExtensionDateFromBookedNotes({
+          apply,
+          bq_dataset: bqDataset,
+          max_rows_per_table: maxRows,
+          concurrency,
+        });
+      });
+
+      const executionTimeMs = Date.now() - wallStartMs;
+      res.status(200).json({ ...result, executionTimeMs });
+    } catch (error) {
+      const executionTimeMs = Date.now() - wallStartMs;
+      logError(`[backfillExtensionDateFromNotes] FAILED after ${executionTimeMs}ms`, error);
       res.status(500).json({
         success: false,
         error: error.message,

@@ -18,6 +18,8 @@ test("resolveHierarchyColumnForTitle maps known designations, case/whitespace-in
   assert.equal(resolveHierarchyColumnForTitle("Sr. Delivery Manager"), "ACCOUNT_MANAGER");
   assert.equal(resolveHierarchyColumnForTitle("Delivery Director"), "DELIVERY_DIRECTOR");
   assert.equal(resolveHierarchyColumnForTitle("Associate Group Director"), "GRP_DIR_ASSOC_GRP_DIR");
+  assert.equal(resolveHierarchyColumnForTitle("Director - Business Operations"), "GRP_DIR_ASSOC_GRP_DIR");
+  assert.equal(resolveHierarchyColumnForTitle("Director delivery for Public Sector"), "GRP_DIR_ASSOC_GRP_DIR");
   assert.equal(resolveHierarchyColumnForTitle("Associate Vice President - Delivery"), "AVP");
   assert.equal(resolveHierarchyColumnForTitle("SrVP"), "VP_SRVP");
   assert.equal(resolveHierarchyColumnForTitle("Chief Growth Officer (CGO)"), null);

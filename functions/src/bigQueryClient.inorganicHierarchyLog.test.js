@@ -6,6 +6,7 @@ const {
   buildInorganicHierarchyLogDedupeKey,
   resolveInorganicHierarchyLogRows,
   mergeInorganicHierarchyLogCandidates,
+  filterInorganicHierarchyAgainstFrozenOrganic,
   fetchOnsiteAmCsmHierarchyByKey,
   applyOnsiteAmCsmHierarchyForRows,
 } = require("./bigQueryClient");
@@ -136,11 +137,10 @@ test("resolveInorganicHierarchyLogRows fills recruiter identity and hierarchy fr
   // "Associate Vice President - Delivery" is now its own AVP designation (split out of VP_SRVP).
   assert.equal(row.INORGANIC_AVP, "Maneet Gupta");
   assert.equal(row.INORGANIC_AVP_EMP_NO, "CY2088");
-  // INORGANIC_DELIVERY_POC = highest present in the deal-sheet POC chain. AVP is NOT in that chain,
-  // so ACCOUNT_MANAGER (Nikhil) wins; email resolved by emp-no.
-  assert.equal(row.INORGANIC_DELIVERY_POC, "Nikhil Sharma");
-  assert.equal(row.INORGANIC_DELIVERY_POC_EMP_NO, "CY2431");
-  assert.equal(row.INORGANIC_DELIVERY_POC_EMAIL, "nikhil.s@cynethealth.com");
+  // INORGANIC_DELIVERY_POC = highest present in the deal-sheet POC chain (AVP beats ACCOUNT_MANAGER).
+  assert.equal(row.INORGANIC_DELIVERY_POC, "Maneet Gupta");
+  assert.equal(row.INORGANIC_DELIVERY_POC_EMP_NO, "CY2088");
+  assert.equal(row.INORGANIC_DELIVERY_POC_EMAIL, null); // fetchEmailsFn only stubs CY2431
   // "Chief Growth Officer (CGO)" matches no known designation -> no INORGANIC_* column set for it.
   assert.equal(row.EFFECTIVE_DATE, new Date().toISOString().slice(0, 10));
   assert.equal(typeof row.DATE_AND_TIME, "string");
@@ -303,4 +303,128 @@ test("applyOnsiteAmCsmHierarchyForRows recomputes on every call (not insert-once
   const out = await applyOnsiteAmCsmHierarchyForRows(rows, {}, { fetchFn });
   assert.equal(out[0].LEVEL_2_CSM, "Fresh Manager");
   assert.equal(out[1].LEVEL_2_CSM, null);
+});
+
+test("filterInorganicHierarchyAgainstFrozenOrganic: EXTENSION same hierarchy → no divergence (skip insert)", () => {
+  const inorganicRow = {
+    DEAL_SHEET_ID: 10,
+    PLACEMENT_ID: 500,
+    RECRUITER_EMAIL_ID: "new@cynethealth.com",
+    INORGANIC_RECRUITER: "New Recruiter",
+    INORGANIC_RECRUITER_EMP_NO: "E999",
+    INORGANIC_TL: "Same TL",
+    INORGANIC_TL_EMP_NO: "TL1",
+    INORGANIC_RM: "Same RM",
+    INORGANIC_RM_EMP_NO: "RM1",
+    INORGANIC_ACCOUNT_MANAGER: "Same AM",
+    INORGANIC_ACCOUNT_MANAGER_EMP_NO: "AM1",
+    INORGANIC_DELIVERY_POC: "Same AM",
+    INORGANIC_DELIVERY_POC_EMP_NO: "AM1",
+    INORGANIC_DELIVERY_POC_EMAIL: "am@cynethealth.com",
+  };
+  const frozen = {
+    DEAL_TYPE: "EXTENSION",
+    TEAM_LEAD: "Same TL",
+    TEAM_LEAD_EMP_NO: "TL1",
+    RM: "Same RM",
+    RM_EMP_NO: "RM1",
+    ACCOUNT_MANAGER: "Same AM",
+    ACCOUNT_MANAGER_EMP_NO: "AM1",
+  };
+  const { row, hasDivergence } = filterInorganicHierarchyAgainstFrozenOrganic(inorganicRow, frozen);
+  assert.equal(hasDivergence, false);
+  assert.equal(row.INORGANIC_TL, null);
+  assert.equal(row.INORGANIC_RM, null);
+  assert.equal(row.INORGANIC_ACCOUNT_MANAGER, null);
+  assert.equal(row.INORGANIC_DELIVERY_POC, null);
+  // Recruiter identity may remain, but alone is not enough to insert.
+  assert.equal(row.INORGANIC_RECRUITER, "New Recruiter");
+});
+
+test("filterInorganicHierarchyAgainstFrozenOrganic: EXTENSION new person only → only that INORGANIC_* kept", () => {
+  const inorganicRow = {
+    INORGANIC_RECRUITER: "New Recruiter",
+    INORGANIC_RECRUITER_EMP_NO: "E999",
+    INORGANIC_TL: "Same TL",
+    INORGANIC_TL_EMP_NO: "TL1",
+    INORGANIC_RM: "Brand New RM",
+    INORGANIC_RM_EMP_NO: "RM_NEW",
+    INORGANIC_ACCOUNT_MANAGER: "Same AM",
+    INORGANIC_ACCOUNT_MANAGER_EMP_NO: "AM1",
+    INORGANIC_DELIVERY_POC: "Same AM",
+    INORGANIC_DELIVERY_POC_EMP_NO: "AM1",
+  };
+  const frozen = {
+    TEAM_LEAD: "Same TL",
+    TEAM_LEAD_EMP_NO: "TL1",
+    RM: "Old RM",
+    RM_EMP_NO: "RM1",
+    ACCOUNT_MANAGER: "Same AM",
+    ACCOUNT_MANAGER_EMP_NO: "AM1",
+  };
+  const { row, hasDivergence } = filterInorganicHierarchyAgainstFrozenOrganic(inorganicRow, frozen);
+  assert.equal(hasDivergence, true);
+  assert.equal(row.INORGANIC_TL, null);
+  assert.equal(row.INORGANIC_TL_EMP_NO, null);
+  assert.equal(row.INORGANIC_ACCOUNT_MANAGER, null);
+  assert.equal(row.INORGANIC_ACCOUNT_MANAGER_EMP_NO, null);
+  assert.equal(row.INORGANIC_RM, "Brand New RM");
+  assert.equal(row.INORGANIC_RM_EMP_NO, "RM_NEW");
+  assert.equal(row.INORGANIC_DELIVERY_POC, "Brand New RM");
+  assert.equal(row.INORGANIC_DELIVERY_POC_EMP_NO, "RM_NEW");
+});
+
+test("filterInorganicHierarchyAgainstFrozenOrganic: EXTENSION fully different chain → all divergent roles set", () => {
+  const inorganicRow = {
+    INORGANIC_TL: "New TL",
+    INORGANIC_TL_EMP_NO: "TL_NEW",
+    INORGANIC_RM: "New RM",
+    INORGANIC_RM_EMP_NO: "RM_NEW",
+    INORGANIC_ACCOUNT_MANAGER: "New AM",
+    INORGANIC_ACCOUNT_MANAGER_EMP_NO: "AM_NEW",
+    INORGANIC_ATL: "New ATL",
+    INORGANIC_ATL_EMP_NO: "ATL_NEW",
+    INORGANIC_DELIVERY_POC: "New AM",
+    INORGANIC_DELIVERY_POC_EMP_NO: "AM_NEW",
+    INORGANIC_DELIVERY_POC_EMAIL: "newam@cynethealth.com",
+  };
+  const frozen = {
+    TEAM_LEAD: "Old TL",
+    TEAM_LEAD_EMP_NO: "TL_OLD",
+    RM: "Old RM",
+    RM_EMP_NO: "RM_OLD",
+    ACCOUNT_MANAGER: "Old AM",
+    ACCOUNT_MANAGER_EMP_NO: "AM_OLD",
+    ATL: "Old ATL",
+    ATL_EMP_NO: "ATL_OLD",
+  };
+  const { row, hasDivergence } = filterInorganicHierarchyAgainstFrozenOrganic(inorganicRow, frozen);
+  assert.equal(hasDivergence, true);
+  assert.equal(row.INORGANIC_TL, "New TL");
+  assert.equal(row.INORGANIC_RM, "New RM");
+  assert.equal(row.INORGANIC_ACCOUNT_MANAGER, "New AM");
+  assert.equal(row.INORGANIC_ATL, "New ATL");
+  assert.equal(row.INORGANIC_DELIVERY_POC, "New AM");
+  assert.equal(row.INORGANIC_DELIVERY_POC_EMP_NO, "AM_NEW");
+  // Same emp remains POC → keep prior email.
+  assert.equal(row.INORGANIC_DELIVERY_POC_EMAIL, "newam@cynethealth.com");
+});
+
+test("filterInorganicHierarchyAgainstFrozenOrganic: same by name when emp missing still clears slot", () => {
+  const inorganicRow = {
+    INORGANIC_TL: "Alex Lead",
+    INORGANIC_TL_EMP_NO: null,
+    INORGANIC_RM: "Different RM",
+    INORGANIC_RM_EMP_NO: "RM2",
+  };
+  const frozen = {
+    TEAM_LEAD: "Alex Lead",
+    TEAM_LEAD_EMP_NO: "TL1",
+    RM: "Old RM",
+    RM_EMP_NO: "RM1",
+  };
+  const { row, hasDivergence } = filterInorganicHierarchyAgainstFrozenOrganic(inorganicRow, frozen);
+  assert.equal(hasDivergence, true);
+  assert.equal(row.INORGANIC_TL, null);
+  assert.equal(row.INORGANIC_RM, "Different RM");
 });
