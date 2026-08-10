@@ -14,7 +14,12 @@
       "Bash(perl -i -pe \"s/all_Locums_data_Runrate \\\\\\(TODO: placeholder — swap once the real table exists\\\\\\)/all_locums_runrate/; s/'all_Locums_data_Runrate'/'all_locums_runrate'/g\" sql/migrate_backfill_extension_runrate_hierarchy.sql)",
       "Bash(node -e \"require\\('./functions/src/index.js'\\); console.log\\('OK'\\)\")",
       "Bash(grep -n \"EXTENSION_RUNRATE_HIERARCHY_COLUMNS,$\" functions/src/bigQueryClient.js)",
-      "Bash(git stash *)"
+      "Bash(git stash *)",
+      "Bash(bq --project_id=cynetdatabase show --schema --format=prettyjson cynetdatabase:rr_project_data.ch_termination_reason_logs)",
+      "Bash(bq --project_id=cynetdatabase ls --max_results=1000 cynetdatabase:rr_project_data)",
+      "Bash(gcloud logging *)",
+      "Bash(awk -F: '{print $1}')",
+      "Bash(awk '/cynet_health_canada_deal_sheet/,0' sql/create_domain_deal_sheet_tables.sql)"
     ]
   }
 }

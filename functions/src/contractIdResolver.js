@@ -29,6 +29,8 @@ const {
 const {
   fetchContractIdsByDealSheetIds,
   fetchContractIdsForExtensions,
+  fetchLegacyContractIdentityForDealRows,
+  buildLegacyContractLookupKey,
 } = require("./bigQueryClient");
 const { resolveActiveDealSheetTableId } = require("./recruiterDomainTables");
 
@@ -368,6 +370,94 @@ async function resolveContractIdsForRows(rows, deps = {}) {
 }
 
 /**
+ * Placement statuses that never became a working assignment, so no SKU_NUMBER belongs on the row.
+ * A SKU identifies an assignment that actually ran; CONTRACT_ID, by contrast, identifies the
+ * contract and is still carried over on these rows.
+ */
+const SKU_INELIGIBLE_PLACEMENT_STATUSES = new Set(["DID NOT START", "DID NOT ACCEPT"]);
+
+/** @returns {boolean} true when this row's placement status may hold a SKU_NUMBER. */
+function skuEligibleForLegacyFill(row) {
+  const status = row?.PLACEMENT_STATUS == null ? "" : String(row.PLACEMENT_STATUS).trim().toUpperCase();
+  return !SKU_INELIGIBLE_PLACEMENT_STATUSES.has(status);
+}
+
+/**
+ * Stamp legacy CONTRACT_ID / SKU_NUMBER onto DEAL rows the run-rate table already knows.
+ *
+ * Runs immediately before Firestore allocation: a placement with run-rate history keeps the id it
+ * already has, so one contract never ends up with two ids (and its EXTENSIONs, which inherit from
+ * the DEAL, stay on the same one). SKU_NUMBER is filled the same way but only when the row has none
+ * and the legacy row actually carries one — many older run-rate rows have a CONTRACT_ID and no SKU,
+ * and a null there must not overwrite anything.
+ *
+ * A lookup failure is non-fatal: rows simply fall through to a freshly minted id, which is the
+ * pre-existing behaviour. Losing the legacy link on one run is recoverable; failing the whole insert
+ * batch is not.
+ *
+ * @param {object[]} dealRows - DEAL rows still without a CONTRACT_ID
+ * @param {object} [deps]
+ * @param {string} [deps.tableId]
+ * @param {Function} [deps.fetchLegacyContractIdentityFn]
+ * @returns {Promise<number>} rows that took a legacy CONTRACT_ID
+ */
+async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
+  if (!dealRows || dealRows.length === 0) return 0;
+
+  const fetchLegacyContractIdentityFn =
+    deps.fetchLegacyContractIdentityFn ?? fetchLegacyContractIdentityForDealRows;
+  const tableId = deps.tableId == null ? "" : String(deps.tableId).trim();
+
+  let identityByRowKey;
+  try {
+    identityByRowKey = await fetchLegacyContractIdentityFn(dealRows, {
+      tableId: tableId || undefined,
+      datasetId: deps.datasetId,
+    });
+  } catch (err) {
+    logDetail(
+      `[contractId allocator] legacy run-rate lookup failed (DEAL rows fall back to a new id): ${String(err?.message || err).slice(0, 200)}`
+    );
+    return 0;
+  }
+  if (!identityByRowKey || identityByRowKey.size === 0) return 0;
+
+  let reused = 0;
+  let skuFilled = 0;
+  for (const row of dealRows) {
+    if (row.CONTRACT_ID != null) continue;
+    const key = buildLegacyContractLookupKey(row);
+    if (!key) continue;
+    const identity = identityByRowKey.get(key.rowKey);
+    const contractId = normalizeContractIdOrNull(identity?.CONTRACT_ID);
+    if (contractId == null) continue;
+
+    row.CONTRACT_ID = contractId;
+    reused++;
+
+    // SKU_NUMBER is only carried over for placements that actually took effect. A DID NOT START /
+    // DID NOT ACCEPT row never became a working assignment, so it must not inherit the legacy SKU
+    // even when the run-rate row carries one — CONTRACT_ID still comes across, since the contract
+    // identity is what ties the row to its chain.
+    if (skuEligibleForLegacyFill(row)) {
+      const legacySku = identity?.SKU_NUMBER;
+      const rowSkuEmpty = row.SKU_NUMBER == null || String(row.SKU_NUMBER).trim() === "";
+      if (rowSkuEmpty && legacySku != null && String(legacySku).trim() !== "") {
+        row.SKU_NUMBER = String(legacySku).trim();
+        skuFilled++;
+      }
+    }
+  }
+
+  if (reused > 0) {
+    logDetail(
+      `[contractId allocator] legacy run-rate identity applied: dealRows=${dealRows.length} contractIdReused=${reused} skuFilled=${skuFilled}`
+    );
+  }
+  return reused;
+}
+
+/**
  * Phase B — allocate CONTRACT_IDs for DEAL rows in the final post-filter insert batch.
  *
  * DEAL_TYPE='DEAL' rows are the ONLY rows in the system that mint a CONTRACT_ID; the
@@ -391,15 +481,26 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
   const allocateContractIdsFn =
     deps.allocateContractIdsFn ?? allocateContractIds;
 
+  const pendingDealRows = [];
+  for (const row of rowsToInsert) {
+    if (row == null) continue;
+    if (row.CONTRACT_ID != null) continue;
+    if (normalizeDealTypeKey(row?.DEAL_TYPE) !== "DEAL") continue;
+    pendingDealRows.push(row);
+  }
+
+  // Legacy identity first: a placement the run-rate table already tracks keeps its original
+  // CONTRACT_ID (and SKU_NUMBER) instead of minting a second id for the same contract. Only rows
+  // with no run-rate history reach the Firestore sequence below.
+  await applyLegacyContractIdentityToDealRows(pendingDealRows, { tableId, ...deps });
+
   /** @type {Map<string, object[]>} */
   const needsAllocationByKey = new Map();
   /** @type {object[]} */
   const noKeyAllocationRows = [];
 
-  for (const row of rowsToInsert) {
-    if (row == null) continue;
+  for (const row of pendingDealRows) {
     if (row.CONTRACT_ID != null) continue;
-    if (normalizeDealTypeKey(row?.DEAL_TYPE) !== "DEAL") continue;
 
     const matchKey = buildContractMatchKey(row);
     if (matchKey) {
@@ -479,6 +580,7 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
 module.exports = {
   resolveContractIdsForRows,
   allocateContractIdsForInsertableRows,
+  applyLegacyContractIdentityToDealRows,
   buildContractMatchKey,
   pickDealContractIdFromBatch,
   normalizeDealTypeKey,

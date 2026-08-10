@@ -935,3 +935,143 @@ test("an already-set CONTRACT_ID is never overwritten by the runrate tier", asyn
 
   assert.equal(out[0].CONTRACT_ID, "CHC7777");
 });
+
+// ---------------------------------------------------------------------------
+// SKU_NUMBER on DID NOT START / DID NOT ACCEPT extensions
+//
+// A placement that never became a working assignment must not carry a SKU_NUMBER, whichever inherit
+// source supplied it (parent DEAL, prior EXTENSION, or run-rate). CONTRACT_ID still comes across —
+// that identifies the contract chain, which the row does belong to.
+// ---------------------------------------------------------------------------
+
+function extensionRow(overrides = {}) {
+  return {
+    DEAL_TYPE: "EXTENSION",
+    PLACEMENT_STATUS: "STARTED",
+    CONTRACT_ID: null,
+    SKU_NUMBER: null,
+    CANDIDATE_ID: 111,
+    CLIENT_ID: 55,
+    PLACEMENT_ID: 999,
+    INITIAL_START_DATE: null,
+    NEW_HIRE_DATE: null,
+    ...overrides,
+  };
+}
+
+for (const status of ["DID NOT START", "DID NOT ACCEPT", "did not accept"]) {
+  test(`applyExtensionInheritForInsertRows: "${status}" extension takes CONTRACT_ID but no SKU_NUMBER`, async () => {
+    const out = await applyExtensionInheritForInsertRows(
+      [extensionRow({ PLACEMENT_STATUS: status })],
+      {},
+      {
+        parentFetchFn: async () =>
+          new Map([["999", { CONTRACT_ID: "CHC21351", SKU_NUMBER: "H14672" }]]),
+        priorExtensionFetchFn: noPriorExtensionFetch,
+        runrateFetchFn: async () => new Map(),
+        resolveContractIdsFn: noContractIdResolution,
+      }
+    );
+    assert.equal(out[0].CONTRACT_ID, "CHC21351");
+    assert.equal(out[0].SKU_NUMBER, null);
+  });
+}
+
+test("applyExtensionInheritForInsertRows: a started extension still inherits SKU_NUMBER", async () => {
+  const out = await applyExtensionInheritForInsertRows(
+    [extensionRow({ PLACEMENT_STATUS: "STARTED" })],
+    {},
+    {
+      parentFetchFn: async () =>
+        new Map([["999", { CONTRACT_ID: "CHC21351", SKU_NUMBER: "H14672" }]]),
+      priorExtensionFetchFn: noPriorExtensionFetch,
+      runrateFetchFn: async () => new Map(),
+      resolveContractIdsFn: noContractIdResolution,
+    }
+  );
+  assert.equal(out[0].SKU_NUMBER, "H14672");
+});
+
+test("applyExtensionInheritForInsertRows: run-rate SKU is also blocked on DID NOT START", async () => {
+  const out = await applyExtensionInheritForInsertRows(
+    [extensionRow({ PLACEMENT_STATUS: "DID NOT START" })],
+    {},
+    {
+      parentFetchFn: async () => new Map(),
+      priorExtensionFetchFn: noPriorExtensionFetch,
+      runrateFetchFn: async () =>
+        new Map([["999", { CONTRACT_ID: "CHC19505", SKU_NUMBER: "H13412" }]]),
+      resolveContractIdsFn: noContractIdResolution,
+    }
+  );
+  assert.equal(out[0].CONTRACT_ID, "CHC19505");
+  assert.equal(out[0].SKU_NUMBER, null);
+});
+
+test("applyExtensionInheritForInsertRows: prior-extension SKU is also blocked on DID NOT ACCEPT", async () => {
+  const out = await applyExtensionInheritForInsertRows(
+    [extensionRow({ PLACEMENT_STATUS: "DID NOT ACCEPT" })],
+    {},
+    {
+      parentFetchFn: async () => new Map(),
+      priorExtensionFetchFn: async () =>
+        new Map([["999", { CONTRACT_ID: "CHC21351", SKU_NUMBER: "H14672" }]]),
+      runrateFetchFn: async () => new Map(),
+      resolveContractIdsFn: noContractIdResolution,
+    }
+  );
+  assert.equal(out[0].CONTRACT_ID, "CHC21351");
+  assert.equal(out[0].SKU_NUMBER, null);
+});
+
+test("applyExtensionInheritForInsertRows: a SKU already on the row is never cleared", async () => {
+  const out = await applyExtensionInheritForInsertRows(
+    [extensionRow({ PLACEMENT_STATUS: "DID NOT START", SKU_NUMBER: "H99999" })],
+    {},
+    {
+      parentFetchFn: async () =>
+        new Map([["999", { CONTRACT_ID: "CHC21351", SKU_NUMBER: "H14672" }]]),
+      priorExtensionFetchFn: noPriorExtensionFetch,
+      runrateFetchFn: async () => new Map(),
+      resolveContractIdsFn: noContractIdResolution,
+    }
+  );
+  assert.equal(out[0].SKU_NUMBER, "H99999");
+});
+
+// The clear only removes a SKU this run inherited — it never touches one already on the row. That is
+// what protects the real sequence: a BOOKED row gets SKU H14672, the placement later flips to DID NOT
+// START, and the update-append carries H14672 forward. Nulling it there would lose a SKU the
+// assignment genuinely earned while it was live.
+test("applyExtensionInheritForInsertRows: an update-append keeps a SKU earned while BOOKED", async () => {
+  const out = await applyExtensionInheritForInsertRows(
+    [extensionRow({
+      PLACEMENT_STATUS: "DID NOT START",
+      CONTRACT_ID: "CHC21351",
+      SKU_NUMBER: "H14672",
+      __CARRIED_FORWARD_UPDATE: true,
+    })],
+    {},
+    {
+      parentFetchFn: async () => new Map(),
+      priorExtensionFetchFn: noPriorExtensionFetch,
+      runrateFetchFn: async () => new Map(),
+      resolveContractIdsFn: noContractIdResolution,
+    }
+  );
+  assert.equal(out[0].SKU_NUMBER, "H14672");
+});
+
+test("applyExtensionInheritForInsertRows: an existing SKU wins over an inherit source offering another", async () => {
+  const out = await applyExtensionInheritForInsertRows(
+    [extensionRow({ PLACEMENT_STATUS: "DID NOT START", SKU_NUMBER: "H14672" })],
+    {},
+    {
+      parentFetchFn: async () => new Map([["999", { SKU_NUMBER: "H00000" }]]),
+      priorExtensionFetchFn: noPriorExtensionFetch,
+      runrateFetchFn: async () => new Map(),
+      resolveContractIdsFn: noContractIdResolution,
+    }
+  );
+  assert.equal(out[0].SKU_NUMBER, "H14672");
+});

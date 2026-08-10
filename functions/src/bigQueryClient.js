@@ -2922,6 +2922,321 @@ async function fetchContractIdsForExtensions(extensionRows, options = {}) {
 }
 
 /**
+ * Placement statuses that never became a working assignment, so no SKU_NUMBER belongs on the row.
+ * A SKU identifies an assignment that actually ran; CONTRACT_ID identifies the contract chain and is
+ * still carried onto these rows. Mirrored for DEAL rows in contractIdResolver.js.
+ */
+const SKU_INELIGIBLE_PLACEMENT_STATUSES = new Set(["DID NOT START", "DID NOT ACCEPT"]);
+
+/** @returns {boolean} true when this placement status may hold a SKU_NUMBER. */
+function skuAllowedForPlacementStatus(status) {
+  const key = status == null ? "" : String(status).trim().toUpperCase();
+  return !SKU_INELIGIBLE_PLACEMENT_STATUSES.has(key);
+}
+
+/** Trimmed SKU_NUMBER, or null when the legacy row never carried one. */
+function normalizeLegacySkuOrNull(value) {
+  if (value == null) return null;
+  const s = String(value).trim();
+  return s === "" ? null : s;
+}
+
+/**
+ * Lookup key for a DEAL row against the legacy run-rate table.
+ * @returns {{rowKey: string, nexusKey: string|null, emailKey: string|null, vmsKey: string|null}|null}
+ */
+function buildLegacyContractLookupKey(row) {
+  if (!row || typeof row !== "object") return null;
+
+  const candidateId = row.CANDIDATE_ID == null ? "" : String(row.CANDIDATE_ID).trim();
+  const jobId = row.INTERNAL_JOB_ID == null ? "" : String(row.INTERNAL_JOB_ID).trim();
+  const nexusKey = candidateId !== "" && jobId !== "" ? `${candidateId}|${jobId}` : null;
+
+  const email = row.CANDIDATE_EMAIL == null ? "" : String(row.CANDIDATE_EMAIL).trim().toLowerCase();
+  const startDate =
+    row.START_DATE == null ? "" : String(row.START_DATE).trim().slice(0, 10);
+  const emailKey =
+    email !== "" && /^\d{4}-\d{2}-\d{2}$/.test(startDate) ? `${email}|${startDate}` : null;
+
+  // Tier 3: the VMS job id outlives Nexus's internal one. A mid-contract rate change is re-issued as
+  // a fresh INTERNAL_JOB_ID with a shifted START_DATE, so tiers 1 and 2 both miss even though it is
+  // the same contract — 401 DEAL rows landed a second CONTRACT_ID and a null SKU that way. This is
+  // the DEAL-side counterpart of the EMAIL_VMS_JOB_ID tier the EXTENSION run-rate matcher has.
+  const vmsJobId = row.VMS_JOB_ID == null ? "" : String(row.VMS_JOB_ID).trim();
+  const vmsKey = candidateId !== "" && vmsJobId !== "" ? `${candidateId}|${vmsJobId}` : null;
+
+  // Tier 4: a contract Nexus re-issued several times mid-flight leaves rows with a new
+  // INTERNAL_JOB_ID, a shifted START_DATE and a changed (or absent) VMS_JOB_ID — nothing tiers 1-3
+  // can key on. What still holds is the candidate and the calendar: the row's START_DATE falls inside
+  // the run-rate row's own START..TENTATIVE_END span, because it is a slice of that same contract.
+  // Measured over the affected rows this resolved 78 of 88 with ZERO ambiguity (not one row matched
+  // two contracts), so the span alone identifies the contract. Facility and parent-client were tested
+  // as extra conditions and only destroyed real matches (69 and 60 of 88): the two tables spell one
+  // client differently ("NY Presbyterian - C" vs "NewYork-Presbyterian ...") and a contract can move
+  // between facilities of the same system mid-assignment.
+  const rangeKey =
+    candidateId !== "" && /^\d{4}-\d{2}-\d{2}$/.test(startDate)
+      ? `${candidateId}|${startDate}`
+      : null;
+
+  if (!nexusKey && !emailKey && !vmsKey && !rangeKey) return null;
+
+  // Row identity for the returned map: DEAL_SHEET_ID is unique per deal sheet; PLACEMENT_ID backs it
+  // up, and the composite key itself is the last resort so two rows never collide.
+  const rowKey =
+    row.DEAL_SHEET_ID != null && String(row.DEAL_SHEET_ID).trim() !== ""
+      ? `ds:${String(row.DEAL_SHEET_ID).trim()}`
+      : row.PLACEMENT_ID != null && String(row.PLACEMENT_ID).trim() !== ""
+        ? `pl:${String(row.PLACEMENT_ID).trim()}`
+        : `k:${nexusKey ?? emailKey ?? vmsKey ?? rangeKey}`;
+
+  return { rowKey, nexusKey, emailKey, vmsKey, rangeKey };
+}
+
+/**
+ * Legacy CONTRACT_ID / SKU_NUMBER for brand-new DEAL rows that the run-rate table already knows.
+ *
+ * Most placements landing here as DEAL_TYPE='DEAL' are not new business — they were already tracked
+ * in the legacy run-rate table with a CONTRACT_ID (and often a SKU_NUMBER). Minting a fresh Firestore
+ * id for them split one real contract across two ids (run-rate CHC22144 vs newly minted CHC23016) and
+ * left SKU_NUMBER empty. That then propagated: EXTENSION rows inherit CONTRACT_ID from their parent
+ * DEAL, and ch_rate_change_logs / ownership_change_logs / ch_termination_reason_logs are all keyed on
+ * it. This looks the row up first so the existing identity wins; only placements with no run-rate
+ * history fall through to a freshly minted id.
+ *
+ * Four match tiers, tried in order — the first that matches wins:
+ *   1. CANDIDATE_ID + INTERNAL_JOB_ID — exact Nexus identity (17,005 of 21,849 run-rate rows).
+ *   2. CANDIDATE_EMAIL + START_DATE — ~22% of run-rate rows carry no Nexus ids at all (4,844 rows),
+ *      but every one of them has an email.
+ *   3. CANDIDATE_ID + VMS_JOB_ID — a mid-contract rate change is re-issued by Nexus as a fresh
+ *      INTERNAL_JOB_ID with a shifted START_DATE, so tiers 1 and 2 both miss on what is really the
+ *      same contract; the VMS job id is the one identifier that survives. 401 DEAL rows had minted a
+ *      second CONTRACT_ID and a null SKU this way. Mirrors the EXTENSION matcher's EMAIL_VMS_JOB_ID
+ *      tier.
+ *   4. CANDIDATE_ID + START_DATE inside the run-rate row's START..TENTATIVE_END span — for rows the
+ *      re-issue also gave a new (or no) VMS job id, leaving tiers 1-3 nothing to key on. See
+ *      buildLegacyContractLookupKey for the measurements behind using the span alone.
+ * These are fallbacks, never extra key parts: START_DATE / FACILITY_NAME / VMS_JOB_ID were each
+ * measured as additional conditions on tier 1 and every one dropped real matches (816 / 857 / 851 of
+ * 865), because start dates shift on the same placement and facility/VMS describe the job rather
+ * than the deal. Used as separate tiers they only add matches tier 1 could not make.
+ *
+ * A key mapping to more than one CONTRACT_ID (80 of 21,849 run-rate rows; 1 affected DEAL row today)
+ * resolves to the EARLIEST START_DATE, then the lowest CONTRACT_ID — deterministic across reruns.
+ *
+ * @param {object[]} rows - DEAL rows needing an id
+ * @param {object} [options]
+ * @param {string} [options.datasetId]
+ * @param {string} [options.tableId] - destination deal sheet table (selects the domain's run-rate table)
+ * @param {string} [options.runrateTableId]
+ * @returns {Promise<Map<string, {CONTRACT_ID: string|null, SKU_NUMBER: string|null}>>} rowKey -> legacy identity
+ */
+async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
+  const out = new Map();
+  if (!rows || rows.length === 0) return out;
+
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+  const runrateTableId =
+    typeof options.runrateTableId === "string" && options.runrateTableId.trim() !== ""
+      ? options.runrateTableId.trim()
+      : resolveRunrateTableIdForDealSheetTable(options.tableId);
+  const runrateFqn = `\`${config.projectId}.${datasetId}.${runrateTableId}\``;
+
+  const keyed = [];
+  const nexusKeys = new Set();
+  const emailKeys = new Set();
+  const vmsKeys = new Set();
+  const rangeKeys = new Set();
+  for (const row of rows) {
+    const key = buildLegacyContractLookupKey(row);
+    if (!key) continue;
+    keyed.push(key);
+    if (key.nexusKey) nexusKeys.add(key.nexusKey);
+    if (key.emailKey) emailKeys.add(key.emailKey);
+    if (key.vmsKey) vmsKeys.add(key.vmsKey);
+    if (key.rangeKey) rangeKeys.add(key.rangeKey);
+  }
+  if (keyed.length === 0) return out;
+
+  const byNexusKey = new Map();
+  const byEmailKey = new Map();
+  const byVmsKey = new Map();
+  const byRangeKey = new Map();
+
+  if (nexusKeys.size > 0) {
+    const pairs = [...nexusKeys].map((k) => {
+      const [cand, job] = k.split("|");
+      return `STRUCT('${escapeSqlString(cand)}' AS cand, '${escapeSqlString(job)}' AS job)`;
+    });
+    // ROW_NUMBER picks the earliest contract per key; CONTRACT_ID then ID break ties so repeated runs
+    // always resolve identically.
+    const sql = `
+      WITH wanted AS (SELECT * FROM UNNEST([${pairs.join(", ")}])),
+      ranked AS (
+        SELECT
+          CAST(r.CANDIDATE_ID AS STRING) AS cand,
+          CAST(r.INTERNAL_JOB_ID AS STRING) AS job,
+          r.CONTRACT_ID AS contract_id,
+          r.SKU_NUMBER AS sku_number,
+          ROW_NUMBER() OVER (
+            PARTITION BY CAST(r.CANDIDATE_ID AS STRING), CAST(r.INTERNAL_JOB_ID AS STRING)
+            ORDER BY r.START_DATE ASC, r.CONTRACT_ID ASC, r.ID ASC
+          ) AS rn
+        FROM ${runrateFqn} r
+        JOIN wanted w
+          ON CAST(r.CANDIDATE_ID AS STRING) = w.cand
+         AND CAST(r.INTERNAL_JOB_ID AS STRING) = w.job
+        WHERE r.CONTRACT_ID IS NOT NULL AND TRIM(r.CONTRACT_ID) != ''
+      )
+      SELECT cand, job, contract_id, sku_number FROM ranked WHERE rn = 1
+    `;
+    const found = await queryObjects(sql, nexusKeys.size);
+    for (const r of found) {
+      byNexusKey.set(`${r.cand}|${r.job}`, {
+        CONTRACT_ID: normalizeContractIdOrNull(r.contract_id),
+        SKU_NUMBER: normalizeLegacySkuOrNull(r.sku_number),
+      });
+    }
+  }
+
+  if (emailKeys.size > 0) {
+    const pairs = [...emailKeys].map((k) => {
+      const idx = k.indexOf("|");
+      return `STRUCT('${escapeSqlString(k.slice(0, idx))}' AS em, DATE '${escapeSqlString(k.slice(idx + 1))}' AS st)`;
+    });
+    const sql = `
+      WITH wanted AS (SELECT * FROM UNNEST([${pairs.join(", ")}])),
+      ranked AS (
+        SELECT
+          LOWER(TRIM(r.CANDIDATE_EMAIL)) AS em,
+          CAST(r.START_DATE AS STRING) AS st,
+          r.CONTRACT_ID AS contract_id,
+          r.SKU_NUMBER AS sku_number,
+          ROW_NUMBER() OVER (
+            PARTITION BY LOWER(TRIM(r.CANDIDATE_EMAIL)), r.START_DATE
+            ORDER BY r.START_DATE ASC, r.CONTRACT_ID ASC, r.ID ASC
+          ) AS rn
+        FROM ${runrateFqn} r
+        JOIN wanted w
+          ON LOWER(TRIM(r.CANDIDATE_EMAIL)) = w.em
+         AND r.START_DATE = w.st
+        WHERE r.CONTRACT_ID IS NOT NULL AND TRIM(r.CONTRACT_ID) != ''
+      )
+      SELECT em, st, contract_id, sku_number FROM ranked WHERE rn = 1
+    `;
+    const found = await queryObjects(sql, emailKeys.size);
+    for (const r of found) {
+      byEmailKey.set(`${r.em}|${String(r.st).slice(0, 10)}`, {
+        CONTRACT_ID: normalizeContractIdOrNull(r.contract_id),
+        SKU_NUMBER: normalizeLegacySkuOrNull(r.sku_number),
+      });
+    }
+  }
+
+  if (vmsKeys.size > 0) {
+    const pairs = [...vmsKeys].map((k) => {
+      const idx = k.indexOf("|");
+      return `STRUCT('${escapeSqlString(k.slice(0, idx))}' AS cand, '${escapeSqlString(k.slice(idx + 1))}' AS vms)`;
+    });
+    const sql = `
+      WITH wanted AS (SELECT * FROM UNNEST([${pairs.join(", ")}])),
+      ranked AS (
+        SELECT
+          CAST(r.CANDIDATE_ID AS STRING) AS cand,
+          TRIM(CAST(r.VMS_JOB_ID AS STRING)) AS vms,
+          r.CONTRACT_ID AS contract_id,
+          r.SKU_NUMBER AS sku_number,
+          ROW_NUMBER() OVER (
+            PARTITION BY CAST(r.CANDIDATE_ID AS STRING), TRIM(CAST(r.VMS_JOB_ID AS STRING))
+            ORDER BY r.START_DATE ASC, r.CONTRACT_ID ASC, r.ID ASC
+          ) AS rn
+        FROM ${runrateFqn} r
+        JOIN wanted w
+          ON CAST(r.CANDIDATE_ID AS STRING) = w.cand
+         AND TRIM(CAST(r.VMS_JOB_ID AS STRING)) = w.vms
+        WHERE r.CONTRACT_ID IS NOT NULL AND TRIM(r.CONTRACT_ID) != ''
+          AND r.VMS_JOB_ID IS NOT NULL AND TRIM(CAST(r.VMS_JOB_ID AS STRING)) != ''
+      )
+      SELECT cand, vms, contract_id, sku_number FROM ranked WHERE rn = 1
+    `;
+    const found = await queryObjects(sql, vmsKeys.size);
+    for (const r of found) {
+      byVmsKey.set(`${r.cand}|${r.vms}`, {
+        CONTRACT_ID: normalizeContractIdOrNull(r.contract_id),
+        SKU_NUMBER: normalizeLegacySkuOrNull(r.sku_number),
+      });
+    }
+  }
+
+  if (rangeKeys.size > 0) {
+    const pairs = [...rangeKeys].map((k) => {
+      const idx = k.indexOf("|");
+      return `STRUCT('${escapeSqlString(k.slice(0, idx))}' AS cand, DATE '${escapeSqlString(k.slice(idx + 1))}' AS st)`;
+    });
+    // Only run-rate rows that actually carry a SKU count here: tier 4 exists to recover the SKU an
+    // in-flight re-issue lost, and a spanning row without one would add nothing while widening the
+    // chance of landing on a neighbouring contract.
+    const sql = `
+      WITH wanted AS (SELECT * FROM UNNEST([${pairs.join(", ")}])),
+      ranked AS (
+        SELECT
+          w.cand AS cand,
+          CAST(w.st AS STRING) AS st,
+          r.CONTRACT_ID AS contract_id,
+          r.SKU_NUMBER AS sku_number,
+          ROW_NUMBER() OVER (
+            PARTITION BY w.cand, w.st
+            ORDER BY r.START_DATE ASC, r.CONTRACT_ID ASC, r.ID ASC
+          ) AS rn
+        FROM ${runrateFqn} r
+        JOIN wanted w
+          ON CAST(r.CANDIDATE_ID AS STRING) = w.cand
+         AND w.st BETWEEN r.START_DATE AND IFNULL(r.TENTATIVE_END_DATE, r.START_DATE)
+        WHERE r.CONTRACT_ID IS NOT NULL AND TRIM(r.CONTRACT_ID) != ''
+          AND r.SKU_NUMBER IS NOT NULL AND TRIM(r.SKU_NUMBER) != ''
+          AND r.START_DATE IS NOT NULL
+      )
+      SELECT cand, st, contract_id, sku_number FROM ranked WHERE rn = 1
+    `;
+    const found = await queryObjects(sql, rangeKeys.size);
+    for (const r of found) {
+      byRangeKey.set(`${r.cand}|${String(r.st).slice(0, 10)}`, {
+        CONTRACT_ID: normalizeContractIdOrNull(r.contract_id),
+        SKU_NUMBER: normalizeLegacySkuOrNull(r.sku_number),
+      });
+    }
+  }
+
+  let tier1Hits = 0;
+  let tier2Hits = 0;
+  let tier3Hits = 0;
+  let tier4Hits = 0;
+  for (const key of keyed) {
+    const tier1 = key.nexusKey ? byNexusKey.get(key.nexusKey) : null;
+    const tier2 = tier1 ? null : key.emailKey ? byEmailKey.get(key.emailKey) : null;
+    const tier3 = tier1 || tier2 ? null : key.vmsKey ? byVmsKey.get(key.vmsKey) : null;
+    const tier4 =
+      tier1 || tier2 || tier3 ? null : key.rangeKey ? byRangeKey.get(key.rangeKey) : null;
+    const hit = tier1 ?? tier2 ?? tier3 ?? tier4;
+    if (!hit || hit.CONTRACT_ID == null) continue;
+    if (tier1) tier1Hits++;
+    else if (tier2) tier2Hits++;
+    else if (tier3) tier3Hits++;
+    else tier4Hits++;
+    out.set(key.rowKey, hit);
+  }
+
+  logDetail(
+    `[legacy contract lookup] runrate=${runrateTableId} dealRows=${rows.length} keyed=${keyed.length} matched=${out.size} (nexusKey=${tier1Hits} emailKey=${tier2Hits} vmsKey=${tier3Hits} dateRange=${tier4Hits})`
+  );
+
+  return out;
+}
+
+/**
  * Non-assignment hierarchy columns backfilled from all_CH_data_runrate for brand-new EXTENSION
  * rows. ASSIGNMENT_RECRUITER* / RECRUITER_ID / RECRUITER_EMP_NO / PREVIOUS_RECRUITER_* stay
  * excluded — the current Nexus assignment wins. Sales / credentialing / payment / SECONDARY_RECRUITER
@@ -3869,6 +4184,7 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
   let parentBackfilledCount = 0;
   let priorExtensionBackfilledCount = 0;
   let runrateBackfilledCount = 0;
+  let skuClearedCount = 0;
 
   const out = rows.map((row) => {
     const key = String(row.PLACEMENT_ID).trim();
@@ -3918,6 +4234,20 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
       }
     }
 
+    // A DID NOT START / DID NOT ACCEPT extension never became a working assignment, so it must not
+    // carry a SKU_NUMBER — undo whatever the three inherit sources above filled in. Applied after the
+    // merges rather than inside each one because all three (parent DEAL, prior EXTENSION, run-rate)
+    // can supply it. CONTRACT_ID is deliberately left alone: that identifies the contract chain the
+    // row belongs to, which is still true for a placement that fell through.
+    if (!skuAllowedForPlacementStatus(current.PLACEMENT_STATUS) && !isEmptyDateFieldValue(current.SKU_NUMBER)) {
+      const inheritedSku = isEmptyDateFieldValue(row.SKU_NUMBER);
+      if (inheritedSku) {
+        current = { ...current, SKU_NUMBER: null };
+        rowChanged = true;
+        skuClearedCount++;
+      }
+    }
+
     return rowChanged ? current : row;
   });
 
@@ -3934,6 +4264,11 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
   if (runrateByPlacementId.size > 0) {
     logDetail(
       `[enriched sync] [BigQuery insertAll] EXTENSION runrate backfill: eligible=${eligible.length} matched=${runrateByPlacementId.size} backfilled=${runrateBackfilledCount}`
+    );
+  }
+  if (skuClearedCount > 0) {
+    logDetail(
+      `[enriched sync] [BigQuery insertAll] EXTENSION SKU_NUMBER cleared on DID NOT START / DID NOT ACCEPT: ${skuClearedCount}`
     );
   }
 
@@ -7330,6 +7665,9 @@ module.exports = {
   computeDealSheetFirstInsertDateStamps,
   fetchContractIdsByDealSheetIds,
   fetchContractIdsForExtensions,
+  fetchLegacyContractIdentityForDealRows,
+  buildLegacyContractLookupKey,
+  skuAllowedForPlacementStatus,
   fetchEmployeeDirectoryByEmails,
   buildActiveDealSheetsUnionSql,
   formatDateOnlyForSql,
