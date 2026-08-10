@@ -90,7 +90,7 @@ function computeCanadaT4PayRate(row) {
   if (payRate == null) return null;
 
   const guaranteedHours = toNumberOrNull(row?.SCHEDULE_HOURS_1);
-  const initialWeeks = toNumberOrNull(row?.INITIAL_PROJECT_DURATION_IN_WEEKS);
+  const initialWeeks = toNumberOrNull(row?.PROJECT_DURATION);
   if (
     guaranteedHours == null ||
     initialWeeks == null ||
@@ -104,7 +104,7 @@ function computeCanadaT4PayRate(row) {
   const perDiem = toNumberOrNull(row?.WEEKLY_PER_DIEM_NON_TAXED) ?? 0;
   const bonusTerm = bonus / (guaranteedHours * initialWeeks);
   const state = normClientState(row?.CLIENT_STATE);
-  const t4Multiplier = isT4Type(row?.TYPE);
+  const t4Multiplier = isT4Type(row?.PAYMENT_TYPE);
 
   if (state === "NL") {
     const core = (payRate * 1.04 + bonusTerm) * (t4Multiplier ? 1.1672 : 1.0254);
@@ -203,7 +203,7 @@ function computeCanadaDerivedPlacementFields(row) {
     FINAL_BILL_RATE: finalBillRate,
     FINAL_COST: finalCost,
     NET_MARGIN: netMargin,
-    GROSS_MARGIN: grossMargin,
+    MARGIN: grossMargin,
     GM_OT: computeGmOt(row),
     DAYS_WORKED: computeDaysWorked(row),
   };
@@ -217,7 +217,7 @@ const CANADA_EXCLUDED_API_OWNED_COLUMNS = new Set([
   "W2_PAY_RATE_NEW",
   "FINAL_PAY_RATE_NEW",
   "FINAL_COST_NEW",
-  "NEW_MARGIN",
+  "CALCULATED_MARGIN",
   "FINAL_BILL_RATE_NEW",
   "FIRST_WEEK_HOURS",
   "SECOND_WEEK_HOURS",

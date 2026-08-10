@@ -10,10 +10,10 @@ test("allocateContractIdsForInsertableRows assigns CHC id to DEAL row", async ()
   const rows = [
     {
       DEAL_TYPE: "DEAL",
-      CANDIDATE_NEXUS_ID: 1,
+      CANDIDATE_ID: 1,
       CLIENT_ID: 2,
       CANDIDATE_EMAIL: "a@example.com",
-      PHONE_NUMBER: "555",
+      CELL_PHONE: "555",
     },
   ];
 
@@ -29,17 +29,17 @@ test("allocateContractIdsForInsertableRows propagates id to EXTENSION in same ba
   const rows = [
     {
       DEAL_TYPE: "DEAL",
-      CANDIDATE_NEXUS_ID: 10,
+      CANDIDATE_ID: 10,
       CLIENT_ID: 20,
       CANDIDATE_EMAIL: "b@example.com",
-      PHONE_NUMBER: "111",
+      CELL_PHONE: "111",
     },
     {
       DEAL_TYPE: "EXTENSION",
-      CANDIDATE_NEXUS_ID: 10,
+      CANDIDATE_ID: 10,
       CLIENT_ID: 20,
       CANDIDATE_EMAIL: "b@example.com",
-      PHONE_NUMBER: "111",
+      CELL_PHONE: "111",
     },
   ];
 

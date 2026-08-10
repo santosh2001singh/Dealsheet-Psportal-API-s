@@ -1,10 +1,10 @@
 const { logLine } = require("./logger");
 const { startDateOnOrAfterUtcMin, effectiveMinFilterDate } = require("./columnMappings");
 
-/** Offer-rejected (`dealSheetSyncOfferRejected`) only: ended rows must have TENTATIVE_DATE on or after this day (UTC). */
+/** Offer-rejected (`dealSheetSyncOfferRejected`) only: ended rows must have TENTATIVE_END_DATE on or after this day (UTC). */
 const OFFER_REJECTED_MIN_TENTATIVE_DATE_MS = Date.UTC(2026, 4, 1); // 2026-05-01 UTC
 
-/** Placement statuses allowed into BigQuery for `dealSheetSyncOfferRejected` (before TENTATIVE_DATE filter). */
+/** Placement statuses allowed into BigQuery for `dealSheetSyncOfferRejected` (before TENTATIVE_END_DATE filter). */
 function filterOfferRejectedEndedPlacementStatuses(rows) {
   return rows.filter((row) => {
     const status = String(row?.PLACEMENT_STATUS || "").trim().toUpperCase();
@@ -26,7 +26,7 @@ function filterOfferRejectedRowsByMinTentativeDate(rows) {
         OFFER_REJECTED_MIN_TENTATIVE_DATE_MS
       );
     }
-    return startDateOnOrAfterUtcMin(row?.TENTATIVE_DATE, OFFER_REJECTED_MIN_TENTATIVE_DATE_MS);
+    return startDateOnOrAfterUtcMin(row?.TENTATIVE_END_DATE, OFFER_REJECTED_MIN_TENTATIVE_DATE_MS);
   });
 }
 
@@ -40,7 +40,7 @@ function transformOfferRejectedEndedRowsForBigQuery(rows) {
   );
   const afterDate = filterOfferRejectedRowsByMinTentativeDate(afterStatus);
   logLine(
-    `[offer-rejected-transform] after_tentative_date_filter=${afterDate.length} (TENTATIVE_DATE>=2026-05-01 UTC)`
+    `[offer-rejected-transform] after_tentative_date_filter=${afterDate.length} (TENTATIVE_END_DATE>=2026-05-01 UTC)`
   );
   return afterDate;
 }

@@ -14,9 +14,9 @@ const DEAL_RECRUITER_HIERARCHY_TARGETS = [
   { column: "ASSOCIATE_AM", empNoColumn: "ASSOCIATE_AM_EMP_NO" },
   { column: "ACCOUNT_MANAGER", empNoColumn: "ACCOUNT_MANAGER_EMP_NO" },
   { column: "DELIVERY_DIRECTOR", empNoColumn: "DELIVERY_DIRECTOR_EMP_NO" },
-  { column: "GRP_DIR_ASSOC_GRP_DIR", empNoColumn: "GRP_DIR_ASSOC_GRP_DIR_EMP_NO" },
+  { column: "ASSOCIATE_DELIVERY_DIRECTOR", empNoColumn: "ASSOCIATE_DELIVERY_DIRECTOR_EMP_NO" },
   { column: "AVP", empNoColumn: "AVP_EMP_NO" },
-  { column: "VP_SRVP", empNoColumn: "VP_SRVP_EMP_NO" },
+  { column: "VP", empNoColumn: "VP_EMP_NO" },
 ];
 Object.freeze(DEAL_RECRUITER_HIERARCHY_TARGETS);
 
@@ -54,7 +54,7 @@ const HIERARCHY_DESIGNATION_SYNONYMS = {
     "senior account manager",
   ],
   DELIVERY_DIRECTOR: ["delivery director", "director - delivery", "director delivery"],
-  GRP_DIR_ASSOC_GRP_DIR: [
+  ASSOCIATE_DELIVERY_DIRECTOR: [
     "director",
     "associate director",
     "assoc director",
@@ -67,7 +67,7 @@ const HIERARCHY_DESIGNATION_SYNONYMS = {
     "director - business operations",
     "director delivery for public sector",
   ],
-  VP_SRVP: [
+  VP: [
     "vice president",
     "vp",
     "sr vp",
@@ -77,8 +77,8 @@ const HIERARCHY_DESIGNATION_SYNONYMS = {
     "vp srvp",
     "vp/srvp",
   ],
-  // Associate VP is its OWN designation (AVP column), split out of VP_SRVP. Exact-map lookup means
-  // "associate vice president" never collides with VP_SRVP's "vice president".
+  // Associate VP is its OWN designation (AVP column), split out of VP. Exact-map lookup means
+  // "associate vice president" never collides with VP's "vice president".
   AVP: [
     "avp",
     "associate vice president",
@@ -182,10 +182,34 @@ function isCsmHierarchyExcludedTitle(title) {
 }
 
 /**
+ * True when a hierarchy row's manager is excluded from CSM resolution.
+ *
+ * Person-level, not row-level: manager_title in directory_employee_hierarchy is unreliable — the
+ * SAME manager appears as "Chief Growth Officer (CGO)" in one snapshot, "CGO - Chief Growth
+ * Officer" in another, "Permanent" in another, and NULL in another. A row-level title check
+ * therefore let C-level managers (Ron Bagga, Nick Budhiraja) leak into LEVEL_3_CSM/LEVEL_4_CSM on
+ * exactly those snapshots where their title happened to be NULL.
+ *
+ * So the row's own title is only one input; `manager_excluded_ever` (computed in SQL across ALL of
+ * that manager's snapshots — see fetchHierarchyLevelChainsByKey) is the authoritative one. Once a
+ * manager has EVER carried an excluded title they stay excluded on every snapshot, including ones
+ * where the title is NULL. These are C-suite designations nobody moves back out of, so
+ * "ever excluded => always excluded" is the intended business rule, not an approximation.
+ * @param {{manager_title?: *, manager_excluded_ever?: *}} row
+ * @returns {boolean}
+ */
+function isCsmHierarchyExcludedRow(row) {
+  if (!row) return false;
+  if (row.manager_excluded_ever === true) return true;
+  return isCsmHierarchyExcludedTitle(row.manager_title);
+}
+
+/**
  * Resolve LEVEL_2_CSM/LEVEL_3_CSM/LEVEL_4_CSM names from an ONSITE_AM's hierarchy chain
- * (hierarchy_level rows from a single chosen snapshot). Excluded titles (see
- * CSM_HIERARCHY_EXCLUDED_TITLES) leave that specific level null without shifting other levels.
- * @param {Array<{hierarchy_level: string, manager_name: string, manager_title: string}>} levelRows
+ * (hierarchy_level rows from a single chosen snapshot). Excluded managers (see
+ * isCsmHierarchyExcludedRow) leave that specific level null without shifting other levels.
+ * @param {Array<{hierarchy_level: string, manager_name: string, manager_title: string,
+ *   manager_excluded_ever?: boolean}>} levelRows
  * @returns {{LEVEL_2_CSM: string|null, LEVEL_3_CSM: string|null, LEVEL_4_CSM: string|null}}
  */
 function resolveCsmLevelsFromChain(levelRows) {
@@ -201,7 +225,7 @@ function resolveCsmLevelsFromChain(levelRows) {
   for (const target of CSM_LEVEL_TARGETS) {
     const row = byLevel.get(target.hierarchyLevel);
     if (!row) continue;
-    if (isCsmHierarchyExcludedTitle(row.manager_title)) continue;
+    if (isCsmHierarchyExcludedRow(row)) continue;
     const name = row.manager_name == null ? null : String(row.manager_name).trim() || null;
     out[target.column] = name;
   }
@@ -224,13 +248,13 @@ const DESIGNATION_TO_INORGANIC_LOG_COLUMN = {
   RM: { column: "INORGANIC_RM", empNoColumn: "INORGANIC_RM_EMP_NO" },
   TEAM_LEAD: { column: "INORGANIC_TL", empNoColumn: "INORGANIC_TL_EMP_NO" },
   ATL: { column: "INORGANIC_ATL", empNoColumn: "INORGANIC_ATL_EMP_NO" },
-  GRP_DIR_ASSOC_GRP_DIR: {
+  ASSOCIATE_DELIVERY_DIRECTOR: {
     column: "INORGANIC_ASSOCIATE_GROUP_DIRECTOR",
     empNoColumn: "INORGANIC_ASSOCIATE_GROUP_DIRECTOR_EMP_NO",
   },
   DELIVERY_DIRECTOR: { column: "INORGANIC_DELIVERY_DIRECTOR", empNoColumn: "INORGANIC_DELIVERY_DIRECTOR_EMP_NO" },
   AVP: { column: "INORGANIC_AVP", empNoColumn: "INORGANIC_AVP_EMP_NO" },
-  VP_SRVP: { column: "INORGANIC_VP_SR_VP", empNoColumn: "INORGANIC_VP_SR_VP_EMP_NO" },
+  VP: { column: "INORGANIC_VP_SR_VP", empNoColumn: "INORGANIC_VP_SR_VP_EMP_NO" },
 };
 Object.freeze(DESIGNATION_TO_INORGANIC_LOG_COLUMN);
 
@@ -386,6 +410,7 @@ module.exports = {
   CSM_HIERARCHY_EXCLUDED_TITLES,
   OWNERSHIP_CHANGE_DIFF_ROLES,
   isCsmHierarchyExcludedTitle,
+  isCsmHierarchyExcludedRow,
   resolveCsmLevelsFromChain,
   normalizeDesignationTitle,
   resolveHierarchyColumnForTitle,

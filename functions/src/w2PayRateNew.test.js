@@ -31,7 +31,7 @@ test("mapDealSheetDetailToBq maps billable orientation from Nexus deal sheet", (
     billable_orientation_hrs: 24,
     billable_orientation: "70.00",
   });
-  assert.equal(out.ORIENTATION_HOURS, 16);
+  assert.equal(out.NBO_HOURS, 16);
   assert.equal(out.BILLABLE_ORIENTATION_HRS, 24);
   assert.equal(out.BILLABLE_ORIENTATION, "70.00%");
 });
@@ -93,7 +93,7 @@ function regularHoursSampleRow(clientState) {
     TOTAL_BONUS_TAXABLE: 0,
     TOTAL_BONUS_NON_TAXABLE: 0,
     PO_HOURS: 500,
-    ORIENTATION_HOURS: 0,
+    NBO_HOURS: 0,
     BILL_RATE: 100,
     CLIENT_OT_RATE: 150,
     CLIENT_MSP_FEE: 0,

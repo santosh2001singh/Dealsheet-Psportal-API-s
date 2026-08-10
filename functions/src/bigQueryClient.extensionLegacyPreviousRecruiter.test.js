@@ -65,7 +65,7 @@ test("no legacy match -> PREVIOUS_RECRUITER stays null", async () => {
   assert.equal(out.PREVIOUS_RECRUITER_NAME ?? null, null);
 });
 
-test("falls back to latest EFFECTIVE_DATE when no NEW_EMP matches current recruiter", async () => {
+test("falls back to latest OWNERSHIP_EFFECTIVE_DATE when no NEW_EMP matches current recruiter", async () => {
   const rows = [
     { DEAL_TYPE: "EXTENSION", SKU_NUMBER: "H14218", RECRUITER_EMP_NO: "CY9999", PREVIOUS_RECRUITER_NAME: null, PREVIOUS_RECRUITER_EMAIL: null },
   ];
@@ -145,14 +145,14 @@ test("H13614 apply still fills when BQ returns value wrappers + uppercase keys",
       NEW_EMP: { value: "CY1554" },
       OLD_ONE: "Philaso Angkang",
       OLD_EMP: { value: "CY4380" },
-      EFFECTIVE_DATE: { value: "2026-07-19" },
+      OWNERSHIP_EFFECTIVE_DATE: { value: "2026-07-19" },
     },
     {
       SKU: { value: "H13614" },
       NEW_EMP: { value: "CY1615" },
       OLD_ONE: "Shim Kashung",
       OLD_EMP: { value: "CY1554" },
-      EFFECTIVE_DATE: { value: "2026-08-30" },
+      OWNERSHIP_EFFECTIVE_DATE: { value: "2026-08-30" },
     },
   ];
   const rows = [

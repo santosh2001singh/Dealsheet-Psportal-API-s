@@ -57,7 +57,7 @@ test("DAYS_WORKED is 0 (not negative) for a DID NOT ACCEPT row after the pushbac
   assert.equal(derived.DAYS_WORKED, 0);
 });
 
-// The gate-level guard: even if the enriched END_DATE/TENTATIVE_DATE diverge again for any reason,
+// The gate-level guard: even if the enriched END_DATE/TENTATIVE_END_DATE diverge again for any reason,
 // pre-applying the override to the compare row must make the gate see no change vs the stored row.
 test("gate sees no change once the DID NOT ACCEPT override is applied to the compare row", () => {
   const stored = {
@@ -66,12 +66,12 @@ test("gate sees no change once the DID NOT ACCEPT override is applied to the com
     PLACEMENT_STATUS: "DID NOT ACCEPT",
     START_DATE: "2026-06-15",
     END_DATE: "2026-06-15",
-    TENTATIVE_DATE: null,
+    TENTATIVE_END_DATE: null,
     ASSIGNMENT_RECRUITER_EMAIL: "preety.n@cynethealth.com",
     CONTRACT_ID: "CHC2152",
   };
-  // Enriched row as it arrives at the gate: pre-override END_DATE/TENTATIVE_DATE.
-  const incoming = { ...stored, END_DATE: "2026-06-01", TENTATIVE_DATE: "2026-09-14", CONTRACT_ID: null };
+  // Enriched row as it arrives at the gate: pre-override END_DATE/TENTATIVE_END_DATE.
+  const incoming = { ...stored, END_DATE: "2026-06-01", TENTATIVE_END_DATE: "2026-09-14", CONTRACT_ID: null };
 
   assert.equal(hasBusinessColumnChanges(incoming, stored, new Set()), true);
 

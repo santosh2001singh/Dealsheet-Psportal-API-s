@@ -10,12 +10,13 @@ and writes enriched rows to **one of** (by `ASSIGNMENT_RECRUITER_EMAIL` domain):
 - `cynetdatabase.rr_project_data.cynet_health_deal_sheet` — `@cynethealth.com` and default for unknown/other domains
 - `cynetdatabase.rr_project_data.cynet_locums_deal_sheet` — `@cynetlocums.com`
 
-**Scheduled job:** `dealSheetSyncTrigger` runs **hourly at :00 in `America/New_York`**, from **9:00 AM through 7:00 PM Eastern** (cron `0 9-19 * * *`). It does **not** pass `bq_table`, so inserts are domain-routed. For HTTP runs with `only_new=true`, each row’s `DEAL_SHEET_ID` is checked only in that row’s **resolved** target table (no duplicate deal sheets per domain table).
+**Scheduled job:** `dealSheetSyncTrigger` runs **hourly at :00 in `America/New_York`**, from **8:00 AM through 7:00 PM Eastern** (cron `0 8-19 * * *`). It does **not** pass `bq_table`, so inserts are domain-routed. For HTTP runs with `only_new=true`, each row’s `DEAL_SHEET_ID` is checked only in that row’s **resolved** target table (no duplicate deal sheets per domain table).
 
 **Scheduled active sync (split):**
 
-- **`dealSheetSyncTrigger` (:00 ET, hourly 9 AM–7 PM):** Insert only when **`DEAL_SHEET_ID` and `PLACEMENT_ID` are both new** in BQ (no append-on-change). Nexus **`PERM_STARTS,ACTIVE,BOOKED`**, full list pagination. First row: **`STARTED,BOOKED`** only. `START_DATE >= 2026-05-01`.
-- **`dealSheetSyncUpdateTrigger` (:30 ET, hourly 9:30 AM–7:30 PM):** One target per **`DEAL_SHEET_ID`** from active BQ tables (`PLACEMENT_ID` fallback if deal sheet null). Nexus refresh by deal sheet, append when **business columns** differ vs latest deal-sheet row (no first-row inserts). **Two-tier sync:** every run refreshes **all** targets whose latest `PLACEMENT_STATUS` is **`STARTED`**, **`BOOKED`**, or **`ACTIVE`**; then processes up to **`DEAL_SHEET_UPDATE_TRIGGER_MAX_PAIRS`** (default 500) from the batch tier (`ENDED`, `ENDED<30`, `DID NOT START`, `DID NOT ACCEPT`, and any other/unknown status). Batch cursor: **`active-deal-sheet-update-cursor`** (`batchOffset` / `batchTotal` only).
+- **`dealSheetSyncTrigger` (:00 ET, hourly 8 AM–7 PM, cron `0 8-19 * * *`):** Insert only when **`DEAL_SHEET_ID` and `PLACEMENT_ID` are both new** in BQ (no append-on-change). Nexus **`PERM_STARTS,ACTIVE,BOOKED`**, full list pagination. First row: **`STARTED,BOOKED`** only. `START_DATE >= 2026-05-01`.
+- **`dealSheetSyncUpdateTrigger` (:30 ET, hourly 8:30 AM–7:30 PM, cron `30 8-19 * * *`):** One target per **`DEAL_SHEET_ID`** from active BQ tables (`PLACEMENT_ID` fallback if deal sheet null). Nexus refresh by deal sheet, append when **business columns** differ vs latest deal-sheet row (no first-row inserts). **Two-tier sync:** every run refreshes **all** targets whose latest `PLACEMENT_STATUS` is **`STARTED`**, **`BOOKED`**, or **`ACTIVE`**; then processes up to **`DEAL_SHEET_UPDATE_TRIGGER_MAX_PAIRS`** (default 500) from the batch tier (`ENDED`, `ENDED<30`, `DID NOT START`, `DID NOT ACCEPT`, and any other/unknown status). Batch cursor: **`active-deal-sheet-update-cursor`** (`batchOffset` / `batchTotal` only).
+- **`rateChangeLogSyncTrigger` (every 30 min ET, 8:00 AM–7:30 PM, cron `0,30 8-19 * * *`):** BQ `CONTRACT_ID` scan → `ch_rate_change_logs`.
 
 ## 1) Environment configuration
 
@@ -40,6 +41,21 @@ Create tables once: see [`sql/create_domain_deal_sheet_tables.sql`](../sql/creat
 **Ended (offer-rejected) tables:** [`sql/create_domain_ended_deal_sheet_tables.sql`](../sql/create_domain_ended_deal_sheet_tables.sql) — `cynet_health_ended_deal_sheet`, `cynet_health_canada_ended_deal_sheet`, `cynet_locums_ended_deal_sheet` (domain-routed like active).
 
 **Firestore checkpoint (page cursor):** checkpoints are stored at `workspaces/run-rate-tool/dealSheetSyncCheckpoints/{checkpoint_key}`. Scheduled `dealSheetSyncTrigger` persists `submittalPageNext`, `submittalPerPage`, and `checkpointCursorMode: "page"`. HTTP **`dealSheetSyncOfferRejected`** uses the same page cursor pattern with default `checkpoint_key=offer-rejected-ended-records` and `clear_checkpoint_on_complete` after a full successful pass. HTTP backfill for active sync can pass `checkpoint_use_submittal_page=true` with `resume=true`.
+
+**CONTRACT_ID sequences (Firestore):** stored at `workspaces/run-rate-tool/contractIdSequences/{table_id}`, one doc per active deal sheet table, each holding a `nextValue` counter. Prefixes and start values come from `config.contractIdByTable`: **cynet health starts at `CHC23000`** (Aug 2026), canada `CAC1000`, locums `LOC1000`.
+
+> **The counter does not follow config on its own.** `startValue` applies **only when the sequence doc does not exist**. If the doc is already there, its stored `nextValue` always wins — so editing `config.contractIdByTable` does nothing to a live sequence. **After truncating deal sheet data you must reset the sequence docs too**, or ids carry on from the pre-reset range:
+>
+> ```bash
+> cd functions
+> node scripts/resetContractIdSequences.js --dry-run          # current vs target, writes nothing
+> node scripts/resetContractIdSequences.js --all              # reset all three to configured start
+> node scripts/resetContractIdSequences.js --table cynet_health_deal_sheet
+> ```
+>
+> Deleting the docs by hand works too — a missing doc falls back to `startValue` on the next allocation.
+
+**Who gets a CONTRACT_ID:** minted for **`DEAL_TYPE='DEAL'` rows only**. An EXTENSION never mints one — it inherits, fill-if-empty, in this order: parent DEAL row in the deal sheet table → prior EXTENSION in the same chain → matched `all_CH_data_runrate` row (alongside `SKU_NUMBER`, same matched row) → reuse lookup across the destination table. An EXTENSION with no resolvable source stays null until its parent DEAL lands.
 
 ## 2) Deploy
 

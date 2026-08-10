@@ -13,7 +13,8 @@
       "Bash(node -e \"require\\('./functions/src/index.js'\\); console.log\\('index.js OK'\\)\")",
       "Bash(perl -i -pe \"s/all_Locums_data_Runrate \\\\\\(TODO: placeholder — swap once the real table exists\\\\\\)/all_locums_runrate/; s/'all_Locums_data_Runrate'/'all_locums_runrate'/g\" sql/migrate_backfill_extension_runrate_hierarchy.sql)",
       "Bash(node -e \"require\\('./functions/src/index.js'\\); console.log\\('OK'\\)\")",
-      "Bash(grep -n \"EXTENSION_RUNRATE_HIERARCHY_COLUMNS,$\" functions/src/bigQueryClient.js)"
+      "Bash(grep -n \"EXTENSION_RUNRATE_HIERARCHY_COLUMNS,$\" functions/src/bigQueryClient.js)",
+      "Bash(git stash *)"
     ]
   }
 }

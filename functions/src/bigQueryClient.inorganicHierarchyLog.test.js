@@ -34,7 +34,7 @@ test("buildInorganicHierarchyLogCandidate uses NEW_HIRE_DATE as anchor for DEAL 
     PLACEMENT_ID: 100,
     PLACEMENT_STATUS: "STARTED",
     CANDIDATE_NAME: "Jane Doe",
-    CANDIDATE_NEXUS_ID: 55,
+    CANDIDATE_ID: 55,
     DEAL_TYPE: "DEAL",
     NEW_HIRE_DATE: "2025-01-01T00:00:00.000Z",
     EXTENSION_DATE: "2099-01-01T00:00:00.000Z",
@@ -89,7 +89,7 @@ test("resolveInorganicHierarchyLogRows fills recruiter identity and hierarchy fr
         PLACEMENT_ID: 100,
         PLACEMENT_STATUS: "STARTED",
         CANDIDATE_NAME: "Jane Doe",
-        CANDIDATE_NEXUS_ID: 55,
+        CANDIDATE_ID: 55,
         DEAL_TYPE: "DEAL",
         NEW_HIRE_DATE: "2025-01-01T00:00:00.000Z",
         ASSIGNMENT_RECRUITER_EMAIL: "ajay.k@cynethealth.com",
@@ -134,7 +134,7 @@ test("resolveInorganicHierarchyLogRows fills recruiter identity and hierarchy fr
   assert.equal(row.INORGANIC_RECRUITER_EMP_NO, "CY2393");
   assert.equal(row.INORGANIC_ACCOUNT_MANAGER, "Nikhil Sharma");
   assert.equal(row.INORGANIC_ACCOUNT_MANAGER_EMP_NO, "CY2431");
-  // "Associate Vice President - Delivery" is now its own AVP designation (split out of VP_SRVP).
+  // "Associate Vice President - Delivery" is now its own AVP designation (split out of VP).
   assert.equal(row.INORGANIC_AVP, "Maneet Gupta");
   assert.equal(row.INORGANIC_AVP_EMP_NO, "CY2088");
   // INORGANIC_DELIVERY_POC = highest present in the deal-sheet POC chain (AVP beats ACCOUNT_MANAGER).
@@ -142,8 +142,8 @@ test("resolveInorganicHierarchyLogRows fills recruiter identity and hierarchy fr
   assert.equal(row.INORGANIC_DELIVERY_POC_EMP_NO, "CY2088");
   assert.equal(row.INORGANIC_DELIVERY_POC_EMAIL, null); // fetchEmailsFn only stubs CY2431
   // "Chief Growth Officer (CGO)" matches no known designation -> no INORGANIC_* column set for it.
-  assert.equal(row.EFFECTIVE_DATE, new Date().toISOString().slice(0, 10));
-  assert.equal(typeof row.DATE_AND_TIME, "string");
+  assert.equal(row.OWNERSHIP_EFFECTIVE_DATE, new Date().toISOString().slice(0, 10));
+  assert.equal(typeof row.LAST_UPDATED, "string");
 });
 
 test("resolveInorganicHierarchyLogRows still logs recruiter identity when hierarchy lookup finds nothing", async () => {
@@ -186,7 +186,7 @@ test("resolveInorganicHierarchyLogRows maps a CSM-only candidate (no recruiter c
       PLACEMENT_ID: 500,
       PLACEMENT_STATUS: "STARTED",
       CANDIDATE_NAME: "John Smith",
-      CANDIDATE_NEXUS_ID: 77,
+      CANDIDATE_ID: 77,
       csmDivergedLevels: { LEVEL_2_CSM: "New CSM Manager", LEVEL_3_CSM: null },
     },
   ];
@@ -290,6 +290,53 @@ test("fetchOnsiteAmCsmHierarchyByKey resolves hire-date-anchored CSM levels via 
 
   const levelsByKey = await fetchOnsiteAmCsmHierarchyByKey(rows, {}, { directoryFetchFn, hierarchyFetchFn });
   assert.deepEqual(levelsByKey.get("0"), { LEVEL_2_CSM: "Jodi Stanton", LEVEL_3_CSM: null, LEVEL_4_CSM: null });
+});
+
+test("fetchOnsiteAmCsmHierarchyByKey resolves CSM levels when the directory has external_id but employee_id is null", async () => {
+  // Chelsea Waszak: directory_employees carries external_id but employee_id IS NULL. The chain must
+  // still resolve — only external_id joins into directory_employee_hierarchy.
+  const rows = [
+    { ONSITE_AM_EMAIL: "chelsea.w@cynethealth.com", NEW_HIRE_DATE: "2026-08-04T13:49:58.000Z" },
+  ];
+  const directoryFetchFn = async () =>
+    new Map([
+      [
+        "chelsea.w@cynethealth.com",
+        { employeeId: null, externalId: "116414702927104296724", nameFull: "Chelsea Waszak" },
+      ],
+    ]);
+  const hierarchyFetchFn = async (targets) => {
+    assert.equal(targets.length, 1);
+    assert.equal(targets[0].externalId, "116414702927104296724");
+    return new Map([["0", [
+      { hierarchy_level: "1", manager_name: "Jessica Van Essen", manager_title: "Client Success Director" },
+      { hierarchy_level: "2", manager_name: "Jodi Stanton", manager_title: "AVP Client Relationship & Strategy" },
+      { hierarchy_level: "3", manager_name: "Ron Bagga", manager_title: "CGO - Chief Growth Officer" },
+      { hierarchy_level: "4", manager_name: "Nick Budhiraja", manager_title: "CO-CEO" },
+    ]]]);
+  };
+
+  const levelsByKey = await fetchOnsiteAmCsmHierarchyByKey(rows, {}, { directoryFetchFn, hierarchyFetchFn });
+  assert.deepEqual(levelsByKey.get("0"), {
+    LEVEL_2_CSM: "Jessica Van Essen",
+    LEVEL_3_CSM: "Jodi Stanton",
+    LEVEL_4_CSM: null, // Ron Bagga excluded (C-level title)
+  });
+});
+
+test("fetchOnsiteAmCsmHierarchyByKey skips rows whose directory entry has no external_id", async () => {
+  const rows = [{ ONSITE_AM_EMAIL: "no.ext@cynethealth.com", NEW_HIRE_DATE: "2026-08-04T00:00:00.000Z" }];
+  const directoryFetchFn = async () =>
+    new Map([["no.ext@cynethealth.com", { employeeId: "CY1", externalId: null, nameFull: "No Ext" }]]);
+  let hierarchyCalled = false;
+  const hierarchyFetchFn = async () => {
+    hierarchyCalled = true;
+    return new Map();
+  };
+
+  const levelsByKey = await fetchOnsiteAmCsmHierarchyByKey(rows, {}, { directoryFetchFn, hierarchyFetchFn });
+  assert.equal(hierarchyCalled, false);
+  assert.equal(levelsByKey.size, 0);
 });
 
 test("applyOnsiteAmCsmHierarchyForRows recomputes on every call (not insert-once) and clears when ONSITE_AM_EMAIL is missing", async () => {

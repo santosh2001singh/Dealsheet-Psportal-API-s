@@ -40,7 +40,6 @@ const {
   mapDealSheetUsersToBq,
   mapCandidateToBq,
   mapCandidateCandidateTypesToBq,
-  clientOfferingHasClientTypeText,
   resolveClientOfferingForEnrich,
   pickClientOfferingRowForJob,
   computeDerivedPlacementFields,
@@ -224,14 +223,11 @@ function isEmbeddedClientOfferingMspSufficient(clientObj) {
   return offerings.some((o) => o?.msp != null && typeof o.msp === "object");
 }
 
-function embeddedClientOfferingsSkippable(clientObj, jobObj) {
-  if (!isEmbeddedClientOfferingMspSufficient(clientObj)) return false;
-  const offerings = clientObj.client_offerings;
-  if (!jobObj) {
-    return offerings.every((o) => clientOfferingHasClientTypeText(o));
-  }
-  const picked = pickClientOfferingRowForJob(offerings, jobObj);
-  return picked != null && clientOfferingHasClientTypeText(picked);
+// The embedded offerings are enough whenever they carry MSP. They previously also had to carry
+// client_setting_type text, because a missing one forced a /api/client-offerings/ fetch just to
+// fill CLIENT_TYPE; that column is manual since Aug 2026, so MSP is now the only requirement.
+function embeddedClientOfferingsSkippable(clientObj, _jobObj) {
+  return isEmbeddedClientOfferingMspSufficient(clientObj);
 }
 
 /** @deprecated use isEmbeddedClientGeoSufficient */
@@ -239,17 +235,53 @@ function isEmbeddedClientSufficient(clientObj) {
   return isEmbeddedClientGeoSufficient(clientObj);
 }
 
-function registerEmbeddedClientSkips(sub, candidateClientId, jobObj, skipDetail, skipOfferings) {
-  const embeddedClient = sub?.client;
+/** Embedded client id matches the deal-sheet-candidate's client id (never map across clients). */
+function embeddedClientMatchesId(clientObj, candidateClientId) {
   const cid = normalizeNexusResourceId(candidateClientId);
+  if (!cid) return false;
   const embeddedId =
-    embeddedClient?.id == null || String(embeddedClient.id).trim() === ""
+    clientObj?.id == null || String(clientObj.id).trim() === ""
       ? null
-      : String(embeddedClient.id).trim();
-  if (!cid || !embeddedId || cid !== embeddedId) return;
-  if (isEmbeddedClientGeoSufficient(embeddedClient)) {
-    skipDetail.add(cid);
+      : String(clientObj.id).trim();
+  return embeddedId != null && embeddedId === cid;
+}
+
+/**
+ * Embedded client to use for a candidate: the submittal's copy first, then the job's. Both carry the
+ * same nested shape; the submittal is preferred only because it is fetched earlier. Returns null
+ * when neither matches the candidate's client id or neither has the geo fields mapClientToBq needs.
+ */
+function pickEmbeddedClientObj(sub, jobObj, candidateClientId) {
+  const fromSub = sub?.client;
+  if (embeddedClientMatchesId(fromSub, candidateClientId) && isEmbeddedClientGeoSufficient(fromSub)) {
+    return fromSub;
   }
+  const fromJob = jobObj?.client;
+  if (embeddedClientMatchesId(fromJob, candidateClientId) && isEmbeddedClientGeoSufficient(fromJob)) {
+    return fromJob;
+  }
+  return null;
+}
+
+/**
+ * Client payloads embedded on a job-submittal (and on a job) carry the same nested shape the
+ * standalone /api/clients/{id}/ response does — id, name, zipcode_data, parent_client {id,name} and
+ * client_offerings[].msp. Everything mapClientToBq and mapMspFromClientOfferingRow read is present,
+ * so the embedded copy is preferred and the client / parent-client / client-offerings GETs are
+ * skipped (3 fewer Nexus calls per candidate). The submittal arrives in STEP 2, well before wave1
+ * builds its URL list, so no wave reordering is needed. Anything incomplete still falls back to the
+ * API, which keeps a stale or trimmed embedded payload from silently emptying a column.
+ *
+ * @param {object|null} sub - job-submittal row (preloaded or fetched)
+ * @param {unknown} candidateClientId - deal-sheet-candidate's client id (must match the embedded one)
+ * @param {object|null} jobObj - job detail, used as a secondary embedded-client source
+ */
+function registerEmbeddedClientSkips(sub, candidateClientId, jobObj, skipDetail, skipOfferings) {
+  const embeddedClient = pickEmbeddedClientObj(sub, jobObj, candidateClientId);
+  if (!embeddedClient) return;
+  const cid = normalizeNexusResourceId(candidateClientId);
+  // pickEmbeddedClientObj already asserted id match + geo sufficiency.
+  skipDetail.add(cid);
   if (embeddedClientOfferingsSkippable(embeddedClient, jobObj)) {
     skipOfferings.add(cid);
   }
@@ -408,6 +440,9 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
 
   const skipClientDetailFetchIds = new Set();
   const skipClientOfferingsFetchIds = new Set();
+  // client id -> embedded client payload good enough to replace /api/clients/{id}/. Built from the
+  // STEP 2 submittals, which are already in hand before wave1 picks its URLs.
+  const embeddedClientById = new Map();
   if (hasPreloadedSubmittals) {
     for (const c of candidates) {
       const sub = getPreloadedSubmittalRow(preloadedSubmittals, c?.job, c?.candidate);
@@ -418,6 +453,8 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
         skipClientDetailFetchIds,
         skipClientOfferingsFetchIds
       );
+      const embedded = pickEmbeddedClientObj(sub, null, c?.client);
+      if (embedded) embeddedClientById.set(String(normalizeNexusResourceId(c?.client)), embedded);
     }
   }
 
@@ -567,27 +604,17 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
   const parentIdsToFetch = [];
   const parentFetchSeen = new Set();
   for (const cid of clientIdsEl) {
-    const obj = clientById.get(String(cid));
+    // Embedded copy wins: it carries parent_client as {id, name}, so the parent GET is unnecessary.
+    const obj = embeddedClientById.get(String(cid)) ?? clientById.get(String(cid));
     if (!obj) continue;
     const ps = normalizeParentClientIdRef(obj?.parent_client);
+    // parent_client null (independent facility) -> mapClientToBq falls back to the client's own name.
     if (!ps) continue;
+    // Nexus sometimes returns parent_client as a bare id; only then is the name still missing.
     if (parentClientNameFromEmbedded(obj)) continue;
     if (parentClientById.has(ps) || parentFetchSeen.has(ps)) continue;
     parentFetchSeen.add(ps);
     parentIdsToFetch.push(ps);
-  }
-  if (hasPreloadedSubmittals) {
-    for (const c of candidates) {
-      const sub = getPreloadedSubmittalRow(preloadedSubmittals, c?.job, c?.candidate);
-      const embeddedClient = sub?.client;
-      if (!isEmbeddedClientGeoSufficient(embeddedClient)) continue;
-      const ps = normalizeParentClientIdRef(embeddedClient?.parent_client);
-      if (!ps) continue;
-      if (parentClientNameFromEmbedded(embeddedClient)) continue;
-      if (parentClientById.has(ps) || parentFetchSeen.has(ps)) continue;
-      parentFetchSeen.add(ps);
-      parentIdsToFetch.push(ps);
-    }
   }
 
   const userIds = [];
@@ -849,6 +876,8 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     let submittalRow = hasPreloadedSubmittals
       ? getPreloadedSubmittalRow(preloadedSubmittals, jobId, candId)
       : null;
+    // Resolved here (not further down) because the embedded-client fallback below reads it.
+    const jobObj = jobId == null || String(jobId).trim() === "" ? null : jobById.get(String(jobId)) ?? null;
 
     const failedKinds = collectCandidateApiFailureKinds({
       dealSheetId,
@@ -886,17 +915,12 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     }
 
     const candidatePart = mapDealSheetCandidateToBq(c, { persistDealSheetStatusFromCandidate });
-    const embeddedClient = submittalRow?.client;
-    const useEmbeddedClient =
-      isEmbeddedClientGeoSufficient(embeddedClient) &&
-      clientId != null &&
-      clientId !== "" &&
-      String(embeddedClient?.id ?? "") === String(clientId);
-    const clientObj = useEmbeddedClient
-      ? embeddedClient
-      : clientId == null || clientId === ""
-        ? null
-        : clientById.get(String(clientId)) ?? null;
+    // Embedded client (submittal, else job) replaces the /api/clients/{id}/ payload — same nested
+    // shape, already fetched. Falls back to the API copy whenever the embedded one is absent or
+    // missing geo, so a trimmed payload can never blank out CLIENT_STATE / CITY_ZIPCODE.
+    const embeddedClient = pickEmbeddedClientObj(submittalRow, jobObj, clientId);
+    const clientObj = embeddedClient
+      ?? (clientId == null || clientId === "" ? null : clientById.get(String(clientId)) ?? null);
     const parentKey = normalizeParentClientIdRef(clientObj?.parent_client);
     const parentNameEmbedded = parentClientNameFromEmbedded(clientObj);
     const parentRec = parentKey ? parentClientById.get(parentKey) ?? null : null;
@@ -933,13 +957,16 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     const rateChangePart = mapDealSheetRateChangeToBq(
       rateChangesByDs.get(String(dealSheetId)) ?? [], jobId
     );
-    const jobObj = jobId == null || String(jobId).trim() === "" ? null : jobById.get(String(jobId)) ?? null;
     const jobPart = mapJobToBq(jobObj);
 
     const apiOfferings = clientId == null || clientId === ""
       ? []
       : clientOfferingsByClient.get(String(clientId)) ?? [];
-    const clientOfferingRow = resolveClientOfferingForEnrich(submittalRow, apiOfferings, jobObj);
+    // resolveClientOfferingForEnrich prefers submittal.client.client_offerings; clientObj covers the
+    // job-embedded case, and apiOfferings remains the fallback when neither carries offerings.
+    const clientOfferingRow =
+      resolveClientOfferingForEnrich(submittalRow, apiOfferings, jobObj)
+      ?? pickClientOfferingRowForJob(clientObj?.client_offerings, jobObj);
     const mspPart = mapMspFromClientOfferingRow(clientOfferingRow);
 
     const ratesList = ratesByDs.get(String(dealSheetId)) ?? [];
@@ -973,7 +1000,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       : computeWeekSplit({
         scheduleHours1: hoursPart.SCHEDULE_HOURS_1,
         scheduleHours2: hoursPart.SCHEDULE_HOURS_2,
-        initialWeeks: dealSheetPart.INITIAL_PROJECT_DURATION_IN_WEEKS,
+        initialWeeks: dealSheetPart.PROJECT_DURATION,
       });
 
     const candidateObj = !candId
@@ -1015,10 +1042,10 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     const extensionDate = resolveExtensionDateForExtensionRow(dealSheetPart?.DEAL_TYPE, notesForPlacement);
 
     const canadaTypePart = isCanadaRecruiter
-      ? { TYPE: mapCanadaTypeFromTenNintyNine(detail) }
+      ? { PAYMENT_TYPE: mapCanadaTypeFromTenNintyNine(detail) }
       : {};
     const locumsTypePart = isLocumsRecruiter
-      ? { TYPE: mapLocumsTypeFromTenNintyNine(detail) }
+      ? { PAYMENT_TYPE: mapLocumsTypeFromTenNintyNine(detail) }
       : {};
 
     const row = {
@@ -1041,12 +1068,13 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       ...providerTypePart,
       ...canadaTypePart,
       ...locumsTypePart,
-      CLIENT_TYPE: mspPart?.CLIENT_TYPE ?? null,
+      // CLIENT_TYPE / TYPE_OF_CLIENT are intentionally absent: manual columns since Aug 2026,
+      // carried forward from the baseline row by applyManualColumnsCarryForward.
       LINE_OF_BUSINESS: lineOfBusiness,
       START_DATE: submittalPart?.START_DATE ?? null,
-      TENTATIVE_DATE: resolveTentativeDateForPlacementRow(
+      TENTATIVE_END_DATE: resolveTentativeDateForPlacementRow(
         submittalPart?.PLACEMENT_STATUS,
-        submittalPart?.TENTATIVE_DATE ?? jobPart?.TENTATIVE_DATE ?? null
+        submittalPart?.TENTATIVE_END_DATE ?? jobPart?.TENTATIVE_END_DATE ?? null
       ),
       TERMINATION_REASON: terminationReason,
       NEW_HIRE_DATE: newHireDate,
@@ -1155,4 +1183,6 @@ module.exports = {
   isEmbeddedClientOfferingMspSufficient,
   embeddedClientOfferingsSkippable,
   registerEmbeddedClientSkips,
+  embeddedClientMatchesId,
+  pickEmbeddedClientObj,
 };

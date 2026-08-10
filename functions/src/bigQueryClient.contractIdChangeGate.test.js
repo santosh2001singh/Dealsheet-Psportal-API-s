@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 
 const { hasBusinessColumnChanges } = require("./bigQueryClient");
 
-const IGNORE = new Set(["ID", "DATE_AND_TIME", "IS_REJECTED"]);
+const IGNORE = new Set(["ID", "LAST_UPDATED", "IS_REJECTED"]);
 
 // Regression: CONTRACT_ID is a Cynet-internal identity resolved INSIDE the insert pipeline, so a
 // freshly-enriched incoming row has it null at compare time. Comparing null-incoming vs a populated

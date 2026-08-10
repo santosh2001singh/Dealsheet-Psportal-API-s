@@ -1,31 +1,37 @@
 /**
- * EXTENSION_REHIRE — derived "Extension/Rehire" column for the 6 domain deal sheet tables.
+ * EXT_OR_REHIRE_BY_RMG — derived "Extension/Rehire" column for the 6 domain deal sheet tables.
  *
- * The value describes where a placement sits in a candidate's history WITH ONE CLIENT:
+ * The value describes where a placement sits in the candidate's OVERALL history with us:
  *
  *   DEAL_TYPE = DEAL
- *     - blank                 : first deal, nothing after it yet
- *     - EXTENSION             : this deal has since been extended (same client)
- *     - REHIRED               : candidate already existed (deal sheet OR run-rate) at a DIFFERENT
- *                               parent client before this deal, and this deal has no extension yet
+ *     - blank                 : the candidate's FIRST deal. Stays blank forever — extending it no
+ *                               longer stamps anything on the deal itself.
+ *     - REOFFERED             : a REPEAT deal (we have earlier history for this candidate) that has
+ *                               not started yet — BOOKED / OFFERED.
+ *     - REBOOKED              : a repeat deal that started. Sticky: stays REBOOKED through
+ *                               ENDED / ENDED<30.
  *   DEAL_TYPE = EXTENSION
- *     - REOFFERED             : 1st extension of the deal, not started yet (BOOKED / OFFERED, and
- *                               it stays REOFFERED if it ends up DID NOT START / DID NOT ACCEPT)
- *     - REBOOKED              : 1st extension of the deal that started (STARTED, and it stays
- *                               REBOOKED once it becomes ENDED / ENDED<30)
- *     - REBOOKED/EXTENSION    : 2nd+ extension of the same deal (extension on extension), whatever
- *                               its placement status is
+ *     - EXTENSION             : extension of the candidate's FIRST deal.
+ *     - REBOOKED/EXTENSION    : extension of a REPEAT deal.
+ *     Both apply at ANY placement status (BOOKED, STARTED, ENDED, DNS) and to EVERY extension in
+ *     the run — the 1st, 2nd and Nth extension of the same deal all read the same value.
  *
- * Chain identity ("same client") = candidate + client:
- *   candidate = CANDIDATE_NEXUS_ID (else CANDIDATE_EMAIL), client = CLIENT_ID (else PARENT_CLIENT_NAME).
- * This is the same identity CONTRACT_ID is allocated on (see contractIdResolver.buildContractMatchKey),
- * so it groups a DEAL with its EXTENSIONs exactly like CONTRACT_ID does — but it also works for the
- * run-rate-only placements whose extensions land here with no parent DEAL row at all.
+ * Two independent questions drive everything:
  *
- * "Extension on extension" is counted per DEAL GENERATION: within a chain the units are ordered by
- * start date and each DEAL opens a new generation, so a chain whose deal only exists in the legacy
- * run-rate table (generation 0) still treats the first extension we hold as the 1st extension
- * (REOFFERED / REBOOKED), not as an extension-on-extension.
+ *   1. Is this DEAL a repeat? — CANDIDATE-level, CLIENT-AGNOSTIC. Any earlier placement for this
+ *      candidate (deal sheet OR legacy run-rate), at the SAME client or a different one, makes the
+ *      next deal a repeat. A candidate who comes back to the same hospital is just as much a
+ *      repeat as one who moves to a new one.
+ *   2. Which DEAL does this EXTENSION hang off? — the extension inherits its parent deal's
+ *      standing: first deal -> EXTENSION, repeat deal -> REBOOKED/EXTENSION.
+ *
+ * Chain identity (which extensions belong to which deal) = candidate + client + VMS job:
+ *   candidate = CANDIDATE_ID (else CANDIDATE_EMAIL),
+ *   client    = CLIENT_ID (else PARENT_CLIENT_NAME),
+ *   job       = VMS_JOB_ID (absent -> the chain is candidate+client only).
+ * Extensions are attached to the newest DEAL at or before their start date within that chain; an
+ * extension whose DEAL exists only in the legacy run-rate table has no parent here and is treated
+ * as an extension of a first deal (EXTENSION).
  *
  * A "unit" is one deal/extension event = one DEAL_SHEET_ID (PLACEMENT_ID when that is null). The deal
  * sheet is append-only, so a unit owns several rows; the unit's placement status is sticky (STARTED at
@@ -44,18 +50,17 @@ const {
 } = require("./recruiterDomainTables");
 
 /** BigQuery column name ("/" is not allowed in an identifier, so not EXTENSION/REHIRE). */
-const EXTENSION_REHIRE_COLUMN = "EXTENSION_REHIRE";
+const EXT_OR_REHIRE_COLUMN = "EXT_OR_REHIRE_BY_RMG";
 
-const EXTENSION_REHIRE_VALUES = Object.freeze({
+const EXT_OR_REHIRE_VALUES = Object.freeze({
   EXTENSION: "EXTENSION",
   REOFFERED: "REOFFERED",
   REBOOKED: "REBOOKED",
   REBOOKED_EXTENSION: "REBOOKED/EXTENSION",
-  REHIRED: "REHIRED",
 });
 
 /** All 6 domain deal sheet tables carry the column (active + ended). */
-const EXTENSION_REHIRE_TABLE_IDS = Object.freeze([
+const EXT_OR_REHIRE_TABLE_IDS = Object.freeze([
   ...ACTIVE_DEAL_SHEET_TABLE_IDS,
   ...ENDED_DEAL_SHEET_TABLE_IDS,
 ]);
@@ -96,61 +101,67 @@ function isStartedPlacementStatus(status) {
 
 /**
  * Single source of truth for the classification, evaluated top-down. `js` reads a facts object,
- * `sql` reads the identically-named columns of the `units` CTE in buildExtensionRehireSql, so the
+ * `sql` reads the identically-named columns of the `ranked` CTE in buildExtensionRehireSql, so the
  * two can never disagree about order or spelling.
  *
  * Facts per unit:
- *   dealType                 - "DEAL" | "EXTENSION" | other/blank
- *   extensionRank            - 1 for the 1st extension of the deal generation, 2+ after that
- *   everStarted              - the unit reached a started status at any point in its history
- *   generationExtensionCount - extensions belonging to this DEAL (0 = not extended yet)
- *   hasPriorOtherClient      - candidate has earlier history at a different parent client
+ *   dealType          - "DEAL" | "EXTENSION" | other/blank
+ *   everStarted       - the unit reached a started status at any point in its history (sticky)
+ *   isRepeatDeal      - a DEAL with EARLIER history for this candidate anywhere (any client).
+ *                       Drives REOFFERED/REBOOKED. Deliberately client-agnostic.
+ *   parentIsRepeatDeal- for an EXTENSION: the DEAL it hangs off is itself a repeat deal.
+ *                       Drives REBOOKED/EXTENSION vs plain EXTENSION.
+ *
+ * Extension RANK is deliberately absent: the 2nd, 3rd, Nth extension of the same deal all carry
+ * the same value as the 1st. What separates EXTENSION from REBOOKED/EXTENSION is which DEAL the
+ * extension belongs to, not how many came before it.
  */
-const EXTENSION_REHIRE_RULES = Object.freeze([
+const EXT_OR_REHIRE_RULES = Object.freeze([
   {
-    value: EXTENSION_REHIRE_VALUES.REBOOKED_EXTENSION,
-    js: (f) => f.dealType === "EXTENSION" && Number(f.extensionRank) >= 2,
-    sql: "deal_type = 'EXTENSION' AND extension_rank >= 2",
+    // Extension of a repeat deal — every extension of it, at any placement status (BOOKED,
+    // STARTED, ENDED, DNS).
+    value: EXT_OR_REHIRE_VALUES.REBOOKED_EXTENSION,
+    js: (f) => f.dealType === "EXTENSION" && f.parentIsRepeatDeal === true,
+    sql: "deal_type = 'EXTENSION' AND parent_is_repeat_deal",
   },
   {
-    value: EXTENSION_REHIRE_VALUES.REBOOKED,
-    js: (f) => f.dealType === "EXTENSION" && f.everStarted === true,
-    sql: "deal_type = 'EXTENSION' AND ever_started",
-  },
-  {
-    value: EXTENSION_REHIRE_VALUES.REOFFERED,
+    // Extension of the candidate's FIRST deal — again at any status, and for every extension in
+    // the run (1st, 2nd, 3rd ... all read EXTENSION).
+    value: EXT_OR_REHIRE_VALUES.EXTENSION,
     js: (f) => f.dealType === "EXTENSION",
     sql: "deal_type = 'EXTENSION'",
   },
   {
-    // Wins over REHIRED: once the new client's deal is extended it is an EXTENSION parent, and the
-    // rehire is still readable from the extension rows below it.
-    value: EXTENSION_REHIRE_VALUES.EXTENSION,
-    js: (f) => f.dealType === "DEAL" && Number(f.generationExtensionCount) > 0,
-    sql: "deal_type = 'DEAL' AND generation_extension_count > 0",
+    // Repeat deal that has started (STARTED / ACTIVE / ENDED / ENDED<30 — sticky, so it never
+    // falls back to REOFFERED once started).
+    value: EXT_OR_REHIRE_VALUES.REBOOKED,
+    js: (f) => f.dealType === "DEAL" && f.isRepeatDeal === true && f.everStarted === true,
+    sql: "deal_type = 'DEAL' AND is_repeat_deal AND ever_started",
   },
   {
-    value: EXTENSION_REHIRE_VALUES.REHIRED,
-    js: (f) => f.dealType === "DEAL" && f.hasPriorOtherClient === true,
-    sql: "deal_type = 'DEAL' AND has_prior_other_client",
+    // Repeat deal not started yet (BOOKED / OFFERED).
+    value: EXT_OR_REHIRE_VALUES.REOFFERED,
+    js: (f) => f.dealType === "DEAL" && f.isRepeatDeal === true,
+    sql: "deal_type = 'DEAL' AND is_repeat_deal",
   },
+  // Everything else stays blank — most importantly the candidate's FIRST deal, whatever happens
+  // to it afterwards (being extended no longer stamps EXTENSION on the deal; that value now
+  // belongs to the extension rows).
 ]);
 
 /**
  * Pure classifier — the JS mirror of the generated SQL CASE.
- * @param {object} facts - see EXTENSION_REHIRE_RULES
+ * @param {object} facts - see EXT_OR_REHIRE_RULES
  * @returns {string|null} column value, or null when the row must stay blank
  */
 function classifyExtensionRehire(facts = {}) {
   const normalized = {
     dealType: normalizeKey(facts.dealType),
-    extensionRank: facts.extensionRank == null ? 0 : Number(facts.extensionRank),
     everStarted: facts.everStarted === true,
-    generationExtensionCount:
-      facts.generationExtensionCount == null ? 0 : Number(facts.generationExtensionCount),
-    hasPriorOtherClient: facts.hasPriorOtherClient === true,
+    isRepeatDeal: facts.isRepeatDeal === true,
+    parentIsRepeatDeal: facts.parentIsRepeatDeal === true,
   };
-  for (const rule of EXTENSION_REHIRE_RULES) {
+  for (const rule of EXT_OR_REHIRE_RULES) {
     if (rule.js(normalized)) return rule.value;
   }
   return null;
@@ -175,12 +186,12 @@ function sqlStringList(values) {
 
 /** candidate identity: nexus id, else email. NULL when neither is usable. */
 const CANDIDATE_KEY_SQL = `CASE
-        WHEN CANDIDATE_NEXUS_ID IS NOT NULL THEN CONCAT('nx:', CAST(CANDIDATE_NEXUS_ID AS STRING))
+        WHEN CANDIDATE_ID IS NOT NULL THEN CONCAT('nx:', CAST(CANDIDATE_ID AS STRING))
         WHEN NULLIF(LOWER(TRIM(CAST(CANDIDATE_EMAIL AS STRING))), '') IS NOT NULL
           THEN CONCAT('em:', LOWER(TRIM(CAST(CANDIDATE_EMAIL AS STRING))))
       END`;
 
-/** parent-client identity used for REHIRED (name only — the run-rate side has no CLIENT_ID). */
+/** parent-client identity used by the rehire rule (name only — run-rate has no CLIENT_ID). */
 const PARENT_CLIENT_KEY_SQL = `NULLIF(LOWER(TRIM(CAST(PARENT_CLIENT_NAME AS STRING))), '')`;
 
 /** SQL for the deal-sheet unit key; `alias` is the table alias holding DEAL_SHEET_ID/PLACEMENT_ID. */
@@ -194,14 +205,14 @@ function buildUnitKeySql(alias = "") {
 
 /** CASE expression producing the column value from the `units` CTE columns. */
 function buildExtensionRehireCaseSql(indent = "        ") {
-  const branches = EXTENSION_REHIRE_RULES.map(
+  const branches = EXT_OR_REHIRE_RULES.map(
     (rule) => `${indent}  WHEN ${rule.sql} THEN '${escapeSqlString(rule.value)}'`
   ).join("\n");
   return `CASE\n${branches}\n${indent}END`;
 }
 
 /**
- * Build the idempotent multi-statement job that recomputes EXTENSION_REHIRE on every row of every
+ * Build the idempotent multi-statement job that recomputes EXT_OR_REHIRE_BY_RMG on every row of every
  * deal sheet table. Statement order:
  *   1. ds_rows              — normalized union of the deal sheet tables (one row per stored row)
  *   2. ext_rehire_values    — one row per unit with its computed value (NULL = must be blank)
@@ -228,7 +239,7 @@ function buildExtensionRehireSql(options = {}) {
   const tableIds =
     Array.isArray(options.tableIds) && options.tableIds.length > 0
       ? [...options.tableIds]
-      : [...EXTENSION_REHIRE_TABLE_IDS];
+      : [...EXT_OR_REHIRE_TABLE_IDS];
   const runrateTableIds = Array.isArray(options.runrateTableIds)
     ? [...new Set(options.runrateTableIds.filter((t) => typeof t === "string" && t.trim() !== ""))]
     : [];
@@ -245,10 +256,11 @@ function buildExtensionRehireSql(options = {}) {
           WHEN CLIENT_ID IS NOT NULL THEN CONCAT('cid:', CAST(CLIENT_ID AS STRING))
           WHEN ${PARENT_CLIENT_KEY_SQL} IS NOT NULL THEN CONCAT('pc:', ${PARENT_CLIENT_KEY_SQL})
         END AS client_key,
+        NULLIF(TRIM(CAST(VMS_JOB_ID AS STRING)), '') AS vms_job_key,
         ${PARENT_CLIENT_KEY_SQL} AS parent_client_key,
-        COALESCE(START_DATE, TENTATIVE_DATE) AS start_key,
-        DATE_AND_TIME AS date_and_time,
-        ${EXTENSION_REHIRE_COLUMN} AS current_value
+        COALESCE(START_DATE, TENTATIVE_END_DATE) AS start_key,
+        LAST_UPDATED AS date_and_time,
+        ${EXT_OR_REHIRE_COLUMN} AS current_value
       FROM ${fqn(projectId, datasetId, tableId)}`
     )
     .join("\n      UNION ALL\n");
@@ -270,14 +282,14 @@ function buildExtensionRehireSql(options = {}) {
   const updates = tableIds
     .map(
       (tableId) => `UPDATE ${fqn(projectId, datasetId, tableId)} t
-SET ${EXTENSION_REHIRE_COLUMN} = v.value
+SET ${EXT_OR_REHIRE_COLUMN} = v.value
 FROM ext_rehire_values v
 WHERE v.unit_key = ${buildUnitKeySql("t")}
-  AND t.${EXTENSION_REHIRE_COLUMN} IS DISTINCT FROM v.value;`
+  AND t.${EXT_OR_REHIRE_COLUMN} IS DISTINCT FROM v.value;`
     )
     .join("\n\n");
 
-  const sql = `-- Recompute EXTENSION_REHIRE for every deal sheet row (idempotent; see extensionRehire.js).
+  const sql = `-- Recompute EXT_OR_REHIRE_BY_RMG for every deal sheet row (idempotent; see extensionRehire.js).
 CREATE TEMP TABLE ds_rows AS
   SELECT * FROM (
 ${dealSheetUnion}
@@ -292,7 +304,7 @@ CREATE TEMP TABLE ext_rehire_values AS
       unit_key,
       IFNULL(LOGICAL_OR(status_started), FALSE) AS ever_started,
       ARRAY_AGG(
-        STRUCT(deal_type, candidate_key, client_key, parent_client_key, start_key)
+        STRUCT(deal_type, candidate_key, client_key, vms_job_key, parent_client_key, start_key)
         ORDER BY date_and_time DESC NULLS LAST, table_id ASC
         LIMIT 1
       )[SAFE_OFFSET(0)] AS latest
@@ -307,71 +319,87 @@ CREATE TEMP TABLE ext_rehire_values AS
       latest.candidate_key AS candidate_key,
       latest.parent_client_key AS parent_client_key,
       latest.start_key AS start_key,
+      -- Chain = candidate + client + VMS job: which extensions belong to which deal. The VMS job
+      -- segment is dropped when the row has none, so those rows still chain on candidate+client.
       IF(
         latest.candidate_key IS NULL OR latest.client_key IS NULL,
         NULL,
-        CONCAT(latest.candidate_key, '|', latest.client_key)
+        CONCAT(
+          latest.candidate_key, '|', latest.client_key,
+          IF(latest.vms_job_key IS NULL, '', CONCAT('|vms:', latest.vms_job_key))
+        )
       ) AS chain_key
     FROM units
   ),
   candidate_history AS (
+    -- Prior placements for the candidate ANYWHERE. No parent-client filter: the repeat-deal rule
+    -- is client-agnostic, so a row with no parent client still counts as history.
     SELECT candidate_key, parent_client_key, start_key AS hist_start
     FROM units_flat
-    WHERE candidate_key IS NOT NULL AND parent_client_key IS NOT NULL
+    WHERE candidate_key IS NOT NULL
 ${runrateHistoryUnion}
   ),
-  rehire AS (
-    -- DEAL units whose candidate has an EARLIER placement at a different parent client.
-    SELECT u.unit_key, TRUE AS has_prior_other_client
+  repeat_deals AS (
+    -- A DEAL is a REPEAT when the candidate has ANY strictly earlier placement — same client or a
+    -- different one (deliberately client-agnostic, unlike the old rehire rule) — from the deal
+    -- sheet or the legacy run-rate tables.
+    SELECT u.unit_key, TRUE AS is_repeat_deal
     FROM units_flat u
     JOIN candidate_history h
       ON h.candidate_key = u.candidate_key
-     AND h.parent_client_key IS NOT NULL
-     AND h.parent_client_key != u.parent_client_key
      AND h.hist_start IS NOT NULL
-     AND (u.start_key IS NULL OR h.hist_start < u.start_key)
+     AND u.start_key IS NOT NULL
+     AND h.hist_start < u.start_key
     WHERE u.deal_type = 'DEAL'
       AND u.candidate_key IS NOT NULL
-      AND u.parent_client_key IS NOT NULL
     GROUP BY u.unit_key
   ),
-  generations AS (
-    -- Each DEAL opens a generation; extensions inherit the generation of the DEAL they follow.
-    -- Generation 0 = extensions of a placement whose DEAL is not in the deal sheet at all (run-rate
-    -- only), so its first extension is still the 1st extension.
+  deals_in_chain AS (
+    -- Every DEAL of a chain, tagged with whether it is a repeat, so extensions can inherit it.
     SELECT
-      unit_key,
-      ever_started,
-      deal_type,
-      chain_key,
-      start_key,
-      COUNTIF(deal_type = 'DEAL') OVER (
-        PARTITION BY chain_key
-        ORDER BY start_key ASC NULLS FIRST, IF(deal_type = 'DEAL', 0, 1) ASC, unit_key ASC
-        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-      ) AS deal_generation
-    FROM units_flat
-    WHERE chain_key IS NOT NULL
+      u.unit_key AS deal_unit_key,
+      u.chain_key,
+      u.start_key AS deal_start,
+      IFNULL(rd.is_repeat_deal, FALSE) AS is_repeat_deal
+    FROM units_flat u
+    LEFT JOIN repeat_deals rd USING (unit_key)
+    WHERE u.chain_key IS NOT NULL AND u.deal_type = 'DEAL'
+  ),
+  extension_parents AS (
+    -- Attach each EXTENSION to the newest DEAL of its chain starting at or before it. An extension
+    -- with no such DEAL here (the deal lives only in run-rate) gets no row and falls through to
+    -- FALSE below -> plain EXTENSION.
+    SELECT
+      e.unit_key,
+      ARRAY_AGG(d.is_repeat_deal ORDER BY d.deal_start DESC NULLS LAST, d.deal_unit_key DESC LIMIT 1)[
+        SAFE_OFFSET(0)
+      ] AS parent_is_repeat_deal
+    FROM units_flat e
+    JOIN deals_in_chain d
+      ON d.chain_key = e.chain_key
+     AND (
+       e.start_key IS NULL
+       OR d.deal_start IS NULL
+       OR d.deal_start <= e.start_key
+     )
+    WHERE e.deal_type = 'EXTENSION' AND e.chain_key IS NOT NULL
+    GROUP BY e.unit_key
   ),
   ranked AS (
     SELECT
-      unit_key,
-      ever_started,
-      deal_type,
-      ROW_NUMBER() OVER (
-        PARTITION BY chain_key, deal_generation, deal_type
-        ORDER BY start_key ASC NULLS FIRST, unit_key ASC
-      ) AS extension_rank,
-      COUNTIF(deal_type = 'EXTENSION') OVER (
-        PARTITION BY chain_key, deal_generation
-      ) AS generation_extension_count
-    FROM generations
+      u.unit_key,
+      u.ever_started,
+      u.deal_type,
+      IFNULL(rd.is_repeat_deal, FALSE) AS is_repeat_deal,
+      IFNULL(ep.parent_is_repeat_deal, FALSE) AS parent_is_repeat_deal
+    FROM units_flat u
+    LEFT JOIN repeat_deals rd USING (unit_key)
+    LEFT JOIN extension_parents ep USING (unit_key)
   )
   SELECT
-    r.unit_key,
+    unit_key,
     ${buildExtensionRehireCaseSql("    ")} AS value
-  FROM ranked r
-  LEFT JOIN rehire h USING (unit_key);
+  FROM ranked;
 
 -- Counted BEFORE the updates below, and always one row per table (0 when nothing changed) so an
 -- empty job result means "counts unavailable", never "nothing changed".
@@ -429,7 +457,7 @@ async function filterExistingTableIds(tableIds, options = {}, deps = {}) {
 }
 
 /**
- * Recompute EXTENSION_REHIRE across the deal sheet tables. Idempotent — steady state updates 0 rows.
+ * Recompute EXT_OR_REHIRE_BY_RMG across the deal sheet tables. Idempotent — steady state updates 0 rows.
  * @param {object} [options] - { projectId, datasetId, tableIds, runrateTableIds }
  * @param {object} deps - { queryFn(sql): Promise<object[]> }
  * @returns {Promise<{updated:number, byTable:Object<string,number>, runrateTableIds:string[]}>}
@@ -464,10 +492,10 @@ async function backfillExtensionRehire(options = {}, deps = {}) {
 }
 
 module.exports = {
-  EXTENSION_REHIRE_COLUMN,
-  EXTENSION_REHIRE_VALUES,
-  EXTENSION_REHIRE_TABLE_IDS,
-  EXTENSION_REHIRE_RULES,
+  EXT_OR_REHIRE_COLUMN,
+  EXT_OR_REHIRE_VALUES,
+  EXT_OR_REHIRE_TABLE_IDS,
+  EXT_OR_REHIRE_RULES,
   STARTED_PLACEMENT_STATUSES,
   RUNRATE_HISTORY_TABLE_IDS,
   isStartedPlacementStatus,

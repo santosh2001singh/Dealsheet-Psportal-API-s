@@ -1,10 +1,12 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
+const config = require("./config");
 const {
   applyExtensionStartDateForRow,
   applyExtensionDateFreeze,
   applyExtensionStartDatesForInsertRows,
+  hasBusinessColumnChanges,
 } = require("./bigQueryClient");
 const { resolveExtensionDateForExtensionRow } = require("./columnMappings");
 
@@ -51,19 +53,61 @@ test("applyExtensionStartDateForRow copies START_DATE for EXTENSION rows", () =>
 });
 
 test("applyExtensionDateFreeze keeps baseline EXTENSION_DATE when present", () => {
-  const frozen = applyExtensionDateFreeze(
-    { DEAL_TYPE: "EXTENSION", EXTENSION_DATE: null },
-    { EXTENSION_DATE: "2026-01-10T15:30:00.000Z" }
-  );
-  assert.equal(frozen.frozen, true);
-  assert.equal(frozen.row.EXTENSION_DATE, "2026-01-10T15:30:00.000Z");
+  const prev = config.extensionDateFreezeEnabled;
+  config.extensionDateFreezeEnabled = true;
+  try {
+    const frozen = applyExtensionDateFreeze(
+      { DEAL_TYPE: "EXTENSION", EXTENSION_DATE: null },
+      { EXTENSION_DATE: "2026-01-10T15:30:00.000Z" }
+    );
+    assert.equal(frozen.frozen, true);
+    assert.equal(frozen.row.EXTENSION_DATE, "2026-01-10T15:30:00.000Z");
 
-  const notFrozen = applyExtensionDateFreeze(
-    { DEAL_TYPE: "EXTENSION", EXTENSION_DATE: null },
-    { EXTENSION_DATE: null }
-  );
-  assert.equal(notFrozen.frozen, false);
-  assert.equal(notFrozen.row.EXTENSION_DATE, null);
+    const notFrozen = applyExtensionDateFreeze(
+      { DEAL_TYPE: "EXTENSION", EXTENSION_DATE: null },
+      { EXTENSION_DATE: null }
+    );
+    assert.equal(notFrozen.frozen, false);
+    assert.equal(notFrozen.row.EXTENSION_DATE, null);
+  } finally {
+    config.extensionDateFreezeEnabled = prev;
+  }
+});
+
+test("applyExtensionDateFreeze is skipped when EXTENSION_DATE_FREEZE_ENABLED is off", () => {
+  const prev = config.extensionDateFreezeEnabled;
+  config.extensionDateFreezeEnabled = false;
+  try {
+    const incoming = { DEAL_TYPE: "EXTENSION", EXTENSION_DATE: "2026-07-29T14:15:54.000Z" };
+    const out = applyExtensionDateFreeze(incoming, { EXTENSION_DATE: "2026-01-10T15:30:00.000Z" });
+    assert.equal(out.frozen, false);
+    assert.equal(out.row.EXTENSION_DATE, "2026-07-29T14:15:54.000Z");
+  } finally {
+    config.extensionDateFreezeEnabled = prev;
+  }
+});
+
+test("hasBusinessColumnChanges treats EXTENSION_DATE-only diff as change when freeze is off", () => {
+  const prev = config.extensionDateFreezeEnabled;
+  config.extensionDateFreezeEnabled = false;
+  try {
+    const baseline = {
+      DEAL_TYPE: "EXTENSION",
+      EXTENSION_DATE: "2026-01-10T15:30:00.000Z",
+      BILL_RATE: 50,
+    };
+    const incoming = {
+      DEAL_TYPE: "EXTENSION",
+      EXTENSION_DATE: "2026-07-29T14:15:54.000Z",
+      BILL_RATE: 50,
+    };
+    assert.equal(hasBusinessColumnChanges(incoming, baseline, new Set()), true);
+
+    config.extensionDateFreezeEnabled = true;
+    assert.equal(hasBusinessColumnChanges(incoming, baseline, new Set()), false);
+  } finally {
+    config.extensionDateFreezeEnabled = prev;
+  }
 });
 
 test("applyExtensionStartDatesForInsertRows sets EXTENSION_START_DATE only", () => {

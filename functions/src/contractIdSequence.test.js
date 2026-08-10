@@ -100,3 +100,30 @@ test("allocateContractIds returns empty for non-positive count", async () => {
     []
   );
 });
+
+// Phase 3 (Aug 2026): cynet health restarts at CHC23000. startValue only applies to a sequence doc
+// that does not exist yet — an existing doc's stored nextValue always wins. That is exactly why
+// changing config alone is not enough after a data reset, and why
+// scripts/resetContractIdSequences.js exists. These two tests pin both halves of that rule.
+test("a missing sequence doc starts at the configured startValue", async () => {
+  const firestore = createMockFirestore(null);
+  const ids = await allocateContractIds(2, {
+    docId: "cynet_health_deal_sheet",
+    prefix: "CHC",
+    startValue: 23000,
+    firestore,
+  });
+  assert.deepEqual(ids, ["CHC23000", "CHC23001"]);
+});
+
+test("an existing sequence doc ignores startValue and continues from its stored nextValue", async () => {
+  // Pre-reset counter still sitting in the CHC1000 range.
+  const firestore = createMockFirestore(1042);
+  const ids = await allocateContractIds(1, {
+    docId: "cynet_health_deal_sheet",
+    prefix: "CHC",
+    startValue: 23000,
+    firestore,
+  });
+  assert.deepEqual(ids, ["CHC1042"], "stored nextValue wins over startValue — reset the doc to move it");
+});

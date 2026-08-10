@@ -15,7 +15,7 @@ function moveReconResult(moves) {
       CANDIDATE_EMAIL: "caronephillips@gmail.com",
       CONTRACT_ID: "CHC1165",
       START_DATE: "2026-05-26",
-      TENTATIVE_DATE: "2026-08-22",
+      TENTATIVE_END_DATE: "2026-08-22",
     },
     moves,
   };
@@ -24,7 +24,7 @@ function moveReconResult(moves) {
 test("hierarchy move -> exactly two ownership rows (vacate old role NA, fill new role), dates populated", () => {
   const rows = buildOwnershipChangeLogRowsForHierarchyMoves(
     moveReconResult([
-      { fromRole: "TEAM_LEAD", toRole: "GRP_DIR_ASSOC_GRP_DIR", name: "Udit Sharma", empNoRaw: "CY4978", displacedName: null, displacedEmpNoRaw: null },
+      { fromRole: "TEAM_LEAD", toRole: "ASSOCIATE_DELIVERY_DIRECTOR", name: "Udit Sharma", empNoRaw: "CY4978", displacedName: null, displacedEmpNoRaw: null },
     ]),
     NOW
   );
@@ -36,7 +36,7 @@ test("hierarchy move -> exactly two ownership rows (vacate old role NA, fill new
   assert.equal(vacate.NEW_OWNER_NAME, "NA");
   assert.equal(vacate.NEW_OWNER_EMP_NO, "NA");
 
-  const fill = rows.find((r) => r.OWNERSHIP_ROLE === "GRP_DIR_ASSOC_GRP_DIR");
+  const fill = rows.find((r) => r.OWNERSHIP_ROLE === "ASSOCIATE_DELIVERY_DIRECTOR");
   assert.equal(fill.NEW_OWNER_NAME, "Udit Sharma");
   assert.equal(fill.NEW_OWNER_EMP_NO, "CY4978");
   assert.equal(fill.PREVIOUS_OWNER_NAME, "NA"); // target field was empty
@@ -46,7 +46,7 @@ test("hierarchy move -> exactly two ownership rows (vacate old role NA, fill new
   for (const r of rows) {
     assert.equal(r.START_DATE, "2026-05-26");
     assert.equal(r.END_DATE_PREVIOUS_OWNER, "2026-08-22"); // tentative date
-    assert.equal(r.EFFECTIVE_DATE, "2026-08-23");          // tentative + 1
+    assert.equal(r.OWNERSHIP_EFFECTIVE_DATE, "2026-08-23");          // tentative + 1
     assert.equal(r.CONTRACT_ID, "CHC1165");
     assert.equal(r.PLACEMENT_ID, "1456183");
   }
@@ -55,11 +55,11 @@ test("hierarchy move -> exactly two ownership rows (vacate old role NA, fill new
 test("collision move -> fill row's PREVIOUS_OWNER is the displaced occupant (not NA)", () => {
   const rows = buildOwnershipChangeLogRowsForHierarchyMoves(
     moveReconResult([
-      { fromRole: "TEAM_LEAD", toRole: "GRP_DIR_ASSOC_GRP_DIR", name: "Udit Sharma", empNoRaw: "CY4978", displacedName: "Amandeep Singh", displacedEmpNoRaw: "CY1753" },
+      { fromRole: "TEAM_LEAD", toRole: "ASSOCIATE_DELIVERY_DIRECTOR", name: "Udit Sharma", empNoRaw: "CY4978", displacedName: "Amandeep Singh", displacedEmpNoRaw: "CY1753" },
     ]),
     NOW
   );
-  const fill = rows.find((r) => r.OWNERSHIP_ROLE === "GRP_DIR_ASSOC_GRP_DIR");
+  const fill = rows.find((r) => r.OWNERSHIP_ROLE === "ASSOCIATE_DELIVERY_DIRECTOR");
   assert.equal(fill.PREVIOUS_OWNER_NAME, "Amandeep Singh");
   assert.equal(fill.PREVIOUS_OWNER_EMP_NO, "CY1753");
   assert.equal(fill.NEW_OWNER_NAME, "Udit Sharma");

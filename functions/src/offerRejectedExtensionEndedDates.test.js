@@ -10,7 +10,7 @@ test("rowNeedsOfferRejectedExtensionEndedDates: EXTENSION + DID NOT ACCEPT/START
   const base = {
     DEAL_TYPE: "EXTENSION",
     PLACEMENT_STATUS: "DID NOT ACCEPT",
-    CANDIDATE_NEXUS_ID: 25212370,
+    CANDIDATE_ID: 25212370,
     PLACEMENT_ID: 1462609,
     PARENT_CLIENT_NAME: "NYC Health + Hospitals",
   };
@@ -19,7 +19,7 @@ test("rowNeedsOfferRejectedExtensionEndedDates: EXTENSION + DID NOT ACCEPT/START
   assert.equal(rowNeedsOfferRejectedExtensionEndedDates({ ...base, DEAL_TYPE: "DEAL" }), false);
   assert.equal(rowNeedsOfferRejectedExtensionEndedDates({ ...base, PLACEMENT_STATUS: "STARTED" }), false);
   assert.equal(rowNeedsOfferRejectedExtensionEndedDates({ ...base, PARENT_CLIENT_NAME: "" }), false);
-  assert.equal(rowNeedsOfferRejectedExtensionEndedDates({ ...base, CANDIDATE_NEXUS_ID: null }), false);
+  assert.equal(rowNeedsOfferRejectedExtensionEndedDates({ ...base, CANDIDATE_ID: null }), false);
 });
 
 test("applyOfferRejectedExtensionEndedDatesForInsertRows: overrides START_DATE/END_DATE from matched ENDED placement", async () => {
@@ -27,14 +27,14 @@ test("applyOfferRejectedExtensionEndedDatesForInsertRows: overrides START_DATE/E
     {
       DEAL_TYPE: "EXTENSION",
       PLACEMENT_STATUS: "DID NOT ACCEPT",
-      CANDIDATE_NEXUS_ID: 25212370,
+      CANDIDATE_ID: 25212370,
       PLACEMENT_ID: 1462609,
       PARENT_CLIENT_NAME: "NYC Health + Hospitals",
       START_DATE: "2026-07-05",
       END_DATE: "2026-07-05",
     },
     // ineligible (STARTED) -> untouched
-    { DEAL_TYPE: "EXTENSION", PLACEMENT_STATUS: "STARTED", CANDIDATE_NEXUS_ID: 1, PLACEMENT_ID: 2, PARENT_CLIENT_NAME: "X", START_DATE: "2026-01-01" },
+    { DEAL_TYPE: "EXTENSION", PLACEMENT_STATUS: "STARTED", CANDIDATE_ID: 1, PLACEMENT_ID: 2, PARENT_CLIENT_NAME: "X", START_DATE: "2026-01-01" },
   ];
   const fetchFn = async (eligible) => {
     assert.equal(eligible.length, 1);
@@ -52,7 +52,7 @@ test("applyOfferRejectedExtensionEndedDatesForInsertRows: no match -> row unchan
     {
       DEAL_TYPE: "EXTENSION",
       PLACEMENT_STATUS: "DID NOT START",
-      CANDIDATE_NEXUS_ID: 999,
+      CANDIDATE_ID: 999,
       PLACEMENT_ID: 3,
       PARENT_CLIENT_NAME: "Y",
       START_DATE: "2026-07-05",
@@ -68,7 +68,7 @@ test("applyOfferRejectedExtensionEndedDatesForInsertRows: no match -> row unchan
 test("applyOfferRejectedExtensionEndedDatesForInsertRows: no eligible rows -> fetch never called", async () => {
   let called = false;
   const fetchFn = async () => { called = true; return new Map(); };
-  const rows = [{ DEAL_TYPE: "DEAL", PLACEMENT_STATUS: "STARTED", CANDIDATE_NEXUS_ID: 1, PLACEMENT_ID: 1, PARENT_CLIENT_NAME: "X" }];
+  const rows = [{ DEAL_TYPE: "DEAL", PLACEMENT_STATUS: "STARTED", CANDIDATE_ID: 1, PLACEMENT_ID: 1, PARENT_CLIENT_NAME: "X" }];
   const out = await applyOfferRejectedExtensionEndedDatesForInsertRows(rows, {}, { fetchFn });
   assert.equal(called, false);
   assert.equal(out[0].PLACEMENT_STATUS, "STARTED");

@@ -3,10 +3,13 @@ const assert = require("node:assert/strict");
 
 const {
   EXTENSION_RUNRATE_HIERARCHY_COLUMNS,
+  EXTENSION_RUNRATE_MANUAL_COLUMNS,
   EXTENSION_RUNRATE_ELIGIBLE_PLACEMENT_STATUSES,
   isExtensionRunrateEligiblePlacementStatus,
   buildRunrateEligiblePlacementStatusSqlPredicate,
   EXTENSION_PARENT_DEAL_INHERIT_COLUMNS,
+  SQL_CANDIDATE_EMAIL_NORM,
+  SQL_PHONE_NUMBER_NORM,
   rowNeedsExtensionInsertBackfill,
   rowNeedsExtensionRunrateBackfill,
   applyExtensionInheritForInsertRows,
@@ -17,6 +20,16 @@ const {
 const noContractIdResolution = async () => new Map();
 const noParentFetch = async () => new Map();
 const noPriorExtensionFetch = async () => new Map();
+
+test("SQL identity norms TRIM email and phone (both sides of EXTENSION parent/prior/contract joins)", () => {
+  assert.equal(SQL_CANDIDATE_EMAIL_NORM, "LOWER(TRIM(IFNULL(CANDIDATE_EMAIL, '')))");
+  assert.equal(SQL_PHONE_NUMBER_NORM, "TRIM(IFNULL(CELL_PHONE, ''))");
+  assert.match(SQL_CANDIDATE_EMAIL_NORM, /TRIM/);
+  assert.match(SQL_PHONE_NUMBER_NORM, /TRIM/);
+  // Guard against regressing to the pre-fix untrimmed forms that dropped parent matches.
+  assert.notEqual(SQL_CANDIDATE_EMAIL_NORM, "LOWER(IFNULL(CANDIDATE_EMAIL, ''))");
+  assert.notEqual(SQL_PHONE_NUMBER_NORM, "IFNULL(CELL_PHONE, '')");
+});
 
 test("EXTENSION_RUNRATE_ELIGIBLE_PLACEMENT_STATUSES allows only STARTED, BOOKED, ENDED, ENDED<30", () => {
   assert.deepEqual([...EXTENSION_RUNRATE_ELIGIBLE_PLACEMENT_STATUSES], [
@@ -50,7 +63,7 @@ test("isExtensionRunrateEligiblePlacementStatus excludes DID NOT START, DID NOT 
   assert.equal(isExtensionRunrateEligiblePlacementStatus(""), false);
 });
 
-test("EXTENSION_RUNRATE_HIERARCHY_COLUMNS excludes recruiter identity fields", () => {
+test("EXTENSION_RUNRATE_HIERARCHY_COLUMNS excludes assignment-recruiter identity fields", () => {
   const excluded = [
     "ASSIGNMENT_RECRUITER",
     "ASSIGNMENT_RECRUITER_EMAIL",
@@ -67,24 +80,51 @@ test("EXTENSION_RUNRATE_HIERARCHY_COLUMNS excludes recruiter identity fields", (
   }
 });
 
-test("EXTENSION_PARENT_DEAL_INHERIT_COLUMNS includes hierarchy and *_EMP_NO but not recruiter identity", () => {
+test("EXTENSION_RUNRATE_MANUAL_COLUMNS covers sales/credentialing/payment + SECONDARY_RECRUITER", () => {
+  const expected = [
+    "CLIENT_RECRUITER",
+    "CREDENTIALING_SPECIALIST",
+    "CREDENTIALING_LEAD",
+    "PRIMARY_SALES_PERSON",
+    "SECONDARY_SALES_PERSON",
+    "RECRUITMENT_MENTOR",
+    "INVOICE_CYCLE_TO_CLIENT",
+    "CLIENT_PAYMENT_TERMS",
+    "CANDIDATE_PAYMENT_TERMS",
+    "SECONDARY_RECRUITER",
+    "SECONDARY_RECRUITER_EMP_NO",
+  ];
+  assert.deepEqual([...EXTENSION_RUNRATE_MANUAL_COLUMNS], expected);
+  assert.equal(EXTENSION_RUNRATE_MANUAL_COLUMNS.includes("ASSIGNMENT_RECRUITER"), false);
+  assert.equal(EXTENSION_RUNRATE_MANUAL_COLUMNS.includes("RECRUITER_CLUSTER_REGION"), false);
+});
+
+test("EXTENSION_PARENT_DEAL_INHERIT_COLUMNS includes hierarchy and ops fields but not assignment recruiter", () => {
   assert.equal(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes("TEAM_LEAD_EMP_NO"), true);
   assert.equal(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes("NEW_HIRE_DATE"), true);
+  assert.equal(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes("CLIENT_RECRUITER"), true);
+  assert.equal(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes("PRIMARY_SALES_PERSON"), true);
+  assert.equal(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes("SECONDARY_SALES_PERSON"), true);
+  assert.equal(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes("RECRUITMENT_MENTOR"), true);
+  assert.equal(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes("INVOICE_CYCLE_TO_CLIENT"), true);
+  assert.equal(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes("CLIENT_PAYMENT_TERMS"), true);
+  assert.equal(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes("CANDIDATE_PAYMENT_TERMS"), true);
   assert.equal(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes("ASSIGNMENT_RECRUITER"), false);
   assert.equal(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes("RECRUITER_ID"), false);
+  assert.equal(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes("RECRUITER_CLUSTER_REGION"), false);
 });
 
 test("rowNeedsExtensionInsertBackfill: EXTENSION rows with PLACEMENT_ID qualify even when CONTRACT_ID is set", () => {
   const base = {
     DEAL_TYPE: "EXTENSION",
     CONTRACT_ID: "CHC1001",
-    CANDIDATE_NEXUS_ID: 123,
+    CANDIDATE_ID: 123,
     PLACEMENT_ID: 456,
   };
   assert.equal(rowNeedsExtensionInsertBackfill(base), true);
   assert.equal(rowNeedsExtensionRunrateBackfill(base), true);
   assert.equal(rowNeedsExtensionInsertBackfill({ ...base, DEAL_TYPE: "DEAL" }), false);
-  assert.equal(rowNeedsExtensionInsertBackfill({ ...base, CANDIDATE_NEXUS_ID: null }), false);
+  assert.equal(rowNeedsExtensionInsertBackfill({ ...base, CANDIDATE_ID: null }), false);
   assert.equal(rowNeedsExtensionInsertBackfill({ ...base, PLACEMENT_ID: null }), false);
   assert.equal(rowNeedsExtensionInsertBackfill(null), false);
 });
@@ -92,7 +132,7 @@ test("rowNeedsExtensionInsertBackfill: EXTENSION rows with PLACEMENT_ID qualify 
 test("rowNeedsExtensionInsertBackfill: carried-forward update-append is never re-backfilled — protects a MOVE-vacated hierarchy field from flapping", () => {
   const base = {
     DEAL_TYPE: "EXTENSION",
-    CANDIDATE_NEXUS_ID: 123,
+    CANDIDATE_ID: 123,
     PLACEMENT_ID: 456,
   };
   assert.equal(rowNeedsExtensionInsertBackfill(base), true);
@@ -104,10 +144,10 @@ test("applyExtensionInheritForInsertRows fills from parent DEAL even when CONTRA
     {
       DEAL_TYPE: "EXTENSION",
       CONTRACT_ID: "CHC1001",
-      CANDIDATE_NEXUS_ID: 111,
+      CANDIDATE_ID: 111,
       CLIENT_ID: 55,
       PLACEMENT_ID: 999,
-      ORIGINAL_START_DATE: null,
+      INITIAL_START_DATE: null,
       NEW_HIRE_DATE: null,
       TEAM_LEAD_EMP_NO: null,
       ASSIGNMENT_RECRUITER: "Current Recruiter",
@@ -121,7 +161,7 @@ test("applyExtensionInheritForInsertRows fills from parent DEAL even when CONTRA
       [
         "999",
         {
-          ORIGINAL_START_DATE: "2025-05-27",
+          INITIAL_START_DATE: "2025-05-27",
           NEW_HIRE_DATE: "2025-04-16T00:00:00.000Z",
           TEAM_LEAD: "Jane Doe",
           TEAM_LEAD_EMP_NO: "EMP-TL-1",
@@ -141,7 +181,7 @@ test("applyExtensionInheritForInsertRows fills from parent DEAL even when CONTRA
   });
 
   assert.equal(out[0].CONTRACT_ID, "CHC1001");
-  assert.equal(out[0].ORIGINAL_START_DATE, "2025-05-27");
+  assert.equal(out[0].INITIAL_START_DATE, "2025-05-27");
   assert.equal(out[0].NEW_HIRE_DATE, "2025-04-16T00:00:00.000Z");
   assert.equal(out[0].TEAM_LEAD, "Jane Doe");
   assert.equal(out[0].TEAM_LEAD_EMP_NO, "EMP-TL-1");
@@ -154,23 +194,23 @@ test("applyExtensionInheritForInsertRows applies parent DEAL before runrate fall
     {
       DEAL_TYPE: "EXTENSION",
       CONTRACT_ID: null,
-      CANDIDATE_NEXUS_ID: 111,
+      CANDIDATE_ID: 111,
       CLIENT_ID: 55,
       PLACEMENT_ID: 999,
-      ORIGINAL_START_DATE: null,
+      INITIAL_START_DATE: null,
       NEW_HIRE_DATE: null,
       TEAM_LEAD: null,
     },
   ];
 
   const parentFetchFn = async () =>
-    new Map([["999", { ORIGINAL_START_DATE: "2025-05-27", NEW_HIRE_DATE: "2025-04-16T00:00:00.000Z" }]]);
+    new Map([["999", { INITIAL_START_DATE: "2025-05-27", NEW_HIRE_DATE: "2025-04-16T00:00:00.000Z" }]]);
   const runrateFetchFn = async () =>
     new Map([
       [
         "999",
         {
-          ORIGINAL_START_DATE: "2022-01-10",
+          INITIAL_START_DATE: "2022-01-10",
           TEAM_LEAD: "Runrate Lead",
         },
       ],
@@ -183,7 +223,7 @@ test("applyExtensionInheritForInsertRows applies parent DEAL before runrate fall
     resolveContractIdsFn: noContractIdResolution,
   });
 
-  assert.equal(out[0].ORIGINAL_START_DATE, "2025-05-27");
+  assert.equal(out[0].INITIAL_START_DATE, "2025-05-27");
   assert.equal(out[0].NEW_HIRE_DATE, "2025-04-16T00:00:00.000Z");
   assert.equal(out[0].TEAM_LEAD, "Runrate Lead");
 });
@@ -193,10 +233,10 @@ test("applyExtensionInheritForInsertRows: prior-extension tier wins over runrate
     {
       DEAL_TYPE: "EXTENSION",
       CONTRACT_ID: null,
-      CANDIDATE_NEXUS_ID: 111,
+      CANDIDATE_ID: 111,
       CLIENT_ID: 55,
       PLACEMENT_ID: 999,
-      ORIGINAL_START_DATE: null,
+      INITIAL_START_DATE: null,
       NEW_HIRE_DATE: null,
       SKU_NUMBER: null,
       TEAM_LEAD: null,
@@ -209,7 +249,7 @@ test("applyExtensionInheritForInsertRows: prior-extension tier wins over runrate
         "999",
         {
           CONTRACT_ID: "CHC1235",
-          ORIGINAL_START_DATE: "2022-03-01",
+          INITIAL_START_DATE: "2022-03-01",
           NEW_HIRE_DATE: "2022-03-01T00:00:00.000Z",
           SKU_NUMBER: "SKU-FROM-PRIOR-EXT",
           TEAM_LEAD: "Latest Extension Lead",
@@ -223,7 +263,7 @@ test("applyExtensionInheritForInsertRows: prior-extension tier wins over runrate
       [
         "999",
         {
-          ORIGINAL_START_DATE: "1999-01-01",
+          INITIAL_START_DATE: "1999-01-01",
           NEW_HIRE_DATE: "1999-01-01T00:00:00.000Z",
           SKU_NUMBER: "SKU-FROM-RUNRATE-SHOULD-NOT-WIN",
           TEAM_LEAD: "Runrate Lead Should Not Win",
@@ -240,7 +280,7 @@ test("applyExtensionInheritForInsertRows: prior-extension tier wins over runrate
   });
 
   assert.equal(out[0].CONTRACT_ID, "CHC1235");
-  assert.equal(out[0].ORIGINAL_START_DATE, "2022-03-01");
+  assert.equal(out[0].INITIAL_START_DATE, "2022-03-01");
   assert.equal(out[0].NEW_HIRE_DATE, "2022-03-01T00:00:00.000Z");
   assert.equal(out[0].SKU_NUMBER, "SKU-FROM-PRIOR-EXT");
   assert.equal(out[0].TEAM_LEAD, "Latest Extension Lead");
@@ -253,18 +293,18 @@ test("applyExtensionInheritForInsertRows: parent DEAL still wins over prior-exte
     {
       DEAL_TYPE: "EXTENSION",
       CONTRACT_ID: null,
-      CANDIDATE_NEXUS_ID: 111,
+      CANDIDATE_ID: 111,
       CLIENT_ID: 55,
       PLACEMENT_ID: 999,
-      ORIGINAL_START_DATE: null,
+      INITIAL_START_DATE: null,
       TEAM_LEAD: null,
     },
   ];
 
   const parentFetchFn = async () =>
-    new Map([["999", { ORIGINAL_START_DATE: "2025-05-27", TEAM_LEAD: "Parent Deal Lead" }]]);
+    new Map([["999", { INITIAL_START_DATE: "2025-05-27", TEAM_LEAD: "Parent Deal Lead" }]]);
   const priorExtensionFetchFn = async () =>
-    new Map([["999", { ORIGINAL_START_DATE: "2022-03-01", TEAM_LEAD: "Prior Extension Lead" }]]);
+    new Map([["999", { INITIAL_START_DATE: "2022-03-01", TEAM_LEAD: "Prior Extension Lead" }]]);
 
   const out = await applyExtensionInheritForInsertRows(rows, {}, {
     parentFetchFn,
@@ -273,7 +313,7 @@ test("applyExtensionInheritForInsertRows: parent DEAL still wins over prior-exte
     resolveContractIdsFn: noContractIdResolution,
   });
 
-  assert.equal(out[0].ORIGINAL_START_DATE, "2025-05-27");
+  assert.equal(out[0].INITIAL_START_DATE, "2025-05-27");
   assert.equal(out[0].TEAM_LEAD, "Parent Deal Lead");
 });
 
@@ -282,10 +322,10 @@ test("applyExtensionInheritForInsertRows: prior-extension tier never overwrites 
     {
       DEAL_TYPE: "EXTENSION",
       CONTRACT_ID: "CHC-ALREADY-SET",
-      CANDIDATE_NEXUS_ID: 111,
+      CANDIDATE_ID: 111,
       CLIENT_ID: 55,
       PLACEMENT_ID: 999,
-      ORIGINAL_START_DATE: "2020-01-01",
+      INITIAL_START_DATE: "2020-01-01",
       SKU_NUMBER: null,
     },
   ];
@@ -296,7 +336,7 @@ test("applyExtensionInheritForInsertRows: prior-extension tier never overwrites 
         "999",
         {
           CONTRACT_ID: "CHC1235",
-          ORIGINAL_START_DATE: "2022-03-01",
+          INITIAL_START_DATE: "2022-03-01",
           SKU_NUMBER: "SKU-FROM-PRIOR-EXT",
         },
       ],
@@ -310,7 +350,7 @@ test("applyExtensionInheritForInsertRows: prior-extension tier never overwrites 
   });
 
   assert.equal(out[0].CONTRACT_ID, "CHC-ALREADY-SET");
-  assert.equal(out[0].ORIGINAL_START_DATE, "2020-01-01");
+  assert.equal(out[0].INITIAL_START_DATE, "2020-01-01");
   assert.equal(out[0].SKU_NUMBER, "SKU-FROM-PRIOR-EXT");
 });
 
@@ -319,10 +359,10 @@ test("applyExtensionInheritForInsertRows fills empty date/hierarchy fields from 
     {
       DEAL_TYPE: "EXTENSION",
       CONTRACT_ID: null,
-      CANDIDATE_NEXUS_ID: 111,
+      CANDIDATE_ID: 111,
       CLIENT_ID: 55,
       PLACEMENT_ID: 999,
-      ORIGINAL_START_DATE: null,
+      INITIAL_START_DATE: null,
       NEW_HIRE_DATE: null,
       TEAM_LEAD: null,
       ASSIGNMENT_RECRUITER: "Current Recruiter",
@@ -337,7 +377,7 @@ test("applyExtensionInheritForInsertRows fills empty date/hierarchy fields from 
       [
         "999",
         {
-          ORIGINAL_START_DATE: "2022-01-10",
+          INITIAL_START_DATE: "2022-01-10",
           NEW_HIRE_DATE: "2022-01-10T00:00:00.000Z",
           TEAM_LEAD: "Jane Doe",
           ATL: "John Smith",
@@ -353,7 +393,7 @@ test("applyExtensionInheritForInsertRows fills empty date/hierarchy fields from 
     runrateFetchFn,
     resolveContractIdsFn: noContractIdResolution,
   });
-  assert.equal(out[0].ORIGINAL_START_DATE, "2022-01-10");
+  assert.equal(out[0].INITIAL_START_DATE, "2022-01-10");
   assert.equal(out[0].NEW_HIRE_DATE, "2022-01-10T00:00:00.000Z");
   assert.equal(out[0].TEAM_LEAD, "Jane Doe");
   assert.equal(out[0].ATL, "John Smith");
@@ -361,12 +401,162 @@ test("applyExtensionInheritForInsertRows fills empty date/hierarchy fields from 
   assert.equal(out[0].ASSIGNMENT_RECRUITER_EMAIL, "current.recruiter@cynetcorp.com");
 });
 
+test("applyExtensionInheritForInsertRows fills empty sales/credentialing/payment fields from runrate", async () => {
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      CONTRACT_ID: null,
+      CANDIDATE_ID: 111,
+      CLIENT_ID: 55,
+      PLACEMENT_ID: 999,
+      CLIENT_RECRUITER: null,
+      CREDENTIALING_SPECIALIST: null,
+      CREDENTIALING_LEAD: null,
+      PRIMARY_SALES_PERSON: null,
+      SECONDARY_SALES_PERSON: null,
+      RECRUITMENT_MENTOR: null,
+      INVOICE_CYCLE_TO_CLIENT: null,
+      CLIENT_PAYMENT_TERMS: null,
+      CANDIDATE_PAYMENT_TERMS: null,
+      SECONDARY_RECRUITER: null,
+      SECONDARY_RECRUITER_EMP_NO: null,
+    },
+  ];
+
+  const runrateFetchFn = async () =>
+    new Map([
+      [
+        "999",
+        {
+          CLIENT_RECRUITER: "Client Rec",
+          CREDENTIALING_SPECIALIST: "Cred Spec",
+          CREDENTIALING_LEAD: "Cred Lead",
+          PRIMARY_SALES_PERSON: "Primary Sales",
+          SECONDARY_SALES_PERSON: "Secondary Sales",
+          RECRUITMENT_MENTOR: "Mentor",
+          INVOICE_CYCLE_TO_CLIENT: "Net 30",
+          CLIENT_PAYMENT_TERMS: "Net 45",
+          CANDIDATE_PAYMENT_TERMS: "Weekly",
+          SECONDARY_RECRUITER: "Sec Rec",
+          SECONDARY_RECRUITER_EMP_NO: "CY9999",
+        },
+      ],
+    ]);
+
+  const out = await applyExtensionInheritForInsertRows(rows, {}, {
+    parentFetchFn: noParentFetch,
+    priorExtensionFetchFn: noPriorExtensionFetch,
+    runrateFetchFn,
+    resolveContractIdsFn: noContractIdResolution,
+  });
+
+  assert.equal(out[0].CLIENT_RECRUITER, "Client Rec");
+  assert.equal(out[0].CREDENTIALING_SPECIALIST, "Cred Spec");
+  assert.equal(out[0].CREDENTIALING_LEAD, "Cred Lead");
+  assert.equal(out[0].PRIMARY_SALES_PERSON, "Primary Sales");
+  assert.equal(out[0].SECONDARY_SALES_PERSON, "Secondary Sales");
+  assert.equal(out[0].RECRUITMENT_MENTOR, "Mentor");
+  assert.equal(out[0].INVOICE_CYCLE_TO_CLIENT, "Net 30");
+  assert.equal(out[0].CLIENT_PAYMENT_TERMS, "Net 45");
+  assert.equal(out[0].CANDIDATE_PAYMENT_TERMS, "Weekly");
+  assert.equal(out[0].SECONDARY_RECRUITER, "Sec Rec");
+  assert.equal(out[0].SECONDARY_RECRUITER_EMP_NO, "CY9999");
+});
+
+test("applyExtensionInheritForInsertRows does not overwrite non-empty manual ops fields from runrate", async () => {
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      CONTRACT_ID: null,
+      CANDIDATE_ID: 111,
+      CLIENT_ID: 55,
+      PLACEMENT_ID: 999,
+      CLIENT_RECRUITER: "Keep Me",
+      PRIMARY_SALES_PERSON: "Keep Sales",
+      SECONDARY_RECRUITER: "Keep Sec",
+    },
+  ];
+
+  const runrateFetchFn = async () =>
+    new Map([
+      [
+        "999",
+        {
+          CLIENT_RECRUITER: "Runrate Rec",
+          PRIMARY_SALES_PERSON: "Runrate Sales",
+          SECONDARY_RECRUITER: "Runrate Sec",
+          CREDENTIALING_LEAD: "Fill Empty",
+        },
+      ],
+    ]);
+
+  const out = await applyExtensionInheritForInsertRows(rows, {}, {
+    parentFetchFn: noParentFetch,
+    priorExtensionFetchFn: noPriorExtensionFetch,
+    runrateFetchFn,
+    resolveContractIdsFn: noContractIdResolution,
+  });
+
+  assert.equal(out[0].CLIENT_RECRUITER, "Keep Me");
+  assert.equal(out[0].PRIMARY_SALES_PERSON, "Keep Sales");
+  assert.equal(out[0].SECONDARY_RECRUITER, "Keep Sec");
+  assert.equal(out[0].CREDENTIALING_LEAD, "Fill Empty");
+});
+
+test("applyExtensionInheritForInsertRows: parent DEAL manual ops win over runrate", async () => {
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      CONTRACT_ID: null,
+      CANDIDATE_ID: 111,
+      CLIENT_ID: 55,
+      PLACEMENT_ID: 999,
+      CLIENT_RECRUITER: null,
+      PRIMARY_SALES_PERSON: null,
+      INVOICE_CYCLE_TO_CLIENT: null,
+    },
+  ];
+
+  const parentFetchFn = async () =>
+    new Map([
+      [
+        "999",
+        {
+          CLIENT_RECRUITER: "Parent Client Rec",
+          PRIMARY_SALES_PERSON: "Parent Sales",
+        },
+      ],
+    ]);
+  const runrateFetchFn = async () =>
+    new Map([
+      [
+        "999",
+        {
+          CLIENT_RECRUITER: "Runrate Client Rec",
+          PRIMARY_SALES_PERSON: "Runrate Sales",
+          INVOICE_CYCLE_TO_CLIENT: "Net 15",
+        },
+      ],
+    ]);
+
+  const out = await applyExtensionInheritForInsertRows(rows, {}, {
+    parentFetchFn,
+    priorExtensionFetchFn: noPriorExtensionFetch,
+    runrateFetchFn,
+    resolveContractIdsFn: noContractIdResolution,
+  });
+
+  assert.equal(out[0].CLIENT_RECRUITER, "Parent Client Rec");
+  assert.equal(out[0].PRIMARY_SALES_PERSON, "Parent Sales");
+  assert.equal(out[0].INVOICE_CYCLE_TO_CLIENT, "Net 15");
+});
+
 test("applyExtensionInheritForInsertRows also merges runrate-matched hierarchy *_EMP_NO fields (read straight from the run-rate table's own *_EMP_NO columns)", async () => {
   const rows = [
     {
       DEAL_TYPE: "EXTENSION",
       CONTRACT_ID: null,
-      CANDIDATE_NEXUS_ID: 111,
+      CANDIDATE_ID: 111,
       CLIENT_ID: 55,
       PLACEMENT_ID: 999,
       TEAM_LEAD: null,
@@ -404,11 +594,11 @@ test("applyExtensionInheritForInsertRows also merges runrate-matched hierarchy *
 test("applyExtensionInheritForInsertRows backfills SKU_NUMBER: parent DEAL wins, else runrate match", async () => {
   const rows = [
     // parent DEAL provides SKU -> parent wins over runrate
-    { DEAL_TYPE: "EXTENSION", CONTRACT_ID: null, CANDIDATE_NEXUS_ID: 1, CLIENT_ID: 5, PLACEMENT_ID: 111, SKU_NUMBER: null },
+    { DEAL_TYPE: "EXTENSION", CONTRACT_ID: null, CANDIDATE_ID: 1, CLIENT_ID: 5, PLACEMENT_ID: 111, SKU_NUMBER: null },
     // no parent match -> runrate SKU used
-    { DEAL_TYPE: "EXTENSION", CONTRACT_ID: null, CANDIDATE_NEXUS_ID: 2, CLIENT_ID: 6, PLACEMENT_ID: 222, SKU_NUMBER: null },
+    { DEAL_TYPE: "EXTENSION", CONTRACT_ID: null, CANDIDATE_ID: 2, CLIENT_ID: 6, PLACEMENT_ID: 222, SKU_NUMBER: null },
     // already set -> untouched
-    { DEAL_TYPE: "EXTENSION", CONTRACT_ID: null, CANDIDATE_NEXUS_ID: 3, CLIENT_ID: 7, PLACEMENT_ID: 333, SKU_NUMBER: "SKU-EXISTING" },
+    { DEAL_TYPE: "EXTENSION", CONTRACT_ID: null, CANDIDATE_ID: 3, CLIENT_ID: 7, PLACEMENT_ID: 333, SKU_NUMBER: "SKU-EXISTING" },
   ];
   const parentFetchFn = async () => new Map([["111", { SKU_NUMBER: "SKU-FROM-PARENT" }]]);
   const runrateFetchFn = async () =>
@@ -434,10 +624,10 @@ test("applyExtensionInheritForInsertRows never overwrites an existing value", as
     {
       DEAL_TYPE: "EXTENSION",
       CONTRACT_ID: null,
-      CANDIDATE_NEXUS_ID: 111,
+      CANDIDATE_ID: 111,
       CLIENT_ID: 55,
       PLACEMENT_ID: 999,
-      ORIGINAL_START_DATE: "2019-06-01",
+      INITIAL_START_DATE: "2019-06-01",
       NEW_HIRE_DATE: null,
       TEAM_LEAD: "Already Manually Set",
     },
@@ -448,7 +638,7 @@ test("applyExtensionInheritForInsertRows never overwrites an existing value", as
       [
         "999",
         {
-          ORIGINAL_START_DATE: "2022-01-10",
+          INITIAL_START_DATE: "2022-01-10",
           NEW_HIRE_DATE: "2022-01-10T00:00:00.000Z",
           TEAM_LEAD: "Jane Doe",
         },
@@ -461,15 +651,15 @@ test("applyExtensionInheritForInsertRows never overwrites an existing value", as
     runrateFetchFn,
     resolveContractIdsFn: noContractIdResolution,
   });
-  assert.equal(out[0].ORIGINAL_START_DATE, "2019-06-01");
+  assert.equal(out[0].INITIAL_START_DATE, "2019-06-01");
   assert.equal(out[0].TEAM_LEAD, "Already Manually Set");
   assert.equal(out[0].NEW_HIRE_DATE, "2022-01-10T00:00:00.000Z");
 });
 
 test("applyExtensionInheritForInsertRows skips non-EXTENSION rows", async () => {
   const rows = [
-    { DEAL_TYPE: "DEAL", CONTRACT_ID: null, CANDIDATE_NEXUS_ID: 1, PLACEMENT_ID: 1, ORIGINAL_START_DATE: null },
-    { DEAL_TYPE: "EXTENSION", CONTRACT_ID: "CHC1001", CANDIDATE_NEXUS_ID: 2, CLIENT_ID: 9, PLACEMENT_ID: 2, ORIGINAL_START_DATE: null },
+    { DEAL_TYPE: "DEAL", CONTRACT_ID: null, CANDIDATE_ID: 1, PLACEMENT_ID: 1, INITIAL_START_DATE: null },
+    { DEAL_TYPE: "EXTENSION", CONTRACT_ID: "CHC1001", CANDIDATE_ID: 2, CLIENT_ID: 9, PLACEMENT_ID: 2, INITIAL_START_DATE: null },
   ];
   let parentFetchCalled = false;
   let runrateFetchCalled = false;
@@ -477,7 +667,7 @@ test("applyExtensionInheritForInsertRows skips non-EXTENSION rows", async () => 
     parentFetchCalled = true;
     assert.equal(eligible.length, 1);
     assert.equal(eligible[0].PLACEMENT_ID, 2);
-    return new Map([["2", { ORIGINAL_START_DATE: "2024-01-01" }]]);
+    return new Map([["2", { INITIAL_START_DATE: "2024-01-01" }]]);
   };
   const runrateFetchFn = async () => {
     runrateFetchCalled = true;
@@ -486,8 +676,8 @@ test("applyExtensionInheritForInsertRows skips non-EXTENSION rows", async () => 
   const out = await applyExtensionInheritForInsertRows(rows, {}, { parentFetchFn, runrateFetchFn, priorExtensionFetchFn: noPriorExtensionFetch });
   assert.equal(parentFetchCalled, true);
   assert.equal(runrateFetchCalled, true);
-  assert.equal(out[0].ORIGINAL_START_DATE, null);
-  assert.equal(out[1].ORIGINAL_START_DATE, "2024-01-01");
+  assert.equal(out[0].INITIAL_START_DATE, null);
+  assert.equal(out[1].INITIAL_START_DATE, "2024-01-01");
 });
 
 test("applyExtensionInheritForInsertRows is a no-op when nothing matches (resolveContractIdsFn never called)", async () => {
@@ -495,10 +685,10 @@ test("applyExtensionInheritForInsertRows is a no-op when nothing matches (resolv
     {
       DEAL_TYPE: "EXTENSION",
       CONTRACT_ID: null,
-      CANDIDATE_NEXUS_ID: 111,
+      CANDIDATE_ID: 111,
       CLIENT_ID: 55,
       PLACEMENT_ID: 999,
-      ORIGINAL_START_DATE: null,
+      INITIAL_START_DATE: null,
     },
   ];
   let resolveCalled = false;
@@ -513,7 +703,7 @@ test("applyExtensionInheritForInsertRows is a no-op when nothing matches (resolv
     runrateFetchFn,
     resolveContractIdsFn,
   });
-  assert.equal(out[0].ORIGINAL_START_DATE, null);
+  assert.equal(out[0].INITIAL_START_DATE, null);
   assert.equal(resolveCalled, false);
 });
 
@@ -522,22 +712,22 @@ test("applyExtensionInheritForInsertRows fills CONTRACT_ID from resolveContractI
     {
       DEAL_TYPE: "EXTENSION",
       CONTRACT_ID: null,
-      CANDIDATE_NEXUS_ID: 111,
+      CANDIDATE_ID: 111,
       CLIENT_ID: 55,
       PLACEMENT_ID: 999,
-      ORIGINAL_START_DATE: null,
+      INITIAL_START_DATE: null,
     },
     {
       DEAL_TYPE: "EXTENSION",
       CONTRACT_ID: null,
-      CANDIDATE_NEXUS_ID: 222,
+      CANDIDATE_ID: 222,
       CLIENT_ID: 66,
       PLACEMENT_ID: 888,
-      ORIGINAL_START_DATE: null,
+      INITIAL_START_DATE: null,
     },
   ];
 
-  const runrateFetchFn = async () => new Map([["999", { ORIGINAL_START_DATE: "2022-01-10" }]]);
+  const runrateFetchFn = async () => new Map([["999", { INITIAL_START_DATE: "2022-01-10" }]]);
   let receivedPlacementIds = null;
   const resolveContractIdsFn = async (matchedRows) => {
     receivedPlacementIds = matchedRows.map((r) => r.PLACEMENT_ID);
@@ -560,67 +750,188 @@ test("applyExtensionRunrateBackfillForInsertRows remains an alias for applyExten
     {
       DEAL_TYPE: "EXTENSION",
       CONTRACT_ID: "CHC1001",
-      CANDIDATE_NEXUS_ID: 111,
+      CANDIDATE_ID: 111,
       CLIENT_ID: 55,
       PLACEMENT_ID: 999,
-      ORIGINAL_START_DATE: null,
+      INITIAL_START_DATE: null,
     },
   ];
-  const parentFetchFn = async () => new Map([["999", { ORIGINAL_START_DATE: "2025-05-27" }]]);
+  const parentFetchFn = async () => new Map([["999", { INITIAL_START_DATE: "2025-05-27" }]]);
   const out = await applyExtensionRunrateBackfillForInsertRows(rows, {}, {
     parentFetchFn,
     priorExtensionFetchFn: noPriorExtensionFetch,
     runrateFetchFn: noParentFetch,
     resolveContractIdsFn: noContractIdResolution,
   });
-  assert.equal(out[0].ORIGINAL_START_DATE, "2025-05-27");
+  assert.equal(out[0].INITIAL_START_DATE, "2025-05-27");
 });
 
-test("resolveContractIdsForRunrateMatchedExtensions reuses an existing CONTRACT_ID before allocating a fresh one", async () => {
+// CONTRACT_ID is minted for DEAL_TYPE='DEAL' rows only (Aug 2026). A run-rate-matched EXTENSION can
+// REUSE an id from a prior row of the same candidate+client identity, but must never get a fresh
+// one — an EXTENSION with no originating DEAL is left null until its parent DEAL lands.
+test("resolveContractIdsForRunrateMatchedExtensions reuses an existing CONTRACT_ID", async () => {
   const rows = [
-    { PLACEMENT_ID: 1, CANDIDATE_NEXUS_ID: 111, CLIENT_ID: 55, CANDIDATE_EMAIL: "a@x.com", START_DATE: "2024-01-01" },
-    { PLACEMENT_ID: 2, CANDIDATE_NEXUS_ID: 222, CLIENT_ID: 66, CANDIDATE_EMAIL: "b@x.com", START_DATE: "2024-02-01" },
+    { PLACEMENT_ID: 1, CANDIDATE_ID: 111, CLIENT_ID: 55, CANDIDATE_EMAIL: "a@x.com", START_DATE: "2024-01-01" },
+    { PLACEMENT_ID: 2, CANDIDATE_ID: 222, CLIENT_ID: 66, CANDIDATE_EMAIL: "b@x.com", START_DATE: "2024-02-01" },
   ];
 
-  let allocateCalled = 0;
   const fetchContractIdsForExtensionsFn = async (lookupInput, opts) => {
     assert.equal(opts.includeExtensionSource, true);
     assert.equal(lookupInput.length, 2);
     return new Map([["1", "CHC5000"]]);
   };
-  const allocateContractIdsFn = async (count) => {
-    allocateCalled++;
-    return Array.from({ length: count }, (_, i) => `CHC${6000 + i}`);
-  };
-  const buildSequenceOptionsForTableFn = () => ({ docId: "cynet_health_deal_sheet", prefix: "CHC", startValue: 1000 });
 
   const out = await resolveContractIdsForRunrateMatchedExtensions(
     rows,
     { tableId: "cynet_health_deal_sheet" },
-    { fetchContractIdsForExtensionsFn, allocateContractIdsFn, buildSequenceOptionsForTableFn }
+    { fetchContractIdsForExtensionsFn }
   );
 
   assert.equal(out.get("1"), "CHC5000");
-  assert.equal(out.get("2"), "CHC6000");
-  assert.equal(allocateCalled, 1);
+  // Placement 2 had no prior id: left unresolved rather than freshly allocated.
+  assert.equal(out.has("2"), false);
+  assert.equal(out.size, 1);
 });
 
-test("resolveContractIdsForRunrateMatchedExtensions skips allocation when the table has no sequence config", async () => {
-  const rows = [{ PLACEMENT_ID: 1, CANDIDATE_NEXUS_ID: 111, CLIENT_ID: 55 }];
+test("resolveContractIdsForRunrateMatchedExtensions never allocates a fresh CONTRACT_ID", async () => {
+  const rows = [
+    { PLACEMENT_ID: 1, CANDIDATE_ID: 111, CLIENT_ID: 55, CANDIDATE_EMAIL: "a@x.com" },
+    { PLACEMENT_ID: 2, CANDIDATE_ID: 222, CLIENT_ID: 66, CANDIDATE_EMAIL: "b@x.com" },
+  ];
+  // Nothing to reuse anywhere.
   const fetchContractIdsForExtensionsFn = async () => new Map();
+
   let allocateCalled = false;
   const allocateContractIdsFn = async () => {
     allocateCalled = true;
-    return [];
+    return ["CHC9999"];
   };
-  const buildSequenceOptionsForTableFn = () => null;
+
+  const out = await resolveContractIdsForRunrateMatchedExtensions(
+    rows,
+    { tableId: "cynet_health_deal_sheet" },
+    { fetchContractIdsForExtensionsFn, allocateContractIdsFn }
+  );
+
+  assert.equal(out.size, 0);
+  assert.equal(allocateCalled, false, "EXTENSION rows must never mint a CONTRACT_ID");
+});
+
+test("resolveContractIdsForRunrateMatchedExtensions returns empty when nothing matches, regardless of table", async () => {
+  const rows = [{ PLACEMENT_ID: 1, CANDIDATE_ID: 111, CLIENT_ID: 55 }];
+  const fetchContractIdsForExtensionsFn = async () => new Map();
 
   const out = await resolveContractIdsForRunrateMatchedExtensions(
     rows,
     { tableId: "cynet_locums_deal_sheet" },
-    { fetchContractIdsForExtensionsFn, allocateContractIdsFn, buildSequenceOptionsForTableFn }
+    { fetchContractIdsForExtensionsFn }
   );
 
   assert.equal(out.size, 0);
-  assert.equal(allocateCalled, false);
+});
+
+// CONTRACT_ID is inherited from the matched run-rate row alongside SKU_NUMBER (Aug 2026) — both
+// describe the same original contract chain. Nothing mints an id for an EXTENSION; a run-rate row
+// with no CONTRACT_ID simply leaves the field null.
+test("runrate tier inherits CONTRACT_ID together with SKU_NUMBER", async () => {
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      CONTRACT_ID: null,
+      SKU_NUMBER: null,
+      CANDIDATE_ID: 111,
+      CLIENT_ID: 55,
+      PLACEMENT_ID: 999,
+    },
+  ];
+
+  const runrateFetchFn = async () =>
+    new Map([["999", { CONTRACT_ID: "CHC4242", SKU_NUMBER: "SKU-9", INITIAL_START_DATE: "2022-01-10" }]]);
+
+  const out = await applyExtensionInheritForInsertRows(rows, {}, {
+    parentFetchFn: async () => new Map(),
+    priorExtensionFetchFn: noPriorExtensionFetch,
+    runrateFetchFn,
+    resolveContractIdsFn: noContractIdResolution,
+  });
+
+  assert.equal(out[0].CONTRACT_ID, "CHC4242");
+  assert.equal(out[0].SKU_NUMBER, "SKU-9");
+});
+
+test("runrate tier leaves CONTRACT_ID null when the matched row has none", async () => {
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      CONTRACT_ID: null,
+      SKU_NUMBER: null,
+      CANDIDATE_ID: 111,
+      CLIENT_ID: 55,
+      PLACEMENT_ID: 999,
+    },
+  ];
+
+  // Sparsely populated run-rate row: SKU present, CONTRACT_ID absent.
+  const runrateFetchFn = async () =>
+    new Map([["999", { CONTRACT_ID: null, SKU_NUMBER: "SKU-9" }]]);
+
+  const out = await applyExtensionInheritForInsertRows(rows, {}, {
+    parentFetchFn: async () => new Map(),
+    priorExtensionFetchFn: noPriorExtensionFetch,
+    runrateFetchFn,
+    resolveContractIdsFn: noContractIdResolution,
+  });
+
+  assert.equal(out[0].SKU_NUMBER, "SKU-9");
+  assert.equal(out[0].CONTRACT_ID ?? null, null);
+});
+
+test("a parent DEAL's CONTRACT_ID outranks the runrate one", async () => {
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      CONTRACT_ID: null,
+      SKU_NUMBER: null,
+      CANDIDATE_ID: 111,
+      CLIENT_ID: 55,
+      PLACEMENT_ID: 999,
+    },
+  ];
+
+  const parentFetchFn = async () => new Map([["999", { CONTRACT_ID: "CHC1000", SKU_NUMBER: "SKU-PARENT" }]]);
+  const runrateFetchFn = async () =>
+    new Map([["999", { CONTRACT_ID: "CHC4242", SKU_NUMBER: "SKU-RUNRATE" }]]);
+
+  const out = await applyExtensionInheritForInsertRows(rows, {}, {
+    parentFetchFn,
+    priorExtensionFetchFn: noPriorExtensionFetch,
+    runrateFetchFn,
+    resolveContractIdsFn: noContractIdResolution,
+  });
+
+  assert.equal(out[0].CONTRACT_ID, "CHC1000");
+  assert.equal(out[0].SKU_NUMBER, "SKU-PARENT");
+});
+
+test("an already-set CONTRACT_ID is never overwritten by the runrate tier", async () => {
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      CONTRACT_ID: "CHC7777",
+      CANDIDATE_ID: 111,
+      CLIENT_ID: 55,
+      PLACEMENT_ID: 999,
+    },
+  ];
+
+  const runrateFetchFn = async () => new Map([["999", { CONTRACT_ID: "CHC4242" }]]);
+
+  const out = await applyExtensionInheritForInsertRows(rows, {}, {
+    parentFetchFn: async () => new Map(),
+    priorExtensionFetchFn: noPriorExtensionFetch,
+    runrateFetchFn,
+    resolveContractIdsFn: noContractIdResolution,
+  });
+
+  assert.equal(out[0].CONTRACT_ID, "CHC7777");
 });

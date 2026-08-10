@@ -4,21 +4,21 @@
 -- Populated by syncOwnershipChangeLogsFromBigQuery at the end of dealSheetSyncUpdateTrigger.
 -- The deal-sheet rows themselves are never modified by this scan.
 --
--- EFFECTIVE_DATE starts as the deal's TENTATIVE_DATE + 1 day (temporary). Once a real extension
--- exists for the same CONTRACT_ID, dealSheetSyncTrigger overwrites EFFECTIVE_DATE with that
+-- OWNERSHIP_EFFECTIVE_DATE starts as the deal's TENTATIVE_END_DATE + 1 day (temporary). Once a real extension
+-- exists for the same CONTRACT_ID, dealSheetSyncTrigger overwrites OWNERSHIP_EFFECTIVE_DATE with that
 -- extension's START_DATE (see overwriteOwnershipChangeLogEffectiveDatesFromExtensions).
 --
 -- Table already exists in BigQuery; the ALTER below adds the CONTRACT_ID column this feature needs.
 
 CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.ownership_change_logs` (
   ID STRING,
-  DATE_AND_TIME TIMESTAMP,
+  LAST_UPDATED TIMESTAMP,
   SKU_NO STRING,
   PLACEMENT_ID STRING,
   CANDIDATE_NAME STRING,
   CANDIDATE_EMAIL STRING,
   START_DATE DATE,
-  EFFECTIVE_DATE DATE,
+  OWNERSHIP_EFFECTIVE_DATE DATE,
   END_DATE_PREVIOUS_OWNER DATE,
   OWNERSHIP_ROLE STRING,
   NEW_OWNER_NAME STRING,

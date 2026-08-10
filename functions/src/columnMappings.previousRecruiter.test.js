@@ -73,7 +73,7 @@ test("applyPreviousRecruiterOnRecruiterChange: deal-sheet recruiter change -> ou
     {
       ASSIGNMENT_RECRUITER: "Sonam Chaudhary (R4A)",
       ASSIGNMENT_RECRUITER_EMAIL: "sonam.c@cynethealth.com",
-      TENTATIVE_DATE: "2026-06-08",
+      TENTATIVE_END_DATE: "2026-06-08",
     },
     {
       ASSIGNMENT_RECRUITER: "Shim Kashung (R2N)",

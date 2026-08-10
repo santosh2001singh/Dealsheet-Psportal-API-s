@@ -53,7 +53,7 @@ test("walks multiple inactive managers until an active one is found", () => {
     { name: "C", empNo: "3", designation: "Vice President - Delivery", status: "Active", immediateManager: null },
   ]);
   const res = resolveActiveOrManager("A", "RM", byName);
-  assert.deepEqual(res, { name: "C", empNo: "3", column: "VP_SRVP" });
+  assert.deepEqual(res, { name: "C", empNo: "3", column: "VP" });
 });
 
 test("entire manager chain inactive/unknown -> NA (null)", () => {
@@ -100,8 +100,8 @@ test("active person: output name prefers GOES_BY_NAME over EMPLOYEE_NAME", () =>
   ]);
   // Runrate provides the goes-by form; lookup key in this test is EMPLOYEE_NAME (buildByName keys by name),
   // so resolve by "Amrita Gupta" to reach the entry and assert the OUTPUT name is the goes-by form.
-  const res = resolveActiveOrManager("Amrita Gupta", "VP_SRVP", byName);
-  assert.deepEqual(res, { name: "Amy Gupta", empNo: "CY788", column: "VP_SRVP" });
+  const res = resolveActiveOrManager("Amrita Gupta", "VP", byName);
+  assert.deepEqual(res, { name: "Amy Gupta", empNo: "CY788", column: "VP" });
 });
 
 test("resolved active manager output name prefers GOES_BY_NAME", () => {
@@ -110,7 +110,7 @@ test("resolved active manager output name prefers GOES_BY_NAME", () => {
     { name: "Amrita Gupta", goesByName: "Amy Gupta", empNo: "CY788", designation: "Vice President - Delivery", status: "ACTIVE", immediateManager: null },
   ]);
   const res = resolveActiveOrManager("Neelesh Vijay", "RM", byName);
-  assert.deepEqual(res, { name: "Amy Gupta", empNo: "CY788", column: "VP_SRVP" });
+  assert.deepEqual(res, { name: "Amy Gupta", empNo: "CY788", column: "VP" });
 });
 
 test("fetchDepartmentEmployeesByNames keys ONLY by GOES_BY_NAME", async () => {

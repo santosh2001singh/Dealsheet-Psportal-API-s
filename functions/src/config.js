@@ -9,7 +9,7 @@ const config = {
   /** Default single-table target; domain-routed sync omits bq_table and ignores this for writes */
   tableId: process.env.BQ_TABLE || "cynet_health_deal_sheet",
   /**
-   * Historical run-rate source tables used to backfill ORIGINAL_START_DATE/NEW_HIRE_DATE/hierarchy
+   * Historical run-rate source tables used to backfill INITIAL_START_DATE/NEW_HIRE_DATE/hierarchy
    * on brand-new EXTENSION rows, one per domain (see recruiterDomainTables.resolveRunrateTableIdForDealSheetTable).
    */
   runrateTableId: process.env.RUNRATE_TABLE_ID || "all_CH_data_runrate",
@@ -80,6 +80,12 @@ const config = {
    */
   newHireDateFreezeEnabled: process.env.NEW_HIRE_DATE_FREEZE_ENABLED !== "false",
 
+  /**
+   * When false, EXTENSION_DATE is not frozen on update-append and EXTENSION EXTENSION_DATE diffs trigger append
+   * (one-time migration: set EXTENSION_DATE_FREEZE_ENABLED=false in Firebase env, run update sync, re-enable).
+   */
+  extensionDateFreezeEnabled: process.env.EXTENSION_DATE_FREEZE_ENABLED !== "false",
+
   /** Parent Firestore document for deal-sheet sync state (subcollections below) */
   firestoreWorkspace: {
     collection: process.env.FIRESTORE_WORKSPACE_COLLECTION || "workspaces",
@@ -94,9 +100,17 @@ const config = {
     checkpointKey: process.env.BACKFILL_CURSOR_KEY || "active-records-default",
   },
 
-  /** Per-table prefixed CONTRACT_ID config (CHC/CAC/LOC + sequence from 1000) */
+  /**
+   * Per-table prefixed CONTRACT_ID config (CHC/CAC/LOC + first sequence value).
+   *
+   * cynet health restarts at CHC23000 (Aug 2026) to leave the pre-reset CHC1000-range ids well
+   * behind; canada and locums keep their original 1000 start. NOTE: startValue only applies when
+   * the Firestore sequence doc does not exist yet — an existing doc's stored nextValue always wins
+   * (see allocateContractIds). After a data reset, delete or reset the doc as well, otherwise the
+   * old counter carries on: see sql/reset_contract_id_sequences.md.
+   */
   contractIdByTable: {
-    cynet_health_deal_sheet: { prefix: "CHC", startValue: 1000 },
+    cynet_health_deal_sheet: { prefix: "CHC", startValue: 23000 },
     cynet_health_canada_deal_sheet: { prefix: "CAC", startValue: 1000 },
     cynet_locums_deal_sheet: { prefix: "LOC", startValue: 1000 },
   },

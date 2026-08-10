@@ -63,13 +63,13 @@ Does **not** refresh existing deal sheets — use **`dealSheetSyncUpdateTrigger`
 Runs **hourly at :30** Eastern from **9:30 AM through 7:30 PM** (30 minutes after each insert trigger run).
 
 1. Loads one target per **`DEAL_SHEET_ID`** from all three active domain tables (latest row per deal sheet). Rows with null deal sheet use **`PLACEMENT_ID`** as fallback only.
-2. For each target (batched, env `DEAL_SHEET_UPDATE_TRIGGER_MAX_PAIRS` per run, default **500**): Nexus refresh by **deal sheet id** (or placement fallback) → enrich → compare **all business columns** to the **latest BigQuery row for that deal sheet** → **append** if different (ignores `ID`, `DATE_AND_TIME`, `IS_REJECTED`). Does not create first rows.
+2. For each target (batched, env `DEAL_SHEET_UPDATE_TRIGGER_MAX_PAIRS` per run, default **500**): Nexus refresh by **deal sheet id** (or placement fallback) → enrich → compare **all business columns** to the **latest BigQuery row for that deal sheet** → **append** if different (ignores `ID`, `LAST_UPDATED`, `IS_REJECTED`). Does not create first rows.
 3. Firestore checkpoint **`active-deal-sheet-update-cursor`** stores pair index when more composites remain; cleared after a full pass.
 4. Same **`START_DATE >= 2026-01-01`** rule as insert.
 
 ### 3. `dealSheetSyncOfferRejected` (HTTP — manual)
 
-Ended-style stream: submittals `EARLY_TERM,COMPLETED,CANCELLED,CANCELED` (override with `submittal_codes`), deal sheets **FINAL** only, **domain-routed ended** tables. **Placement filter** (after enrich): `DID NOT START`, `ENDED`, `ENDED<30`, `DID NOT ACCEPT`. **Tentative date:** `TENTATIVE_DATE >= 2026-05-01` (UTC). Logs each flush with prefix **`[offer-rejected-transform]`** (`enriched_in`, `after_placement_status_filter`, `after_tentative_date_filter`).
+Ended-style stream: submittals `EARLY_TERM,COMPLETED,CANCELLED,CANCELED` (override with `submittal_codes`), deal sheets **FINAL** only, **domain-routed ended** tables. **Placement filter** (after enrich): `DID NOT START`, `ENDED`, `ENDED<30`, `DID NOT ACCEPT`. **Tentative date:** `TENTATIVE_END_DATE >= 2026-05-01` (UTC). Logs each flush with prefix **`[offer-rejected-transform]`** (`enriched_in`, `after_placement_status_filter`, `after_tentative_date_filter`).
 
 **BigQuery behaviour (aligned with scheduled active sync):** `append_on_change_by_dealsheet`, `generated_uuid_field: ID`, same `compare_ignore_fields`, and **`first_insert_placement_status_allowlist`** = expanded active list (`STARTED`, `BOOKED`, `ENDED`, `ENDED<30`, `DID NOT START`, `DID NOT ACCEPT`). **`CONTRACT_ID` is always null** on ended inserts (`skip_contract_id`); prefixed Firestore allocation runs only on active insert (`dealSheetSyncTrigger` / manual `dealSheetSync` HTTP). Defaults: **`dedupe_by_placement_id=false`**, **`skip_did_not_accept_existing=false`** (pass `dedupe_by_placement_id=true` or `skip_did_not_accept_existing=true` if you need the older skip behaviour).
 
@@ -93,12 +93,12 @@ Active deal sheet inserts assign a **STRING** `CONTRACT_ID` per business line (n
 
 | BigQuery table | Prefix | First ID example |
 |---|---|---|
-| `cynet_health_deal_sheet` | `CHC` | `CHC1000` |
+| `cynet_health_deal_sheet` | `CHC` | `CHC23000` |
 | `cynet_health_canada_deal_sheet` | `CAC` | `CAC1000` |
 | `cynet_locums_deal_sheet` | `LOC` | `LOC1000` |
 
-- **DEAL** rows: new id from a per-table Firestore counter (`workspaces/run-rate-tool/contractIdSequences/{table_id}`, sequence starts at **1000**).
-- **EXTENSION** rows: reuse the matching DEAL’s `CONTRACT_ID` (in-batch or table-scoped BigQuery lookup).
+- **DEAL** rows only: new id from a per-table Firestore counter (`workspaces/run-rate-tool/contractIdSequences/{table_id}`). Health starts at **23000** (Aug 2026), canada/locums at **1000**. The counter follows config **only when the sequence doc does not exist** — after a data reset run `functions/scripts/resetContractIdSequences.js`, or the old range carries on.
+- **EXTENSION** rows: never mint an id — they inherit, fill-if-empty, in this order: parent DEAL row → prior EXTENSION in the same chain → matched run-rate row (alongside `SKU_NUMBER`) → table-scoped BigQuery reuse lookup. An extension with no resolvable source stays null until its parent DEAL lands.
 - **Ended** inserts: `CONTRACT_ID` remains null (`skip_contract_id`).
 
 **Firestore layout:** sync state lives under `workspaces/run-rate-tool`:
@@ -111,9 +111,9 @@ Override parent path via `FIRESTORE_WORKSPACE_COLLECTION` / `FIRESTORE_WORKSPACE
 
 **Clear values only (after STRING migration):** [`sql/migrate_contract_id_column.sql`](sql/migrate_contract_id_column.sql).
 
-## EXTENSION_REHIRE ("Extension/Rehire")
+## EXT_OR_REHIRE_BY_RMG ("Extension/Rehire")
 
-Derived column on all 6 domain deal sheet tables (active + ended). A BigQuery identifier cannot contain `/`, so the column is `EXTENSION_REHIRE`; the `/` only appears in a value.
+Derived column on all 6 domain deal sheet tables (active + ended). A BigQuery identifier cannot contain `/`, so the column is `EXT_OR_REHIRE_BY_RMG`; the `/` only appears in a value.
 
 | `DEAL_TYPE` | Value | When |
 |---|---|---|
@@ -124,7 +124,7 @@ Derived column on all 6 domain deal sheet tables (active + ended). A BigQuery id
 | `EXTENSION` | `REBOOKED` | 1st extension that started (stays `REBOOKED` once `ENDED` / `ENDED<30`) |
 | `EXTENSION` | `REBOOKED/EXTENSION` | 2nd+ extension of the same deal (extension on extension), whatever its placement status |
 
-- **Same client** = candidate (`CANDIDATE_NEXUS_ID`, else `CANDIDATE_EMAIL`) + client (`CLIENT_ID`, else `PARENT_CLIENT_NAME`) — the same identity `CONTRACT_ID` is allocated on, so it groups a DEAL with its EXTENSIONs exactly like `CONTRACT_ID` while also covering run-rate-only placements that have no parent DEAL row here.
+- **Same client** = candidate (`CANDIDATE_ID`, else `CANDIDATE_EMAIL`) + client (`CLIENT_ID`, else `PARENT_CLIENT_NAME`) — the same identity `CONTRACT_ID` is allocated on, so it groups a DEAL with its EXTENSIONs exactly like `CONTRACT_ID` while also covering run-rate-only placements that have no parent DEAL row here.
 - **Extension on extension** is counted per **deal generation**: each DEAL opens a generation, so a chain whose deal only exists in the legacy run-rate table still treats the first extension we hold as the 1st extension (`REOFFERED`/`REBOOKED`).
 - The deal sheet is append-only, so every row of one deal/extension event (`DEAL_SHEET_ID`, else `PLACEMENT_ID`) gets the same value, and the placement status is **sticky** — `STARTED` at any point in a unit's history wins.
 - Recomputed by an idempotent post-sync pass (`backfillExtensionRehireForDealSheets`, run from both scheduled triggers): a brand-new extension must flip its **parent DEAL** row from blank to `EXTENSION`, which no insert-time rule can do. Steady state updates 0 rows.
@@ -173,10 +173,23 @@ firebase deploy --only functions
 
 # Deploy specific function
 firebase deploy --only functions:dealSheetSync
-firebase deploy --only functions:dealSheetSyncTrigger
-firebase deploy --only functions:dealSheetSyncUpdateTrigger
 firebase deploy --only functions:dealSheetSyncOfferRejected
+
+# Scheduled sync is split per domain (health / canada / locums) so cynet health can stay live
+# while another domain is being worked on. Deploy one domain without touching the others:
+firebase deploy --only functions:dealSheetSyncTriggerHealth,functions:dealSheetSyncUpdateTriggerHealth
+firebase deploy --only functions:dealSheetSyncTriggerCanada,functions:dealSheetSyncUpdateTriggerCanada
+firebase deploy --only functions:dealSheetSyncTriggerLocums,functions:dealSheetSyncUpdateTriggerLocums
 ```
+
+**Schedules (America/New_York, hourly 8–19):** insert at :00 health / :10 canada / :20 locums, each
+followed ~30m later by its update at :30 / :40 / :50. Staggered so the three domains never run
+concurrently against the shared Nexus API budget.
+
+**After deploying:** the old `dealSheetSyncTrigger` and `dealSheetSyncUpdateTrigger` functions (and
+their Cloud Scheduler jobs) are gone from the codebase — delete the stale deployed functions with
+`firebase functions:delete dealSheetSyncTrigger dealSheetSyncUpdateTrigger`, or they will keep
+running on the old all-domains code path alongside the new per-domain ones.
 
 ## Performance Configuration
 

@@ -88,16 +88,23 @@ function mapClientToBq(client, parentClientName) {
       : null;
   const parentName = parentFromApi ?? facilityName;
   
+  // Independent facilities come back with parent_client null. Both parent columns then fall back to
+  // the client's own identity — PARENT_CLIENT_NAME to its name (above) and NEXUS_PARENT_CLIENT_ID to
+  // its id — so a facility is always its own parent rather than an unjoinable null.
   const rawParent = client?.parent_client;
   const rawParentId =
     rawParent != null && typeof rawParent === "object" && rawParent.id != null
       ? rawParent.id
       : rawParent;
   const parentIdNum = rawParentId == null || rawParentId === "" ? null : Number(rawParentId);
-  const nexusParentClientId = parentIdNum != null && Number.isFinite(parentIdNum) ? Math.trunc(parentIdNum) : null;
+  const parentIdFromApi =
+    parentIdNum != null && Number.isFinite(parentIdNum) ? Math.trunc(parentIdNum) : null;
+  const ownIdNum = client?.id == null || client.id === "" ? null : Number(client.id);
+  const ownId = ownIdNum != null && Number.isFinite(ownIdNum) ? Math.trunc(ownIdNum) : null;
+  const nexusParentClientId = parentIdFromApi ?? ownId;
   
   return {
-    END_CLIENT_DEPT_FACILITY: client.name ?? null,
+    FACILITY_NAME: client.name ?? null,
     CITY_ZIPCODE: cityZipcode,
     CLIENT_STATE: stateCode,
     REGION: region,
@@ -134,8 +141,8 @@ function mapDealSheetCandidateToBq(item, options = {}) {
   return {
     DEAL_SHEET_ID: truncId(dsStr),
     DEAL_SHEET_STATUS: dealSheetStatus,
-    NEXUS_INTERNAL_JOB_ID: truncId(jobStr),
-    CANDIDATE_NEXUS_ID: truncId(candStr),
+    INTERNAL_JOB_ID: truncId(jobStr),
+    CANDIDATE_ID: truncId(candStr),
     CLIENT_ID: truncId(cliStr),
   };
 }
@@ -178,10 +185,10 @@ function mapDealSheetDetailToBq(dealSheet) {
     DEAL_TYPE: dealSheet?.type ?? null,
     GP_PERCENTAGE: toNumberOrNull(dealSheet?.gross_margin_percentage),
     CLIENT_MSP_FEE: vmsFee == null ? null : vmsFee / 100,
-    ORIENTATION_HOURS: toNumberOrNull(dealSheet?.non_billable_orientation_hrs),
+    NBO_HOURS: toNumberOrNull(dealSheet?.non_billable_orientation_hrs),
     BILLABLE_ORIENTATION_HRS: toNumberOrNull(dealSheet?.billable_orientation_hrs),
     BILLABLE_ORIENTATION: formatBillableOrientationPercent(dealSheet?.billable_orientation),
-    INITIAL_PROJECT_DURATION_IN_WEEKS: toNumberOrNull(dealSheet?.job_duration),
+    PROJECT_DURATION: toNumberOrNull(dealSheet?.job_duration),
     VMS: dealSheetVmsDisplayValue(dealSheet),
   };
 }
@@ -294,7 +301,7 @@ function mapCandidateToBq(candidate) {
     CANDIDATE_NAME: name,
     CANDIDATE_STATUS: statusCode,
     CANDIDATE_EMAIL: candidateEmailFromContactInfo(candidate) ?? trimContactValue(candidate?.email),
-    PHONE_NUMBER: candidatePhoneFromContactInfo(candidate) ?? trimContactValue(candidate?.phone),
+    CELL_PHONE: candidatePhoneFromContactInfo(candidate) ?? trimContactValue(candidate?.phone),
   };
 }
 
@@ -472,7 +479,7 @@ function mapJobToBq(job) {
     VMS_JOB_ID: job?.ref_code ?? null,
     BILL_RATE: toNumberOrNull(job?.bill_rate),
     OFFER_TIME_START_DATE: formatDateStringForBq(job?.start_date) ?? null,
-    TENTATIVE_DATE: job ? tentativeDateFromJob(job) : null,
+    TENTATIVE_END_DATE: job ? tentativeDateFromJob(job) : null,
     END_DATE: computeBqEndDateFromJob(job),
     OFFERING: job?.offering ?? null,
     JOB_TYPE: job?.job_type ?? null,
@@ -515,17 +522,10 @@ function pickClientOfferingRowForJob(items, job) {
   return items[0];
 }
 
-function clientOfferingHasClientTypeText(row) {
-  if (!row || typeof row !== "object") return false;
-  const cst = row.client_setting_type;
-  return cst != null
-    && typeof cst === "object"
-    && cst.value != null
-    && String(cst.value).trim() !== "";
-}
-
 /**
- * Prefer embedded submittal client offerings; merge CLIENT_TYPE from API list when missing.
+ * Prefer embedded submittal client offerings; fall back to the API list when there are none.
+ * Used only for MSP_ID / MSP_NAME / LINE_OF_BUSINESS now — the old "merge client_setting_type from
+ * the API row when the embedded one lacks it" step went away with CLIENT_TYPE becoming manual.
  */
 function resolveClientOfferingForEnrich(submittalRow, clientOfferingsFromApi, job) {
   const embeddedClient = submittalRow?.client;
@@ -534,61 +534,27 @@ function resolveClientOfferingForEnrich(submittalRow, clientOfferingsFromApi, jo
     : [];
   const apiItems = Array.isArray(clientOfferingsFromApi) ? clientOfferingsFromApi : [];
 
-  let picked = embeddedItems.length > 0
-    ? pickClientOfferingRowForJob(embeddedItems, job)
-    : null;
-
-  if (picked && clientOfferingHasClientTypeText(picked)) {
-    return picked;
+  if (embeddedItems.length > 0) {
+    return pickClientOfferingRowForJob(embeddedItems, job);
   }
-
-  if (picked && apiItems.length > 0) {
-    const apiPicked = pickClientOfferingRowForJob(apiItems, job);
-    if (apiPicked && clientOfferingHasClientTypeText(apiPicked)) {
-      return { ...picked, client_setting_type: apiPicked.client_setting_type };
-    }
-  }
-
-  if (!picked && apiItems.length > 0) {
+  if (apiItems.length > 0) {
     return pickClientOfferingRowForJob(apiItems, job);
   }
-
-  return picked;
+  return null;
 }
 
 /**
- * Bucket a raw CLIENT_TYPE (e.g. "VMS", "State/Local Direct", "Federal VMS") into TYPE_OF_CLIENT.
- * Keyword-based so new variants map too. NOTE: "Goverment" spelling matches the business reference
- * table verbatim (their column value) — change the string here if the correct "Government" is wanted.
- * Unmatched non-empty types (VMS/Direct/Practice/…) default to "Commercial".
- */
-function mapClientTypeToTypeOfClient(clientType) {
-  if (clientType == null || String(clientType).trim() === "") return null;
-  const k = String(clientType).trim().toLowerCase();
-  if (k.includes("school")) return "School";
-  if (k.includes("federal")) return "Federal";
-  if (k.includes("state") || k.includes("local") || k.includes("goverment") || k.includes("government")) return "Goverment";
-  return "Commercial";
-}
-
-/**
- * Map MSP from client offering row
+ * Map MSP from client offering row.
+ * Deliberately does NOT emit CLIENT_TYPE / TYPE_OF_CLIENT — those became MANUAL_COLUMNS in Aug 2026
+ * and are owned by hand in BigQuery, so the enrich pipeline must leave them alone (see the note in
+ * MANUAL_COLUMNS). The offering row is still read here for MSP_ID / MSP_NAME / LINE_OF_BUSINESS.
  */
 function mapMspFromClientOfferingRow(row) {
   if (!row || typeof row !== "object") return {};
 
-  const cst = row.client_setting_type;
-  const clientType =
-    cst != null && typeof cst === "object" && cst.value != null
-      ? String(cst.value).trim() || null
-      : cst != null && typeof cst !== "object"
-        ? String(cst).trim() || null
-        : null;
-
   const msp = row.msp;
-  if (!msp || typeof msp !== "object") {
-    return { CLIENT_TYPE: clientType, TYPE_OF_CLIENT: mapClientTypeToTypeOfClient(clientType) };
-  }
+  if (!msp || typeof msp !== "object") return {};
+
   const mid = msp.id;
   const n = mid == null || mid === "" ? null : Number(mid);
   const name = msp.name != null ? String(msp.name).trim() || null : null;
@@ -597,8 +563,6 @@ function mapMspFromClientOfferingRow(row) {
     MSP_ID: n != null && Number.isFinite(n) ? Math.trunc(n) : null,
     MSP_NAME: name,
     LINE_OF_BUSINESS: name,
-    CLIENT_TYPE: clientType,
-    TYPE_OF_CLIENT: mapClientTypeToTypeOfClient(clientType),
   };
 }
 
@@ -614,10 +578,10 @@ function mapJobProfessionSpecialtyFromJob(job) {
   const specName = s != null && typeof s === "object" && s.name != null
     ? String(s.name).trim() || null : null;
   return {
-    CATEGORIZATION_OF_POSITION: profName,
-    CATEGORIZATION_OF_POSITION_ID: toIntOrNull(p?.id),
-    POSITION: specName,
-    POSITION_ID: toIntOrNull(s?.id),
+    PROFESSION: profName,
+    PROFESSION_ID: toIntOrNull(p?.id),
+    SPECIALTY: specName,
+    SPECIALTY_ID: toIntOrNull(s?.id),
   };
 }
 
@@ -656,7 +620,7 @@ function mapDealSheetRevenueDetailsToBq(revenueRow) {
   const grossMargin = toNumberOrNull(revenueRow.hourly_revenue);
   return {
     GP_PERCENTAGE: toNumberOrNull(revenueRow.gross_margin_percentage),
-    GROSS_MARGIN: grossMargin,
+    MARGIN: grossMargin,
   };
 }
 
@@ -688,10 +652,10 @@ function mapAdditionalCostLogRowsForDealSheet(addCostRows, contextRow, captureTi
       ? null
       : String(contextRow.START_DATE).trim()
   );
-  const tentativeDate = formatDateStringForBq(contextRow?.TENTATIVE_DATE) ?? (
-    contextRow?.TENTATIVE_DATE == null || String(contextRow.TENTATIVE_DATE).trim() === ""
+  const tentativeDate = formatDateStringForBq(contextRow?.TENTATIVE_END_DATE) ?? (
+    contextRow?.TENTATIVE_END_DATE == null || String(contextRow.TENTATIVE_END_DATE).trim() === ""
       ? null
-      : String(contextRow.TENTATIVE_DATE).trim()
+      : String(contextRow.TENTATIVE_END_DATE).trim()
   );
   const candidateName = contextRow?.CANDIDATE_NAME ?? null;
   const candidateEmail = contextRow?.CANDIDATE_EMAIL ?? null;
@@ -706,14 +670,14 @@ function mapAdditionalCostLogRowsForDealSheet(addCostRows, contextRow, captureTi
     if (lineId == null && name == null && toNumberOrNull(item?.value) == null) continue;
 
     out.push({
-      DATE_AND_TIME: ts,
+      LAST_UPDATED: ts,
       DEAL_SHEET_ID: dealSheetId,
       PLACEMENT_ID: placementId,
       CANDIDATE_NAME: candidateName,
       CANDIDATE_EMAIL: candidateEmail,
       ASSIGNMENT_RECRUITER_EMAIL: recruiterEmail,
       START_DATE: startDate,
-      TENTATIVE_DATE: tentativeDate,
+      TENTATIVE_END_DATE: tentativeDate,
       ADDITIONAL_COST_ID: lineId,
       ADDITIONAL_COST_NAME: name,
       CATEGORY:
@@ -757,10 +721,10 @@ function mapTravelAllowanceLogRowsForDealSheet(travelRows, contextRow, captureTi
       ? null
       : String(contextRow.START_DATE).trim()
   );
-  const tentativeDate = formatDateStringForBq(contextRow?.TENTATIVE_DATE) ?? (
-    contextRow?.TENTATIVE_DATE == null || String(contextRow.TENTATIVE_DATE).trim() === ""
+  const tentativeDate = formatDateStringForBq(contextRow?.TENTATIVE_END_DATE) ?? (
+    contextRow?.TENTATIVE_END_DATE == null || String(contextRow.TENTATIVE_END_DATE).trim() === ""
       ? null
-      : String(contextRow.TENTATIVE_DATE).trim()
+      : String(contextRow.TENTATIVE_END_DATE).trim()
   );
   const candidateName = contextRow?.CANDIDATE_NAME ?? null;
   const candidateEmail = contextRow?.CANDIDATE_EMAIL ?? null;
@@ -778,14 +742,14 @@ function mapTravelAllowanceLogRowsForDealSheet(travelRows, contextRow, captureTi
       `Last check amount: ${last == null ? "0" : last}`;
 
     out.push({
-      DATE_AND_TIME: ts,
+      LAST_UPDATED: ts,
       DEAL_SHEET_ID: dealSheetId,
       PLACEMENT_ID: placementId,
       CANDIDATE_NAME: candidateName,
       CANDIDATE_EMAIL: candidateEmail,
       ASSIGNMENT_RECRUITER_EMAIL: recruiterEmail,
       START_DATE: startDate,
-      TENTATIVE_DATE: tentativeDate,
+      TENTATIVE_END_DATE: tentativeDate,
       ADDITIONAL_COST_ID: lineId,
       ADDITIONAL_COST_NAME: "Travel Allowances",
       CATEGORY: "BONUS",
@@ -823,10 +787,10 @@ function mapClientCostLogRowsForDealSheet(clientCostRows, contextRow, captureTim
       ? null
       : String(contextRow.START_DATE).trim()
   );
-  const tentativeDate = formatDateStringForBq(contextRow?.TENTATIVE_DATE) ?? (
-    contextRow?.TENTATIVE_DATE == null || String(contextRow.TENTATIVE_DATE).trim() === ""
+  const tentativeDate = formatDateStringForBq(contextRow?.TENTATIVE_END_DATE) ?? (
+    contextRow?.TENTATIVE_END_DATE == null || String(contextRow.TENTATIVE_END_DATE).trim() === ""
       ? null
-      : String(contextRow.TENTATIVE_DATE).trim()
+      : String(contextRow.TENTATIVE_END_DATE).trim()
   );
   const candidateName = contextRow?.CANDIDATE_NAME ?? null;
   const candidateEmail = contextRow?.CANDIDATE_EMAIL ?? null;
@@ -840,14 +804,14 @@ function mapClientCostLogRowsForDealSheet(clientCostRows, contextRow, captureTim
     if (lineId == null && name == null && toNumberOrNull(item?.cost) == null) continue;
 
     out.push({
-      DATE_AND_TIME: ts,
+      LAST_UPDATED: ts,
       DEAL_SHEET_ID: dealSheetId,
       PLACEMENT_ID: placementId,
       CANDIDATE_NAME: candidateName,
       CANDIDATE_EMAIL: candidateEmail,
       ASSIGNMENT_RECRUITER_EMAIL: recruiterEmail,
       START_DATE: startDate,
-      TENTATIVE_DATE: tentativeDate,
+      TENTATIVE_END_DATE: tentativeDate,
       ADDITIONAL_COST_ID: lineId,
       ADDITIONAL_COST_NAME: name,
       CATEGORY:
@@ -1018,13 +982,13 @@ function computeDerivedPlacementFields(row) {
   }
 
   const payRate = toNumberOrNull(row?.PAY_RATE);
-  const typeVal = row?.TYPE == null ? null : String(row.TYPE).trim();
+  const typeVal = row?.PAYMENT_TYPE == null ? null : String(row.PAYMENT_TYPE).trim();
   const weeklyPerDiem = toNumberOrNull(row?.WEEKLY_PER_DIEM_NON_TAXED) ?? 0;
   const weeklyWalletMoney = toNumberOrNull(row?.WEEKLY_WALLET_MONEY) ?? 0;
   const scheduleHours1 = toNumberOrNull(row?.SCHEDULE_HOURS_1) ?? 0;
   const additionalBonus = toNumberOrNull(row?.ADDITIONAL_BONUS) ?? 0;
-  const orientationHours = toNumberOrNull(row?.ORIENTATION_HOURS) ?? 0;
-  const initialWeeks = toNumberOrNull(row?.INITIAL_PROJECT_DURATION_IN_WEEKS) ?? 0;
+  const orientationHours = toNumberOrNull(row?.NBO_HOURS) ?? 0;
+  const initialWeeks = toNumberOrNull(row?.PROJECT_DURATION) ?? 0;
   const billRate = toNumberOrNull(row?.BILL_RATE);
   const placementType = row?.PLACEMENT_TYPE == null ? "" : String(row.PLACEMENT_TYPE).trim().toUpperCase();
   const parentClientName = row?.PARENT_CLIENT_NAME == null ? "" : String(row.PARENT_CLIENT_NAME).trim();
@@ -1194,14 +1158,14 @@ function computeBqEndDateFromSubmittal(submittalRow, jobObj) {
   // DAYS_WORKED came out negative, and the change-gate saw the pre-override END_DATE differ from the
   // stored (overridden) one on every refresh, re-appending a 0-diff row forever.
   // For END_DATE the ACTUAL end lives on the SUBMITTAL (early-term / completion date) — the job
-  // carries only the planned/tentative end (which becomes TENTATIVE_DATE elsewhere). So the ended
+  // carries only the planned/tentative end (which becomes TENTATIVE_END_DATE elsewhere). So the ended
   // date is submittal-first, job as fallback.
   const startRaw = nonBlank(submittalRow?.start_date, jobObj?.start_date);
   const endedDate = nonBlank(submittalRow?.end_date, jobObj?.end_date);
 
   // END_DATE is populated ONLY once the placement has actually ended (ENDED / ENDED<30) — then it is
   // the submittal's real end date. While STARTED/BOOKED/ACTIVE it stays null (not ended yet); the
-  // planned end is captured as TENTATIVE_DATE, not END_DATE.
+  // planned end is captured as TENTATIVE_END_DATE, not END_DATE.
   if (isEnded) return formatDateStringForBq(endedDate);
   if (isCancelled) return formatDateStringForBq(startRaw); // DID NOT ACCEPT/START: never worked -> end = start
   if (isActiveBooked) return null;
@@ -1249,7 +1213,7 @@ function mapJobSubmittalToBq(submittalRow, jobObj) {
   const startRaw = firstNonEmptyDate(submittalRow?.start_date, jobObj?.start_date);
   const startDate =
     startRaw == null ? null : (formatDateStringForBq(startRaw) ?? String(startRaw).trim());
-  // TENTATIVE_DATE (planned/tentative end): the JOB's end_date ONLY — no submittal fallback (business
+  // TENTATIVE_END_DATE (planned/tentative end): the JOB's end_date ONLY — no submittal fallback (business
   // rule: tentative end comes from the job). Blank/absent job end_date -> null.
   const tentativeRaw = jobObj?.end_date;
   const tentativeDate = formatDateStringForBq(tentativeRaw) ?? (
@@ -1262,7 +1226,7 @@ function mapJobSubmittalToBq(submittalRow, jobObj) {
     SUBMISSION_DATE: submittedStr,
     PLACEMENT_STATUS: resolvePlacementStatusFromSubmittal(submittalRow, jobObj || null),
     START_DATE: startDate,
-    TENTATIVE_DATE: tentativeDate,
+    TENTATIVE_END_DATE: tentativeDate,
     END_DATE: computeBqEndDateFromSubmittal(submittalRow, jobObj || null),
   };
 }
@@ -1325,11 +1289,11 @@ const API_FLOAT_COLUMNS_DEFAULT_ZERO = [
   "CLIENT_CALL_BACK_RATE",
   "CLIENT_MSP_FEE",
   "WEEKLY_PER_DIEM_NON_TAXED",
-  "ORIENTATION_HOURS",
+  "NBO_HOURS",
   "BILLABLE_ORIENTATION_HRS",
-  "INITIAL_PROJECT_DURATION_IN_WEEKS",
+  "PROJECT_DURATION",
   "GP_PERCENTAGE",
-  "GROSS_MARGIN",
+  "MARGIN",
   "PO_HOURS",
   "TOTAL_BONUS_TAXABLE",
   "TOTAL_BONUS_NON_TAXABLE",
@@ -1377,7 +1341,7 @@ function isDidNotStartPlacementStatus(status) {
 }
 
 /**
- * TENTATIVE_DATE for enriched row: null when placement is DID NOT START.
+ * TENTATIVE_END_DATE for enriched row: null when placement is DID NOT START.
  * @param {string|null|undefined} placementStatus
  * @param {string|null|undefined} tentativeDate
  * @returns {string|null}
@@ -1509,7 +1473,7 @@ function mapTerminationReasonLogRowForDealSheet(apiItem, contextRow, captureTime
     return null;
   }
   return {
-    DATE_AND_TIME: ts,
+    LAST_UPDATED: ts,
     DEAL_SHEET_ID: toIntOrNull(contextRow?.DEAL_SHEET_ID),
     PLACEMENT_ID: toIntOrNull(contextRow?.PLACEMENT_ID),
     CONTRACT_ID: normalizeContractIdOrNull(contextRow?.CONTRACT_ID),
@@ -1527,7 +1491,7 @@ function mapTerminationReasonLogRowForDealSheet(apiItem, contextRow, captureTime
  * Manual fields are listed explicitly in MANUAL_COLUMNS.
  */
 const API_OWNED_COLUMNS = new Set([
-  "END_CLIENT_DEPT_FACILITY",
+  "FACILITY_NAME",
   "CITY_ZIPCODE",
   "CLIENT_STATE",
   "REGION",
@@ -1535,22 +1499,22 @@ const API_OWNED_COLUMNS = new Set([
   "PARENT_CLIENT_NAME",
   "DEAL_SHEET_ID",
   "DEAL_SHEET_STATUS",
-  "NEXUS_INTERNAL_JOB_ID",
-  "CANDIDATE_NEXUS_ID",
+  "INTERNAL_JOB_ID",
+  "CANDIDATE_ID",
   "CLIENT_ID",
   "WEEKLY_PER_DIEM_NON_TAXED",
   "DEAL_TYPE",
   "GP_PERCENTAGE",
   "CLIENT_MSP_FEE",
-  "ORIENTATION_HOURS",
+  "NBO_HOURS",
   "BILLABLE_ORIENTATION_HRS",
   "BILLABLE_ORIENTATION",
-  "INITIAL_PROJECT_DURATION_IN_WEEKS",
+  "PROJECT_DURATION",
   "VMS",
   "CANDIDATE_NAME",
   "CANDIDATE_STATUS",
   "CANDIDATE_EMAIL",
-  "PHONE_NUMBER",
+  "CELL_PHONE",
   "PROVIDER_TYPE",
   "RECRUITER_ID",
   "RECRUITER_EMP_NO",
@@ -1562,7 +1526,6 @@ const API_OWNED_COLUMNS = new Set([
   "ONSITE_AM_EMAIL",
   "VMS_JOB_ID",
   "START_DATE",
-  "OFFER_TIME_START_DATE",
   "END_DATE",
   "OFFERING",
   "JOB_TYPE",
@@ -1574,18 +1537,20 @@ const API_OWNED_COLUMNS = new Set([
   "MSP_ID",
   "MSP_NAME",
   "LINE_OF_BUSINESS",
-  "CLIENT_TYPE",
-  "TYPE_OF_CLIENT",
-  "CATEGORIZATION_OF_POSITION",
-  "CATEGORIZATION_OF_POSITION_ID",
-  "POSITION",
-  "POSITION_ID",
+  // CLIENT_TYPE / TYPE_OF_CLIENT are NOT here — they moved to MANUAL_COLUMNS (Aug 2026). They used
+  // to be enriched from the client offering's client_setting_type, but the offering pick could
+  // swing between syncs (offering/sub_offering match vs items[0] fallback), rewriting the values
+  // under the business. They are now hand-owned in BigQuery and frozen on every sync.
+  "PROFESSION",
+  "PROFESSION_ID",
+  "SPECIALTY",
+  "SPECIALTY_ID",
   "PO_HOURS",
   "SCHEDULE_HOURS_1",
   "SCHEDULE_HOURS_2",
   "REGULAR_HOURS_1",
   "REGULAR_HOURS_2",
-  "GROSS_MARGIN",
+  "MARGIN",
   "ADDITIONAL_BONUS",
   "RATE_CHANGE",
   "BILL_RATE",
@@ -1613,7 +1578,7 @@ const API_OWNED_COLUMNS = new Set([
   "FINAL_PAY_RATE_NEW",
   "FINAL_COST_NEW",
   "FINAL_BILL_RATE_NEW",
-  "NEW_MARGIN",
+  "CALCULATED_MARGIN",
   "TOTAL_BONUS_TAXABLE",
   "TOTAL_BONUS_NON_TAXABLE",
   "FIRST_WEEK_HOURS",
@@ -1624,32 +1589,40 @@ Object.freeze(API_OWNED_COLUMNS);
 
 /**
  * Columns written by the insert pipeline itself (never carried forward from baseline).
- * `ID` is generated per insert, `DATE_AND_TIME` is set at insert time,
+ * `ID` is generated per insert, `LAST_UPDATED` is set at insert time,
  * `IS_REJECTED` is reset by applyIsRejectedResetForChangedUpdate,
  * `MOVE_RUNRATE` is gated by applyMoveRunrateAppendOverride,
- * `TENTATIVE_DATE` is cleared when PLACEMENT_STATUS is DID NOT START; otherwise frozen by
+ * `TENTATIVE_END_DATE` is cleared when PLACEMENT_STATUS is DID NOT START; otherwise frozen by
  * applyTentativeDateFreeze (release on START_DATE change),
  * `NEW_HIRE_DATE` is set from job-submittal-notes (earliest BOOKED modified_date) for DEAL rows when baseline is empty;
  * EXTENSION rows are not set from API on enrich; once baseline has a value it is frozen on update-append (DEAL or EXTENSION)
  * unless `NEW_HIRE_DATE_FREEZE_ENABLED=false` (one-time migration to rewrite legacy insert-time stamps).
- * `EXTENSION_DATE` is earliest BOOKED job-submittal-note date for EXTENSION rows (TIMESTAMP); frozen once set.
+ * `EXTENSION_DATE` is earliest BOOKED job-submittal-note date for EXTENSION rows (TIMESTAMP); frozen once set
+ * unless `EXTENSION_DATE_FREEZE_ENABLED=false` (one-time migration to rewrite legacy submittal created_date stamps).
  * `EXTENSION_START_DATE` mirrors START_DATE for EXTENSION rows (null for DEAL); updates with START_DATE.
+ * `OFFER_TIME_START_DATE` is set from Nexus job.start_date on first insert / empty baseline; once baseline
+ * has a value it is frozen on update-append (DEAL or EXTENSION) even when START_DATE changes
+ * (applyOfferTimeStartDateFreeze) — never re-compared as API-owned.
  */
 const SYSTEM_CONTROLLED_COLUMNS = new Set([
   "ID",
-  "DATE_AND_TIME",
+  "LAST_UPDATED",
   "IS_REJECTED",
   "MOVE_RUNRATE",
-  "TENTATIVE_DATE",
+  "TENTATIVE_END_DATE",
   "NEW_HIRE_DATE",
   "EXTENSION_DATE",
   "EXTENSION_START_DATE",
+  "OFFER_TIME_START_DATE",
 ]);
 Object.freeze(SYSTEM_CONTROLLED_COLUMNS);
 
 /**
  * Manual BigQuery-edited columns (see sql/create_domain_deal_sheet_tables.sql).
  * Carried forward from baseline on update-append; never overwritten by Nexus enrich.
+ * Ops fields CLIENT_RECRUITER / CREDENTIALING_* / PRIMARY_SALES_PERSON / SECONDARY_SALES_PERSON /
+ * RECRUITMENT_MENTOR / INVOICE_CYCLE_TO_CLIENT / CLIENT_PAYMENT_TERMS / CANDIDATE_PAYMENT_TERMS / SECONDARY_RECRUITER*
+ * are intentionally frozen this way (fill-if-empty on first EXTENSION inherit only).
  * LEVEL_2_CSM/LEVEL_3_CSM/LEVEL_4_CSM are intentionally NOT here even though they used to be
  * manual — they're now recomputed on every insert from ONSITE_AM_EMAIL's manager chain (see
  * applyOnsiteAmCsmHierarchyForRows in bigQueryClient.js), so they must never be carried forward.
@@ -1675,13 +1648,20 @@ const MANUAL_COLUMNS = new Set([
   "BGC_CATEGORY3",
   "BGC_TOTAL_BGV_COST",
   "BOOKING_DATE",
-  "CAND_PYMT_TERMS",
+  "CANDIDATE_PAYMENT_TERMS",
+  // Client-side counterpart of RECRUITER_CLUSTER_REGION (was PLACEMENT_CLUSTER). Hand-edited only.
+  "CLIENT_CLUSTER_REGION",
   "CLIENT_CREATED_DATE",
   "CLIENT_NAME_IN_CONREP",
   "CLIENT_OWNER",
   "CLIENT_RECRUITER",
   "CLIENT_START_DATE",
-  "CLT_PYMT_TERM",
+  // CLIENT_TYPE + its derived bucket TYPE_OF_CLIENT: manual since Aug 2026 (previously enriched
+  // from the client offering's client_setting_type). Hand-edited in BigQuery and carried forward
+  // unchanged on every sync — the enrich pipeline no longer writes either column.
+  "CLIENT_TYPE",
+  "TYPE_OF_CLIENT",
+  "CLIENT_PAYMENT_TERMS",
   "COMMENTS",
   "CREDENTIALING_LEAD",
   "CREDENTIALING_SPECIALIST",
@@ -1699,19 +1679,19 @@ const MANUAL_COLUMNS = new Set([
   "CLIENT_DT_RATE",
   "EDIT_DATE",
   "EDITED_BY",
-  "EFFECTIVE_DATE",
+  "OWNERSHIP_EFFECTIVE_DATE",
   "ENTITY",
   // "Extension/Rehire" — derived, but owned by the post-sync recompute pass (extensionRehire.js), not
   // by enrich. Listed here only so an update-append carries the last computed value forward instead of
   // blanking the row until the next pass runs.
-  "EXTENSION_REHIRE",
+  "EXT_OR_REHIRE_BY_RMG",
   "FIFTYTWO_TENURE_CANDIDATE_STATUS",
   "FIFTYTWO_TENURE_RTO_LASTDATE",
   "GROUP_DIRECTOR",
-  "GRP_DIR_ASSOC_GRP_DIR",
-  "GRP_DIR_ASSOC_GRP_DIR_EMP_NO",
+  "ASSOCIATE_DELIVERY_DIRECTOR",
+  "ASSOCIATE_DELIVERY_DIRECTOR_EMP_NO",
   "HOURLY_GP",
-  "INV_CYC_TO_CLT",
+  "INVOICE_CYCLE_TO_CLIENT",
   "IS_DELETED",
   "ONB_CAND_DOB",
   "ONB_E_VERIFY",
@@ -1723,11 +1703,11 @@ const MANUAL_COLUMNS = new Set([
   "ONSITE_CLIENT_OWNER",
   "ONSITE_OWNER",
   "ONSITE_VP_AVP",
-  "ORIGINAL_START_DATE",
+  "INITIAL_START_DATE",
   "PAYLOCITY_ID",
   "PO_RECEIVED",
   "PRIMARY_SALES_PERSON",
-  "RECRUITER_CLUSTER",
+  "RECRUITER_CLUSTER_REGION",
   "RECRUITMENT_MENTOR",
   "REJECTION_REASON",
   "RM",
@@ -1739,15 +1719,18 @@ const MANUAL_COLUMNS = new Set([
   "SECONDARY_RECRUITER_EMP_NO",
   "SECONDARY_SALES_PERSON",
   "SKU_NUMBER",
+  // VP holds the combined VP/Sr. VP name resolved from the hierarchy; SR_VP is filled by hand when
+  // a separate Sr. VP is needed. Nothing derives it, so it stays manual and frozen.
+  "SR_VP",
   "ST_DT_PUSHBACK_REASON",
   "TEAM_LEAD",
   "TEAM_LEAD_EMP_NO",
-  "TYPE",
+  "PAYMENT_TYPE",
   "UPDATED_AT",
   "AVP",
   "AVP_EMP_NO",
-  "VP_SRVP",
-  "VP_SRVP_EMP_NO",
+  "VP",
+  "VP_EMP_NO",
   "WEEKLY_WALLET_MONEY",
   // Set only on a recruiter reassignment (applyPreviousRecruiterOnRecruiterChange, bigQueryClient.js);
   // otherwise carried forward from baseline like any manual column so the value persists.
@@ -1772,10 +1755,8 @@ module.exports = {
   mapDealSheetUsersToBq,
   mapJobToBq,
   pickClientOfferingRowForJob,
-  clientOfferingHasClientTypeText,
   resolveClientOfferingForEnrich,
   mapMspFromClientOfferingRow,
-  mapClientTypeToTypeOfClient,
   mapJobProfessionSpecialtyFromJob,
   mapDealSheetHoursDetailsToBq,
   mapDealSheetRevenueDetailsToBq,

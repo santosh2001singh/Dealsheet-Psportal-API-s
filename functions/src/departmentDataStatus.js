@@ -115,7 +115,7 @@ function pickEmployeeEntry(entries, expectedColumn) {
  *    not map to a column) -> null (=> NA).
  *
  * @param {string} name
- * @param {string} expectedColumn - deal-sheet-style column key (e.g. "ASSOCIATE_AM", "VP_SRVP")
+ * @param {string} expectedColumn - deal-sheet-style column key (e.g. "ASSOCIATE_AM", "VP")
  * @param {Map} byName - output of fetchDepartmentEmployeesByNames
  * @returns {{name: string, empNo: (string|null), column: string}|null}
  */

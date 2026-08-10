@@ -26,7 +26,7 @@ CREATE TABLE `cynetdatabase.rr_project_data.ch_rate_change_logs` (
   TEAM_LEAD STRING,
   ATL STRING,
   MSP STRING,
-  END_CLIENT_DEPT_FACILITY STRING,
+  FACILITY_NAME STRING,
 
   -- OLD rate snapshot (from deal sheet before rate change)
   OLD_GUARANTEED_HOURS FLOAT64,

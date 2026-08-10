@@ -89,7 +89,7 @@ function nexusBinaryFlagToBoolean(v) {
 }
 
 function isTypeBlank(row) {
-  const typeVal = row?.TYPE;
+  const typeVal = row?.PAYMENT_TYPE;
   if (typeVal == null) return true;
   return String(typeVal).trim() === "";
 }
@@ -97,7 +97,7 @@ function isTypeBlank(row) {
 function isGainwellException(row) {
   const entity = row?.ENTITY == null ? "" : String(row.ENTITY).trim();
   const parent = row?.PARENT_CLIENT_NAME == null ? "" : String(row.PARENT_CLIENT_NAME).trim();
-  const position = row?.POSITION == null ? "" : String(row.POSITION).trim().toUpperCase();
+  const position = row?.SPECIALTY == null ? "" : String(row.SPECIALTY).trim().toUpperCase();
   return entity === "" && parent === "Gainwell Technologies" && position !== "DENTIST";
 }
 
@@ -150,8 +150,8 @@ function computeLocumsW2PayRate(row, finalBillRate) {
   const weeklyWalletMoney = toNumberOrNull(row?.WEEKLY_WALLET_MONEY) ?? 0;
   const scheduleHours1 = toNumberOrNull(row?.SCHEDULE_HOURS_1) ?? 0;
   const additionalBonus = toNumberOrNull(row?.ADDITIONAL_BONUS) ?? 0;
-  const orientationHours = toNumberOrNull(row?.ORIENTATION_HOURS) ?? 0;
-  const initialWeeks = toNumberOrNull(row?.INITIAL_PROJECT_DURATION_IN_WEEKS) ?? 0;
+  const orientationHours = toNumberOrNull(row?.NBO_HOURS) ?? 0;
+  const initialWeeks = toNumberOrNull(row?.PROJECT_DURATION) ?? 0;
 
   if (isTypeBlank(row)) {
     const gh = ghBase(scheduleHours1);
@@ -259,7 +259,7 @@ function normPlacementType(value) {
 }
 
 function isType1099(row) {
-  const typeVal = row?.TYPE;
+  const typeVal = row?.PAYMENT_TYPE;
   if (typeVal == null) return false;
   const s = String(typeVal).trim();
   return s === "1099" || s === String(1099);
@@ -317,7 +317,7 @@ function computeLocumsDerivedPlacementFields(row) {
     FINAL_BILL_RATE: finalBillRate,
     FINAL_COST: finalCost,
     NET_MARGIN: computeLocumsNetMargin(row, finalBillRate, finalCost),
-    GROSS_MARGIN: computeLocumsGrossMargin(row, finalBillRate, w2PayRate, finalPayRate),
+    MARGIN: computeLocumsGrossMargin(row, finalBillRate, w2PayRate, finalPayRate),
     GM_OT: computeGmOt(row),
     DAYS_WORKED: computeDaysWorked(row),
     ENTITY: LOCUMS_ENTITY,
@@ -334,7 +334,7 @@ const LOCUMS_EXCLUDED_API_OWNED_COLUMNS = new Set([
   "W2_PAY_RATE_NEW",
   "FINAL_PAY_RATE_NEW",
   "FINAL_COST_NEW",
-  "NEW_MARGIN",
+  "CALCULATED_MARGIN",
   "FINAL_BILL_RATE_NEW",
   "FIRST_WEEK_HOURS",
   "SECOND_WEEK_HOURS",

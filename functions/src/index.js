@@ -3,15 +3,16 @@
  *
  * 1. dealSheetSync — HTTP (v2 onRequest, up to 3600s)
  * 2. rateChangeLogSync — HTTP rate-change log (BigQuery CONTRACT_ID scan)
- * 3. dealSheetSyncTrigger — scheduled insert (new deal sheets only)
- * 4. dealSheetSyncUpdateTrigger — scheduled update (existing BQ composites); also runs the
- *    recruiter-reassignment / CSM-divergence audit log scan (inorganic_hierarchy_logs) as its
- *    last step, on the same invocation
+ * 3. dealSheetSyncTrigger{Health,Canada,Locums} — scheduled insert (new deal sheets only), one per
+ *    sync domain so cynet health stays live and untouched while canada / locums are worked on.
+ *    Each reads and writes only its own deal sheet table and keeps its own checkpoint.
+ * 4. dealSheetSyncUpdateTrigger{Health,Canada,Locums} — scheduled update (existing BQ composites),
+ *    same per-domain split; also runs the recruiter-reassignment / CSM-divergence audit log scan
+ *    (inorganic_hierarchy_logs) as its last step, on the same invocation
  * 5. dealSheetSyncOfferRejected — HTTP ended / offer-rejected stream (manual)
  * 6. rateChangeLogSyncTrigger — scheduled rate-change logs (BigQuery CONTRACT_ID scan)
  * 7. bulkBackfillByPlacementId — HTTP bulk Nexus backfill (no BQ baseline checks)
  * 8. inorganicHierarchyLogSync — HTTP manual/debug trigger for the audit log scan (see 4.)
- * 9. backfillExtensionDateFromNotes — HTTP one-time EXTENSION_DATE rewrite from earliest BOOKED note
  */
 
 const { onRequest } = require("firebase-functions/v2/https");
@@ -29,7 +30,6 @@ const {
   resolveBulkBackfillMaxPlacementIds,
 } = require("./syncService");
 const { syncPeopleStrongEmployeeDetailsToBigQuery } = require("./peoplestrongEmployeeDetailsService");
-const { backfillExtensionDateFromBookedNotes } = require("./extensionDateBackfill");
 const { logLine, logError, withTimingAsync } = require("./logger");
 const { startDateOnOrAfterUtcMin, effectiveMinFilterDate } = require("./columnMappings");
 const { transformOfferRejectedEndedRowsForBigQuery } = require("./offerRejectedRowTransform");
@@ -402,7 +402,7 @@ exports.refreshDealSheetByPlacementId = onRequest(
         if (bqDatasetRaw) params.bq_dataset = bqDatasetRaw;
         if (bqTableRaw) params.bq_table = bqTableRaw;
         params.generated_uuid_field = "ID";
-        params.compare_ignore_fields = ["ID", "DATE_AND_TIME", "IS_REJECTED"];
+        params.compare_ignore_fields = ["ID", "LAST_UPDATED", "IS_REJECTED"];
         params.first_insert_placement_status_allowlist =
           ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES;
         // Manual single-placement call: opt IN to the table-wide inorganic scan for full parity
@@ -557,240 +557,317 @@ exports.peoplestrongEmployeeDetailsSyncTrigger = onSchedule(
 );
 
 /**
- * Scheduled: every 2 hours at :00 Eastern on ODD slots (09,11,13,15,17,19), alternating with
- * dealSheetSyncUpdateTrigger which runs on the EVEN hours in between (10,12,...). This gives a clean
- * insert -> (1h) update -> (1h) insert -> (1h) update rhythm: a new EXTENSION whose parent DEAL is
- * inserted in the same run (and may sort before it) gets its CONTRACT_ID / hierarchy / ORIGINAL_START_DATE
- * inherited on the very next update run, once the parent DEAL row exists in BigQuery.
+ * Body of the scheduled insert trigger, parameterized by sync domain.
+ *
  * Inserts **new** deal sheets only (DEAL_SHEET_ID not yet in BigQuery), first row STARTED/BOOKED.
+ * Each domain's insert runs ~30m before its own update run, giving a clean
+ * insert -> (30m) update rhythm: a new EXTENSION whose parent DEAL is inserted in the same run (and
+ * may sort before it) gets its CONTRACT_ID / hierarchy / INITIAL_START_DATE inherited on the very
+ * next update run, once the parent DEAL row exists in BigQuery.
+ *
+ * One trigger per domain (health / canada / locums) so cynet health can stay live and untouched
+ * while canada or locums are being worked on — pause or redeploy one domain's schedule without
+ * affecting the others. Each domain gets its OWN checkpoint key: a shared key would let one
+ * domain's resume cursor swallow another's pages.
+ *
+ * @param {"health"|"canada"|"locums"} domain
+ * @param {string} label - trigger name, used as the log prefix
  */
-exports.dealSheetSyncTrigger = onSchedule(
-  {
-    schedule: "0 9,11,13,15,17,19 * * *",
-    timeZone: "America/New_York",
-    region: REGION,
-    timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
-    memory: SCHEDULE_MEMORY,
-  },
-  async (event) => {
-    logLine(
-      `[dealSheetSyncTrigger] Gen2 onSchedule region=${REGION} timeoutSeconds=${SCHEDULE_TIMEOUT_SEC} scheduleTime=${event.scheduleTime || "n/a"} jobName=${event.jobName || "n/a"}`
-    );
+async function runDealSheetInsertSyncForDomain(domain, label) {
+  const bqDataset = "rr_project_data";
+  const organizationSubmittalCodes = ACTIVE_BOOTSTRAP_SUBMITTAL_CODES;
+  const firstInsertPlacementStatuses = ACTIVE_BOOTSTRAP_FIRST_INSERT_PLACEMENT_STATUSES;
+  const insertMaxPages = resolveDealSheetInsertTriggerMaxPages();
+  const checkpointKey = `${ACTIVE_INSERT_SYNC_CHECKPOINT_KEY}-${domain}`;
 
-    return withTimingAsync("dealSheetSyncTrigger", async () => {
-      const bqDataset = "rr_project_data";
-      const organizationSubmittalCodes = ACTIVE_BOOTSTRAP_SUBMITTAL_CODES;
-      const firstInsertPlacementStatuses = ACTIVE_BOOTSTRAP_FIRST_INSERT_PLACEMENT_STATUSES;
-      const insertMaxPages = resolveDealSheetInsertTriggerMaxPages();
+  logLine(
+    `[${label}] Scheduled insert-only domain=${domain}: ${organizationSubmittalCodes} -> cynetdatabase.${bqDataset}; skip if DEAL_SHEET_ID or PLACEMENT_ID exists in BQ; START_DATE>=${DEAL_SHEET_MIN_START_DATE_ISO}; first_insert_allowlist=${firstInsertPlacementStatuses}; no append-on-change; checkpoint_key=${checkpointKey} (resume-on-error/timeout by submittal page, clear-on-complete); max_pages_per_run=${insertMaxPages || "none"}`
+  );
+  logLine(`[${label}] Invoking syncEnrichedDealSheetCandidatesToBigQuery`);
 
-      logLine(
-        `[dealSheetSyncTrigger] Scheduled insert-only: ${organizationSubmittalCodes} -> cynetdatabase.${bqDataset}; skip if DEAL_SHEET_ID or PLACEMENT_ID exists in BQ; START_DATE>=${DEAL_SHEET_MIN_START_DATE_ISO}; first_insert_allowlist=${firstInsertPlacementStatuses}; no append-on-change; checkpoint_key=${ACTIVE_INSERT_SYNC_CHECKPOINT_KEY} (resume-on-error/timeout by submittal page, clear-on-complete); max_pages_per_run=${insertMaxPages || "none"}`
-      );
-      logLine("[dealSheetSyncTrigger] Invoking syncEnrichedDealSheetCandidatesToBigQuery");
+  const result = await syncEnrichedDealSheetCandidatesToBigQuery({
+    sync_domain: domain,
+    organization_submittal_status_code: organizationSubmittalCodes,
+    only_new_deal_sheets: true,
+    skip_existing_deal_sheet_or_placement: true,
+    reject_if_existing_deal_sheet_or_placement: true,
+    dedupe_by_placement_id: false,
+    bq_dataset: bqDataset,
+    generated_uuid_field: "ID",
+    append_on_change_by_dealsheet: false,
+    compare_ignore_fields: ["ID", "LAST_UPDATED", "IS_REJECTED"],
+    first_insert_placement_status_allowlist: firstInsertPlacementStatuses,
+    // Bring in BOTH FINAL and VERBAL deal sheets (no longer FINAL-only).
+    deal_sheet_status_codes: "FINAL,VERBAL",
+    // Push the START_DATE >= 2026-01-01 lower bound to the Nexus list (server-side) so we fetch
+    // ~1k relevant submittals instead of scanning every page (~3k+) and discarding old ones —
+    // this is the real cut to the socket-hangup / timeout load. No upper bound (future starts).
+    // filterEnrichedRowsByDealSheetMinStartDate stays below as the in-code safety net.
+    submittal_start_date_from: DEAL_SHEET_MIN_START_DATE_ISO,
+    transform_rows_fn: filterEnrichedRowsByDealSheetMinStartDate,
+    // Final gate inside the insert pipeline, against the FINAL START_DATE (the offer-rejected /
+    // extension steps rewrite it from a prior ended assignment after transform_rows_fn ran).
+    min_start_date_ms: DEAL_SHEET_MIN_START_DATE_MS,
+    // Page-level Firestore checkpoint: on a thrown socket-hangup (ECONNRESET after retries) the
+    // failed submittal page is saved and the next run resumes from it; on a fully-successful pass
+    // the doc is deleted so the next run rescans from page 1 to pick up newly-added deal sheets.
+    resume_from_checkpoint: true,
+    checkpoint_key: checkpointKey,
+    checkpoint_use_submittal_page: true,
+    clear_checkpoint_on_complete: true,
+    ...(insertMaxPages > 0 ? { max_pages: insertMaxPages, max_pages_provided: true } : {}),
+  });
 
-      const result = await syncEnrichedDealSheetCandidatesToBigQuery({
-        organization_submittal_status_code: organizationSubmittalCodes,
-        only_new_deal_sheets: true,
-        skip_existing_deal_sheet_or_placement: true,
-        reject_if_existing_deal_sheet_or_placement: true,
-        dedupe_by_placement_id: false,
-        bq_dataset: bqDataset,
-        generated_uuid_field: "ID",
-        append_on_change_by_dealsheet: false,
-        compare_ignore_fields: ["ID", "DATE_AND_TIME", "IS_REJECTED"],
-        first_insert_placement_status_allowlist: firstInsertPlacementStatuses,
-        // Bring in BOTH FINAL and VERBAL deal sheets (no longer FINAL-only).
-        deal_sheet_status_codes: "FINAL,VERBAL",
-        // Push the START_DATE >= 2026-01-01 lower bound to the Nexus list (server-side) so we fetch
-        // ~1k relevant submittals instead of scanning every page (~3k+) and discarding old ones —
-        // this is the real cut to the socket-hangup / timeout load. No upper bound (future starts).
-        // filterEnrichedRowsByDealSheetMinStartDate stays below as the in-code safety net.
-        submittal_start_date_from: DEAL_SHEET_MIN_START_DATE_ISO,
-        transform_rows_fn: filterEnrichedRowsByDealSheetMinStartDate,
-        // Final gate inside the insert pipeline, against the FINAL START_DATE (the offer-rejected /
-        // extension steps rewrite it from a prior ended assignment after transform_rows_fn ran).
-        min_start_date_ms: DEAL_SHEET_MIN_START_DATE_MS,
-        // Page-level Firestore checkpoint: on a thrown socket-hangup (ECONNRESET after retries) the
-        // failed submittal page is saved and the next run resumes from it; on a fully-successful pass
-        // the doc is deleted so the next run rescans from page 1 to pick up newly-added deal sheets.
-        resume_from_checkpoint: true,
-        checkpoint_key: ACTIVE_INSERT_SYNC_CHECKPOINT_KEY,
-        checkpoint_use_submittal_page: true,
-        clear_checkpoint_on_complete: true,
-        ...(insertMaxPages > 0 ? { max_pages: insertMaxPages, max_pages_provided: true } : {}),
-      });
+  logLine(
+    `[${label}] Pipeline result domain=${domain} inserted=${result.inserted} candidatesProcessed=${result.candidatesProcessed} skippedOtherDomain=${result.rowsSkippedOtherDomain ?? 0} errorBatches=${result.errorBatches} elapsed=${result.elapsed || "n/a"} pagesProcessed=${result.pagesProcessedThisRun ?? "n/a"}`
+  );
 
-      logLine(
-        `[dealSheetSyncTrigger] Pipeline result inserted=${result.inserted} candidatesProcessed=${result.candidatesProcessed} errorBatches=${result.errorBatches} elapsed=${result.elapsed || "n/a"} pagesProcessed=${result.pagesProcessedThisRun ?? "n/a"}`
-      );
+  // The audit-log scans below are NOT domain-scoped: they scan all three deal sheet tables and
+  // write to shared log tables. Running them from each domain's trigger is harmless (they are
+  // idempotent — they only insert rows for changes not already logged), and it keeps every domain's
+  // logs current even while another domain's schedule is paused.
 
-      // Extensions get inserted here; reconcile ownership_change_logs EFFECTIVE_DATE from the
-      // matching CONTRACT_ID's extension start date (overwrites the temporary tentative+1 value).
-      logLine("[dealSheetSyncTrigger] Invoking syncOwnershipChangeLogEffectiveDatesFromExtensions");
-      let ownershipEffectiveDateResult = null;
-      try {
-        ownershipEffectiveDateResult = await syncOwnershipChangeLogEffectiveDatesFromExtensions({
-          deal_sheet_bq_dataset: bqDataset,
-          bq_table: "ownership_change_logs",
-        });
-        logLine(
-          `[dealSheetSyncTrigger] ownership effective-date overwrite updated=${ownershipEffectiveDateResult.updated == null ? "n/a" : ownershipEffectiveDateResult.updated} elapsed=${ownershipEffectiveDateResult.elapsed || "n/a"}`
-        );
-      } catch (effErr) {
-        logError("[dealSheetSyncTrigger] ownership effective-date overwrite FAILED (non-fatal)", effErr);
-      }
-
-      // Fresh inserts freeze hierarchy as of NEW_HIRE_DATE; the org chart can already have moved on
-      // by the time this same run happens (see recruiter-hierarchy-divergence signal below), so this
-      // full active-table scan runs on both triggers, not just dealSheetSyncUpdateTrigger.
-      logLine(
-        "[dealSheetSyncTrigger] Invoking syncInorganicHierarchyLogsFromBigQuery (recruiter-change + CSM-divergence + recruiter-hierarchy-divergence scan)"
-      );
-      let inorganicHierarchyLogResult = null;
-      try {
-        inorganicHierarchyLogResult = await syncInorganicHierarchyLogsFromBigQuery({
-          bq_dataset: bqDataset,
-          bq_table: "inorganic_hierarchy_logs",
-        });
-        logLine(
-          `[dealSheetSyncTrigger] inorganic hierarchy log result inserted=${inorganicHierarchyLogResult.inserted} recruiterChangePairs=${inorganicHierarchyLogResult.total} csmDivergences=${inorganicHierarchyLogResult.csmDivergences} recruiterHierarchyDivergences=${inorganicHierarchyLogResult.recruiterHierarchyDivergences} errorBatches=${inorganicHierarchyLogResult.errorBatches} elapsed=${inorganicHierarchyLogResult.elapsed || "n/a"}`
-        );
-      } catch (inorganicErr) {
-        logError("[dealSheetSyncTrigger] inorganic hierarchy log scan FAILED (non-fatal)", inorganicErr);
-      }
-
-      // Ownership change logs incl. the recruiter-handover (previous->new recruiter + vacated role)
-      // rows — runs on this insert trigger too (not just the update trigger) per requirement.
-      logLine("[dealSheetSyncTrigger] Invoking syncOwnershipChangeLogsFromBigQuery (per-role + recruiter-handover scan)");
-      let ownershipChangeLogResult = null;
-      try {
-        ownershipChangeLogResult = await syncOwnershipChangeLogsFromBigQuery({
-          bq_dataset: bqDataset,
-          bq_table: "ownership_change_logs",
-        });
-        logLine(
-          `[dealSheetSyncTrigger] ownership change log result inserted=${ownershipChangeLogResult.inserted} changedPairs=${ownershipChangeLogResult.total} handoverRows=${ownershipChangeLogResult.handoverRows} builtRows=${ownershipChangeLogResult.builtRows} errorBatches=${ownershipChangeLogResult.errorBatches} elapsed=${ownershipChangeLogResult.elapsed || "n/a"}`
-        );
-      } catch (ownershipErr) {
-        logError("[dealSheetSyncTrigger] ownership change log scan FAILED (non-fatal)", ownershipErr);
-      }
-
-      return {
-        success: true,
-        result,
-        ownershipEffectiveDate: ownershipEffectiveDateResult,
-        inorganicHierarchyLog: inorganicHierarchyLogResult,
-        ownershipChangeLog: ownershipChangeLogResult,
-      };
+  // Extensions get inserted here; reconcile ownership_change_logs OWNERSHIP_EFFECTIVE_DATE from the
+  // matching CONTRACT_ID's extension start date (overwrites the temporary tentative+1 value).
+  logLine(`[${label}] Invoking syncOwnershipChangeLogEffectiveDatesFromExtensions`);
+  let ownershipEffectiveDateResult = null;
+  try {
+    ownershipEffectiveDateResult = await syncOwnershipChangeLogEffectiveDatesFromExtensions({
+      deal_sheet_bq_dataset: bqDataset,
+      bq_table: "ownership_change_logs",
     });
+    logLine(
+      `[${label}] ownership effective-date overwrite updated=${ownershipEffectiveDateResult.updated == null ? "n/a" : ownershipEffectiveDateResult.updated} elapsed=${ownershipEffectiveDateResult.elapsed || "n/a"}`
+    );
+  } catch (effErr) {
+    logError(`[${label}] ownership effective-date overwrite FAILED (non-fatal)`, effErr);
   }
+
+  // Fresh inserts freeze hierarchy as of NEW_HIRE_DATE; the org chart can already have moved on
+  // by the time this same run happens (see recruiter-hierarchy-divergence signal below), so this
+  // full active-table scan runs on both triggers, not just the update trigger.
+  logLine(
+    `[${label}] Invoking syncInorganicHierarchyLogsFromBigQuery (recruiter-change + CSM-divergence + recruiter-hierarchy-divergence scan)`
+  );
+  let inorganicHierarchyLogResult = null;
+  try {
+    inorganicHierarchyLogResult = await syncInorganicHierarchyLogsFromBigQuery({
+      bq_dataset: bqDataset,
+      bq_table: "inorganic_hierarchy_logs",
+    });
+    logLine(
+      `[${label}] inorganic hierarchy log result inserted=${inorganicHierarchyLogResult.inserted} recruiterChangePairs=${inorganicHierarchyLogResult.total} csmDivergences=${inorganicHierarchyLogResult.csmDivergences} recruiterHierarchyDivergences=${inorganicHierarchyLogResult.recruiterHierarchyDivergences} errorBatches=${inorganicHierarchyLogResult.errorBatches} elapsed=${inorganicHierarchyLogResult.elapsed || "n/a"}`
+    );
+  } catch (inorganicErr) {
+    logError(`[${label}] inorganic hierarchy log scan FAILED (non-fatal)`, inorganicErr);
+  }
+
+  // Ownership change logs incl. the recruiter-handover (previous->new recruiter + vacated role)
+  // rows — runs on this insert trigger too (not just the update trigger) per requirement.
+  logLine(`[${label}] Invoking syncOwnershipChangeLogsFromBigQuery (per-role + recruiter-handover scan)`);
+  let ownershipChangeLogResult = null;
+  try {
+    ownershipChangeLogResult = await syncOwnershipChangeLogsFromBigQuery({
+      bq_dataset: bqDataset,
+      bq_table: "ownership_change_logs",
+    });
+    logLine(
+      `[${label}] ownership change log result inserted=${ownershipChangeLogResult.inserted} changedPairs=${ownershipChangeLogResult.total} handoverRows=${ownershipChangeLogResult.handoverRows} builtRows=${ownershipChangeLogResult.builtRows} errorBatches=${ownershipChangeLogResult.errorBatches} elapsed=${ownershipChangeLogResult.elapsed || "n/a"}`
+    );
+  } catch (ownershipErr) {
+    logError(`[${label}] ownership change log scan FAILED (non-fatal)`, ownershipErr);
+  }
+
+  return {
+    success: true,
+    domain,
+    result,
+    ownershipEffectiveDate: ownershipEffectiveDateResult,
+    inorganicHierarchyLog: inorganicHierarchyLogResult,
+    ownershipChangeLog: ownershipChangeLogResult,
+  };
+}
+
+/**
+ * Build a scheduled insert trigger bound to one domain.
+ * @param {"health"|"canada"|"locums"} domain
+ * @param {string} label - exported function name, used as the log prefix
+ * @param {string} schedule - cron expression (domains are staggered so they don't run concurrently)
+ */
+function buildDealSheetInsertTrigger(domain, label, schedule) {
+  return onSchedule(
+    {
+      schedule,
+      timeZone: "America/New_York",
+      region: REGION,
+      timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
+      memory: SCHEDULE_MEMORY,
+    },
+    async (event) => {
+      logLine(
+        `[${label}] Gen2 onSchedule domain=${domain} region=${REGION} timeoutSeconds=${SCHEDULE_TIMEOUT_SEC} scheduleTime=${event.scheduleTime || "n/a"} jobName=${event.jobName || "n/a"}`
+      );
+      return withTimingAsync(label, () => runDealSheetInsertSyncForDomain(domain, label));
+    }
+  );
+}
+
+// Staggered :00 / :10 / :20 so the three domains never run concurrently (shared Nexus API budget).
+exports.dealSheetSyncTriggerHealth = buildDealSheetInsertTrigger(
+  "health",
+  "dealSheetSyncTriggerHealth",
+  "0 8-19 * * *"
+);
+exports.dealSheetSyncTriggerCanada = buildDealSheetInsertTrigger(
+  "canada",
+  "dealSheetSyncTriggerCanada",
+  "10 8-19 * * *"
+);
+exports.dealSheetSyncTriggerLocums = buildDealSheetInsertTrigger(
+  "locums",
+  "dealSheetSyncTriggerLocums",
+  "20 8-19 * * *"
 );
 
 /**
- * Scheduled: every 2 hours at :00 Eastern on EVEN slots (10,12,14,16,18,20), interleaved with
- * dealSheetSyncTrigger's ODD slots — so an insert run is always followed ~1h later by an update run.
- * Loads existing DEAL_SHEET_IDs from BigQuery (placement_id fallback when deal sheet null), refreshes
- * via Nexus, appends on column diff vs latest deal-sheet row. This is also where a same-run-inserted
- * EXTENSION gets its parent-DEAL inheritance (CONTRACT_ID / hierarchy / ORIGINAL_START_DATE) filled in.
+ * Body of the scheduled update trigger, parameterized by sync domain. Loads existing DEAL_SHEET_IDs
+ * from this domain's BigQuery table (placement_id fallback when deal sheet null), refreshes via
+ * Nexus, appends on column diff vs latest deal-sheet row. This is also where a same-run-inserted
+ * EXTENSION gets its parent-DEAL inheritance (CONTRACT_ID / hierarchy / INITIAL_START_DATE) filled
+ * in. Own checkpoint key per domain, same reason as the insert trigger.
+ *
+ * @param {"health"|"canada"|"locums"} domain
+ * @param {string} label - trigger name, used as the log prefix
  */
-exports.dealSheetSyncUpdateTrigger = onSchedule(
-  {
-    schedule: "0 10,12,14,16,18,20 * * *",
-    timeZone: "America/New_York",
-    region: REGION,
-    timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
-    memory: SCHEDULE_MEMORY,
-  },
-  async (event) => {
-    logLine(
-      `[dealSheetSyncUpdateTrigger] Gen2 onSchedule region=${REGION} timeoutSeconds=${SCHEDULE_TIMEOUT_SEC} scheduleTime=${event.scheduleTime || "n/a"} jobName=${event.jobName || "n/a"}`
-    );
+async function runDealSheetUpdateSyncForDomain(domain, label) {
+  const bqDataset = "rr_project_data";
+  const maxPairsPerRun = resolveDealSheetUpdateTriggerMaxPairs();
+  const checkpointKey = `${ACTIVE_UPDATE_SYNC_CHECKPOINT_KEY}-${domain}`;
 
-    return withTimingAsync("dealSheetSyncUpdateTrigger", async () => {
-      const bqDataset = "rr_project_data";
-      const maxPairsPerRun = resolveDealSheetUpdateTriggerMaxPairs();
+  logLine(
+    `[${label}] Scheduled update domain=${domain}: cynetdatabase.${bqDataset}; BQ deal_sheet targets -> Nexus refresh; baseline=deal_sheet_id; priority=STARTED,BOOKED,ACTIVE (all each run); batch=ENDED,ENDED<30,DID NOT START,DID NOT ACCEPT+unknown; max_pairs_per_run=${maxPairsPerRun} (batch only); terminal_stale_cutoff_days=20 (ENDED/ENDED<30/DID NOT START/DID NOT ACCEPT, latest LAST_UPDATED older than cutoff dropped); checkpoint_key=${checkpointKey}; START_DATE>=${DEAL_SHEET_MIN_START_DATE_ISO}`
+  );
+  logLine(`[${label}] Invoking syncExistingActiveDealSheetUpdatesFromBigQuery`);
 
-      logLine(
-        `[dealSheetSyncUpdateTrigger] Scheduled update: cynetdatabase.${bqDataset}; BQ deal_sheet targets -> Nexus refresh; baseline=deal_sheet_id; priority=STARTED,BOOKED,ACTIVE (all each run); batch=ENDED,ENDED<30,DID NOT START,DID NOT ACCEPT+unknown; max_pairs_per_run=${maxPairsPerRun} (batch only); terminal_stale_cutoff_days=20 (ENDED/ENDED<30/DID NOT START/DID NOT ACCEPT, latest DATE_AND_TIME older than cutoff dropped); checkpoint_key=${ACTIVE_UPDATE_SYNC_CHECKPOINT_KEY}; START_DATE>=${DEAL_SHEET_MIN_START_DATE_ISO}`
-      );
-      logLine("[dealSheetSyncUpdateTrigger] Invoking syncExistingActiveDealSheetUpdatesFromBigQuery");
-
-      const result = await syncExistingActiveDealSheetUpdatesFromBigQuery({
+  const result = await syncExistingActiveDealSheetUpdatesFromBigQuery({
+        sync_domain: domain,
         bq_dataset: bqDataset,
         resume_from_checkpoint: true,
-        checkpoint_key: ACTIVE_UPDATE_SYNC_CHECKPOINT_KEY,
+        checkpoint_key: checkpointKey,
         clear_checkpoint_on_complete: true,
         max_pairs_per_run: maxPairsPerRun,
         min_start_date_ms: DEAL_SHEET_MIN_START_DATE_MS,
         generated_uuid_field: "ID",
-        compare_ignore_fields: ["ID", "DATE_AND_TIME", "IS_REJECTED"],
-      });
+        compare_ignore_fields: ["ID", "LAST_UPDATED", "IS_REJECTED"],
+  });
 
-      logLine(
-        `[dealSheetSyncUpdateTrigger] Pipeline result checked=${result.checked} appended=${result.appended} no_change=${result.no_change} not_found=${result.not_found} no_baseline=${result.no_baseline ?? 0} skipped_date=${result.skipped_date} errors=${result.errors} priorityTotal=${result.priorityTotal ?? "n/a"} priorityChecked=${result.priorityChecked ?? "n/a"} batchTotal=${result.batchTotal ?? "n/a"} batchStaleSkipped=${result.batchStaleSkipped ?? "n/a"} batchCheckedThisRun=${result.batchCheckedThisRun ?? "n/a"} batchOffsetEnd=${result.batchOffsetEnd ?? result.targetOffsetEnd ?? "n/a"} targetTotal=${result.targetTotal ?? result.pairTotal ?? "n/a"} hasMore=${result.hasMore ? "yes" : "no"} elapsed=${result.elapsed || "n/a"}`
-      );
+  logLine(
+    `[${label}] Pipeline result domain=${domain} checked=${result.checked} appended=${result.appended} no_change=${result.no_change} not_found=${result.not_found} no_baseline=${result.no_baseline ?? 0} skipped_date=${result.skipped_date} errors=${result.errors} priorityTotal=${result.priorityTotal ?? "n/a"} priorityChecked=${result.priorityChecked ?? "n/a"} batchTotal=${result.batchTotal ?? "n/a"} batchStaleSkipped=${result.batchStaleSkipped ?? "n/a"} batchCheckedThisRun=${result.batchCheckedThisRun ?? "n/a"} batchOffsetEnd=${result.batchOffsetEnd ?? result.targetOffsetEnd ?? "n/a"} targetTotal=${result.targetTotal ?? result.pairTotal ?? "n/a"} hasMore=${result.hasMore ? "yes" : "no"} elapsed=${result.elapsed || "n/a"}`
+  );
 
-      logLine(
-        "[dealSheetSyncUpdateTrigger] Invoking syncInorganicHierarchyLogsFromBigQuery (recruiter-change + CSM-divergence + recruiter-hierarchy-divergence scan)"
-      );
-      let inorganicHierarchyLogResult = null;
-      try {
-        inorganicHierarchyLogResult = await syncInorganicHierarchyLogsFromBigQuery({
-          bq_dataset: bqDataset,
-          bq_table: "inorganic_hierarchy_logs",
-        });
-        logLine(
-          `[dealSheetSyncUpdateTrigger] inorganic hierarchy log result inserted=${inorganicHierarchyLogResult.inserted} recruiterChangePairs=${inorganicHierarchyLogResult.total} csmDivergences=${inorganicHierarchyLogResult.csmDivergences} recruiterHierarchyDivergences=${inorganicHierarchyLogResult.recruiterHierarchyDivergences} errorBatches=${inorganicHierarchyLogResult.errorBatches} elapsed=${inorganicHierarchyLogResult.elapsed || "n/a"}`
-        );
-      } catch (inorganicErr) {
-        // Non-fatal: the main deal-sheet update already succeeded above; don't fail the whole
-        // trigger run over the audit-log scan.
-        logError("[dealSheetSyncUpdateTrigger] inorganic hierarchy log scan FAILED (non-fatal)", inorganicErr);
-      }
-
-      logLine("[dealSheetSyncUpdateTrigger] Invoking syncOwnershipChangeLogsFromBigQuery (per-role ownership handover scan)");
-      let ownershipChangeLogResult = null;
-      try {
-        ownershipChangeLogResult = await syncOwnershipChangeLogsFromBigQuery({
-          bq_dataset: bqDataset,
-          bq_table: "ownership_change_logs",
-        });
-        logLine(
-          `[dealSheetSyncUpdateTrigger] ownership change log result inserted=${ownershipChangeLogResult.inserted} changedPairs=${ownershipChangeLogResult.total} handoverRows=${ownershipChangeLogResult.handoverRows} builtRows=${ownershipChangeLogResult.builtRows} errorBatches=${ownershipChangeLogResult.errorBatches} elapsed=${ownershipChangeLogResult.elapsed || "n/a"}`
-        );
-      } catch (ownershipErr) {
-        // Non-fatal, same as the inorganic scan above.
-        logError("[dealSheetSyncUpdateTrigger] ownership change log scan FAILED (non-fatal)", ownershipErr);
-      }
-
-      // Keep ownership_change_logs' placement dates (START_DATE / END_DATE_PREVIOUS_OWNER /
-      // EFFECTIVE_DATE) in sync with each placement's CURRENT deal-sheet row. Date changes (e.g. a
-      // placement going ENDED / ENDED<30, or START/TENTATIVE edits) happen on THIS update trigger,
-      // so the overwrite must run here too — not only on dealSheetSyncTrigger. Runs AFTER the
-      // ownership-change scan so freshly-inserted handover rows are re-dated as well. Non-fatal.
-      logLine("[dealSheetSyncUpdateTrigger] Invoking syncOwnershipChangeLogEffectiveDatesFromExtensions (placement date sync)");
-      let ownershipEffectiveDateResult = null;
-      try {
-        ownershipEffectiveDateResult = await syncOwnershipChangeLogEffectiveDatesFromExtensions({
-          deal_sheet_bq_dataset: bqDataset,
-          bq_table: "ownership_change_logs",
-        });
-        logLine(
-          `[dealSheetSyncUpdateTrigger] ownership date sync updated=${ownershipEffectiveDateResult.updated == null ? "n/a" : ownershipEffectiveDateResult.updated} dealSheetUpdated=${ownershipEffectiveDateResult.dealSheetUpdated == null ? "n/a" : ownershipEffectiveDateResult.dealSheetUpdated} elapsed=${ownershipEffectiveDateResult.elapsed || "n/a"}`
-        );
-      } catch (effErr) {
-        logError("[dealSheetSyncUpdateTrigger] ownership date sync FAILED (non-fatal)", effErr);
-      }
-
-      return {
-        success: true,
-        result,
-        inorganicHierarchyLog: inorganicHierarchyLogResult,
-        ownershipChangeLog: ownershipChangeLogResult,
-        ownershipEffectiveDate: ownershipEffectiveDateResult,
-      };
+  // As on the insert trigger, the audit-log scans below are shared (not domain-scoped) and
+  // idempotent, so running them from each domain's trigger is safe.
+  logLine(
+    `[${label}] Invoking syncInorganicHierarchyLogsFromBigQuery (recruiter-change + CSM-divergence + recruiter-hierarchy-divergence scan)`
+  );
+  let inorganicHierarchyLogResult = null;
+  try {
+    inorganicHierarchyLogResult = await syncInorganicHierarchyLogsFromBigQuery({
+      bq_dataset: bqDataset,
+      bq_table: "inorganic_hierarchy_logs",
     });
+    logLine(
+      `[${label}] inorganic hierarchy log result inserted=${inorganicHierarchyLogResult.inserted} recruiterChangePairs=${inorganicHierarchyLogResult.total} csmDivergences=${inorganicHierarchyLogResult.csmDivergences} recruiterHierarchyDivergences=${inorganicHierarchyLogResult.recruiterHierarchyDivergences} errorBatches=${inorganicHierarchyLogResult.errorBatches} elapsed=${inorganicHierarchyLogResult.elapsed || "n/a"}`
+    );
+  } catch (inorganicErr) {
+    // Non-fatal: the main deal-sheet update already succeeded above; don't fail the whole
+    // trigger run over the audit-log scan.
+    logError(`[${label}] inorganic hierarchy log scan FAILED (non-fatal)`, inorganicErr);
   }
+
+  logLine(`[${label}] Invoking syncOwnershipChangeLogsFromBigQuery (per-role ownership handover scan)`);
+  let ownershipChangeLogResult = null;
+  try {
+    ownershipChangeLogResult = await syncOwnershipChangeLogsFromBigQuery({
+      bq_dataset: bqDataset,
+      bq_table: "ownership_change_logs",
+    });
+    logLine(
+      `[${label}] ownership change log result inserted=${ownershipChangeLogResult.inserted} changedPairs=${ownershipChangeLogResult.total} handoverRows=${ownershipChangeLogResult.handoverRows} builtRows=${ownershipChangeLogResult.builtRows} errorBatches=${ownershipChangeLogResult.errorBatches} elapsed=${ownershipChangeLogResult.elapsed || "n/a"}`
+    );
+  } catch (ownershipErr) {
+    // Non-fatal, same as the inorganic scan above.
+    logError(`[${label}] ownership change log scan FAILED (non-fatal)`, ownershipErr);
+  }
+
+  // Keep ownership_change_logs' placement dates (START_DATE / END_DATE_PREVIOUS_OWNER /
+  // OWNERSHIP_EFFECTIVE_DATE) in sync with each placement's CURRENT deal-sheet row. Date changes (e.g. a
+  // placement going ENDED / ENDED<30, or START/TENTATIVE edits) happen on THIS update trigger,
+  // so the overwrite must run here too — not only on the insert trigger. Runs AFTER the
+  // ownership-change scan so freshly-inserted handover rows are re-dated as well. Non-fatal.
+  logLine(`[${label}] Invoking syncOwnershipChangeLogEffectiveDatesFromExtensions (placement date sync)`);
+  let ownershipEffectiveDateResult = null;
+  try {
+    ownershipEffectiveDateResult = await syncOwnershipChangeLogEffectiveDatesFromExtensions({
+      deal_sheet_bq_dataset: bqDataset,
+      bq_table: "ownership_change_logs",
+    });
+    logLine(
+      `[${label}] ownership date sync updated=${ownershipEffectiveDateResult.updated == null ? "n/a" : ownershipEffectiveDateResult.updated} dealSheetUpdated=${ownershipEffectiveDateResult.dealSheetUpdated == null ? "n/a" : ownershipEffectiveDateResult.dealSheetUpdated} elapsed=${ownershipEffectiveDateResult.elapsed || "n/a"}`
+    );
+  } catch (effErr) {
+    logError(`[${label}] ownership date sync FAILED (non-fatal)`, effErr);
+  }
+
+  return {
+    success: true,
+    domain,
+    result,
+    inorganicHierarchyLog: inorganicHierarchyLogResult,
+    ownershipChangeLog: ownershipChangeLogResult,
+    ownershipEffectiveDate: ownershipEffectiveDateResult,
+  };
+}
+
+/**
+ * Build a scheduled update trigger bound to one domain.
+ * @param {"health"|"canada"|"locums"} domain
+ * @param {string} label - exported function name, used as the log prefix
+ * @param {string} schedule - cron expression
+ */
+function buildDealSheetUpdateTrigger(domain, label, schedule) {
+  return onSchedule(
+    {
+      schedule,
+      timeZone: "America/New_York",
+      region: REGION,
+      timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
+      memory: SCHEDULE_MEMORY,
+    },
+    async (event) => {
+      logLine(
+        `[${label}] Gen2 onSchedule domain=${domain} region=${REGION} timeoutSeconds=${SCHEDULE_TIMEOUT_SEC} scheduleTime=${event.scheduleTime || "n/a"} jobName=${event.jobName || "n/a"}`
+      );
+      return withTimingAsync(label, () => runDealSheetUpdateSyncForDomain(domain, label));
+    }
+  );
+}
+
+// Interleaved with the inserts (:00/:10/:20) so each domain runs insert -> ~30m -> update.
+exports.dealSheetSyncUpdateTriggerHealth = buildDealSheetUpdateTrigger(
+  "health",
+  "dealSheetSyncUpdateTriggerHealth",
+  "30 8-19 * * *"
+);
+exports.dealSheetSyncUpdateTriggerCanada = buildDealSheetUpdateTrigger(
+  "canada",
+  "dealSheetSyncUpdateTriggerCanada",
+  "40 8-19 * * *"
+);
+exports.dealSheetSyncUpdateTriggerLocums = buildDealSheetUpdateTrigger(
+  "locums",
+  "dealSheetSyncUpdateTriggerLocums",
+  "50 8-19 * * *"
 );
 
 /**
@@ -808,7 +885,7 @@ exports.dealSheetSyncUpdateTrigger = onSchedule(
  * With default `dedupe_by_placement_id=false`, multiple history rows per placement are possible (like active tables).
  * If you need one row per placement only, pass `dedupe_by_placement_id=true` and do not rely on append-on-change for that placement.
  *
- * Placement filter: DID NOT START, ENDED, ENDED<30, DID NOT ACCEPT; TENTATIVE_DATE >= 2026-05-01 UTC.
+ * Placement filter: DID NOT START, ENDED, ENDED<30, DID NOT ACCEPT; TENTATIVE_END_DATE >= 2026-05-01 UTC.
  * CONTRACT_ID: always null on ended inserts (`skip_contract_id`); allocation only on active insert (`dealSheetSyncTrigger` / `dealSheetSync` HTTP).
  * After deploy, delete the legacy GCP job `firebase-schedule-dealSheetSyncOfferRejectedTrigger-*` if it still exists.
  * To run from Cloud Scheduler, create an HTTP job targeting this function URL (GET/POST).
@@ -863,7 +940,7 @@ exports.dealSheetSyncOfferRejected = onRequest(
           checkpoint_use_submittal_page: checkpointUseSubmittalPage,
           generated_uuid_field: "ID",
           append_on_change_by_dealsheet: true,
-          compare_ignore_fields: ["ID", "DATE_AND_TIME", "IS_REJECTED"],
+          compare_ignore_fields: ["ID", "LAST_UPDATED", "IS_REJECTED"],
           first_insert_placement_status_allowlist: ACTIVE_EXPANDED_FIRST_INSERT_PLACEMENT_STATUSES,
           transform_rows_fn: transformOfferRejectedEndedRowsForBigQuery,
           skip_contract_id: true,
@@ -908,75 +985,13 @@ exports.dealSheetSyncOfferRejected = onRequest(
 );
 
 /**
- * HTTP: one-time EXTENSION_DATE backfill from earliest BOOKED job-submittal-note.
- * Default dry_run (apply=false). Pass apply=true to UPDATE latest EXTENSION rows in active tables.
- * Does not wipe data or touch inorganic/ownership logs.
- *
- * Query: apply, bq_dataset, max_rows_per_table, concurrency
- */
-exports.backfillExtensionDateFromNotes = onRequest(
-  {
-    region: REGION,
-    timeoutSeconds: HTTP_TIMEOUT_SEC,
-    memory: HTTP_MEMORY,
-  },
-  async (req, res) => {
-    const wallStartMs = Date.now();
-    try {
-      const result = await withTimingAsync("backfillExtensionDateFromNotes", async () => {
-        const q = req.query || {};
-        const body = req.body && typeof req.body === "object" ? req.body : {};
-        const applyRaw = body.apply != null ? body.apply : q.apply;
-        const apply = applyRaw === true || applyRaw === "true";
-        const bqDataset =
-          typeof body.bq_dataset === "string"
-            ? body.bq_dataset.trim()
-            : typeof q.bq_dataset === "string"
-              ? q.bq_dataset.trim()
-              : "rr_project_data";
-        const maxRows =
-          body.max_rows_per_table != null
-            ? body.max_rows_per_table
-            : q.max_rows_per_table != null
-              ? q.max_rows_per_table
-              : undefined;
-        const concurrency =
-          body.concurrency != null ? body.concurrency : q.concurrency != null ? q.concurrency : undefined;
-
-        logLine(
-          `[backfillExtensionDateFromNotes] method=${req.method} apply=${apply ? "true" : "dry_run"} bq_dataset=${bqDataset} max_rows_per_table=${maxRows ?? "default"} concurrency=${concurrency ?? "default"}`
-        );
-
-        return backfillExtensionDateFromBookedNotes({
-          apply,
-          bq_dataset: bqDataset,
-          max_rows_per_table: maxRows,
-          concurrency,
-        });
-      });
-
-      const executionTimeMs = Date.now() - wallStartMs;
-      res.status(200).json({ ...result, executionTimeMs });
-    } catch (error) {
-      const executionTimeMs = Date.now() - wallStartMs;
-      logError(`[backfillExtensionDateFromNotes] FAILED after ${executionTimeMs}ms`, error);
-      res.status(500).json({
-        success: false,
-        error: error.message,
-        executionTimeMs,
-      });
-    }
-  }
-);
-
-/**
  * Scheduled: rate-change log stream (BigQuery CONTRACT_ID scan).
  * Scans active deal-sheet tables; when latest row per CONTRACT_ID has RATE_CHANGE=YES
  * and a previous row exists, writes OLD/NEW snapshot to ch_rate_change_logs.
  */
 exports.rateChangeLogSyncTrigger = onSchedule(
   {
-    schedule: "0 9-19 * * *",
+    schedule: "0,30 8-19 * * *",
     timeZone: "America/New_York",
     region: REGION,
     timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
@@ -989,7 +1004,7 @@ exports.rateChangeLogSyncTrigger = onSchedule(
 
     return withTimingAsync("rateChangeLogSyncTrigger", async () => {
       logLine(
-        "[rateChangeLogSyncTrigger] Scheduled (hourly :00 Eastern, 9 AM–7 PM): BQ CONTRACT_ID scan -> ch_rate_change_logs (RATE_CHANGE=YES on latest row); skip existing CONTRACT_ID+EFFECTIVE_DATE"
+        "[rateChangeLogSyncTrigger] Scheduled (every 30 min Eastern, 8:00 AM–7:30 PM): BQ CONTRACT_ID scan -> ch_rate_change_logs (RATE_CHANGE=YES on latest row); skip existing CONTRACT_ID+OWNERSHIP_EFFECTIVE_DATE"
       );
       logLine("[rateChangeLogSyncTrigger] Invoking syncRateChangeLogsFromBigQuery");
 

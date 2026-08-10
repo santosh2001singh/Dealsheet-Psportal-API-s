@@ -3,9 +3,9 @@ const assert = require("node:assert/strict");
 
 const { pickDeliveryPocForRow, applyDeliveryPocForInsertRows } = require("./bigQueryClient");
 
-test("pickDeliveryPocForRow: prefers VP_SRVP when filled", () => {
-  const p = pickDeliveryPocForRow({ VP_SRVP: "Amy Gupta", VP_SRVP_EMP_NO: "CY788", ACCOUNT_MANAGER: "Neelesh", ACCOUNT_MANAGER_EMP_NO: "CY1615" });
-  assert.equal(p.nameCol, "VP_SRVP");
+test("pickDeliveryPocForRow: prefers VP when filled", () => {
+  const p = pickDeliveryPocForRow({ VP: "Amy Gupta", VP_EMP_NO: "CY788", ACCOUNT_MANAGER: "Neelesh", ACCOUNT_MANAGER_EMP_NO: "CY1615" });
+  assert.equal(p.nameCol, "VP");
   assert.equal(p.name, "Amy Gupta");
   assert.equal(p.empNo, "CY788");
   assert.equal(p.isRecruiter, false);
@@ -13,8 +13,8 @@ test("pickDeliveryPocForRow: prefers VP_SRVP when filled", () => {
 
 test("pickDeliveryPocForRow: skips NA/blank and falls to ACCOUNT_MANAGER", () => {
   const p = pickDeliveryPocForRow({
-    VP_SRVP: "NA", VP_SRVP_EMP_NO: null,
-    GRP_DIR_ASSOC_GRP_DIR: "", GRP_DIR_ASSOC_GRP_DIR_EMP_NO: null,
+    VP: "NA", VP_EMP_NO: null,
+    ASSOCIATE_DELIVERY_DIRECTOR: "", ASSOCIATE_DELIVERY_DIRECTOR_EMP_NO: null,
     ACCOUNT_MANAGER: "Neelesh Vijay", ACCOUNT_MANAGER_EMP_NO: "CY1615",
     RM: "Alex Smith", RM_EMP_NO: "CY3248",
   });
@@ -25,7 +25,7 @@ test("pickDeliveryPocForRow: skips NA/blank and falls to ACCOUNT_MANAGER", () =>
 
 test("pickDeliveryPocForRow: only RM and ATL filled -> RM (RM is higher priority than ATL)", () => {
   const p = pickDeliveryPocForRow({
-    VP_SRVP: "NA", ACCOUNT_MANAGER: "NA", SECONDARY_AM: "NA", ASSOCIATE_AM: "NA",
+    VP: "NA", ACCOUNT_MANAGER: "NA", SECONDARY_AM: "NA", ASSOCIATE_AM: "NA",
     RM: "Alex Smith", RM_EMP_NO: "CY3248",
     ATL: "Some Atl", ATL_EMP_NO: "CY9",
   });
@@ -34,7 +34,7 @@ test("pickDeliveryPocForRow: only RM and ATL filled -> RM (RM is higher priority
 
 test("pickDeliveryPocForRow: all delivery roles blank/NA -> falls back to recruiter", () => {
   const p = pickDeliveryPocForRow({
-    VP_SRVP: "NA", ACCOUNT_MANAGER: null, RM: "NA", ATL: "",
+    VP: "NA", ACCOUNT_MANAGER: null, RM: "NA", ATL: "",
     ASSIGNMENT_RECRUITER: "Gurmeet Singh", RECRUITER_EMP_NO: "CY5565",
     ASSIGNMENT_RECRUITER_EMAIL: "gurmeet.s@cynethealth.com",
   });
@@ -44,15 +44,15 @@ test("pickDeliveryPocForRow: all delivery roles blank/NA -> falls back to recrui
 });
 
 test("pickDeliveryPocForRow: everyone blank -> null", () => {
-  assert.equal(pickDeliveryPocForRow({ VP_SRVP: "NA", RM: null, ASSIGNMENT_RECRUITER: "" }), null);
+  assert.equal(pickDeliveryPocForRow({ VP: "NA", RM: null, ASSIGNMENT_RECRUITER: "" }), null);
 });
 
 test("applyDeliveryPocForInsertRows: fills name/emp/email; recruiter email from row, others from directory", async () => {
   const rows = [
     // VP POC -> email from directory by emp_no
-    { PLACEMENT_ID: 1, VP_SRVP: "Amy Gupta", VP_SRVP_EMP_NO: "CY788" },
+    { PLACEMENT_ID: 1, VP: "Amy Gupta", VP_EMP_NO: "CY788" },
     // recruiter fallback -> email from ASSIGNMENT_RECRUITER_EMAIL directly
-    { PLACEMENT_ID: 2, VP_SRVP: "NA", ASSIGNMENT_RECRUITER: "Gurmeet Singh", RECRUITER_EMP_NO: "CY5565", ASSIGNMENT_RECRUITER_EMAIL: "gurmeet.s@cynethealth.com" },
+    { PLACEMENT_ID: 2, VP: "NA", ASSIGNMENT_RECRUITER: "Gurmeet Singh", RECRUITER_EMP_NO: "CY5565", ASSIGNMENT_RECRUITER_EMAIL: "gurmeet.s@cynethealth.com" },
     // already-set DELIVERY_POC -> frozen, untouched
     { PLACEMENT_ID: 3, DELIVERY_POC: "Frozen Person", DELIVERY_POC_EMP_NO: "CYX", ACCOUNT_MANAGER: "Someone", ACCOUNT_MANAGER_EMP_NO: "CY2" },
   ];
@@ -75,7 +75,7 @@ test("applyDeliveryPocForInsertRows: fills name/emp/email; recruiter email from 
 });
 
 test("applyDeliveryPocForInsertRows: falls back to name lookup when emp_no missing", async () => {
-  const rows = [{ PLACEMENT_ID: 1, VP_SRVP: "Amy Gupta", VP_SRVP_EMP_NO: null }];
+  const rows = [{ PLACEMENT_ID: 1, VP: "Amy Gupta", VP_EMP_NO: null }];
   const fetchEmailsFn = async (empNos, names) => {
     assert.deepEqual(empNos, []);
     assert.deepEqual(names, ["Amy Gupta"]);

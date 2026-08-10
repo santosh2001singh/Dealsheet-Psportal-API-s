@@ -65,13 +65,13 @@ function parseStartDateMs(value) {
  * @returns {string|null}
  */
 function buildContractMatchKey(row) {
-  const candidateNexusId = toInt64OrNull(row?.CANDIDATE_NEXUS_ID);
+  const candidateNexusId = toInt64OrNull(row?.CANDIDATE_ID);
   if (candidateNexusId == null) return null;
   const clientId = toInt64OrNull(row?.CLIENT_ID);
   if (clientId == null) return null;
   const email =
     row?.CANDIDATE_EMAIL == null ? "" : String(row.CANDIDATE_EMAIL).trim().toLowerCase();
-  const phone = row?.PHONE_NUMBER == null ? "" : String(row.PHONE_NUMBER).trim();
+  const phone = row?.CELL_PHONE == null ? "" : String(row.CELL_PHONE).trim();
   return `${candidateNexusId}|${email}|${phone}|${clientId}`;
 }
 
@@ -333,9 +333,9 @@ async function resolveContractIdsForRows(rows, deps = {}) {
 
     unresolvedExtensions.push({
       placementId: extPlacementId,
-      candidateNexusId: toInt64OrNull(row.CANDIDATE_NEXUS_ID),
+      candidateNexusId: toInt64OrNull(row.CANDIDATE_ID),
       candidateEmail: row.CANDIDATE_EMAIL,
-      phoneNumber: row.PHONE_NUMBER,
+      phoneNumber: row.CELL_PHONE,
       clientId: toInt64OrNull(row.CLIENT_ID),
       startDate: row.START_DATE,
       tableId: resolveTableIdFn(row),
@@ -369,6 +369,12 @@ async function resolveContractIdsForRows(rows, deps = {}) {
 
 /**
  * Phase B — allocate CONTRACT_IDs for DEAL rows in the final post-filter insert batch.
+ *
+ * DEAL_TYPE='DEAL' rows are the ONLY rows in the system that mint a CONTRACT_ID; the
+ * `normalizeDealTypeKey(row?.DEAL_TYPE) !== "DEAL"` skip below is that invariant and must stay.
+ * EXTENSION rows only ever inherit an existing id (in-batch DEAL map, BigQuery lookup, or
+ * applyExtensionInheritForInsertRows), exactly like SKU_NUMBER — see
+ * resolveContractIdsForRunrateMatchedExtensions in bigQueryClient.js.
  *
  * @param {object[]} rowsToInsert
  * @param {object} [deps]

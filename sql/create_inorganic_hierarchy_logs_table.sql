@@ -10,17 +10,17 @@
 -- MISC.directory_employees). INORGANIC_ONSITE_AM and INORGANIC_ACCOUNTS_DIRECTOR_SR_AM_VERTICAL_HEAD
 -- have no designation synonym list yet and are always NULL until one is supplied.
 -- SECONDARY_AM and SECONDARY_RECRUITER are intentionally not tracked in this table.
--- INORGANIC_AVP / _EMP_NO added when AVP (Associate Vice President - Delivery) was split out of VP_SRVP.
+-- INORGANIC_AVP / _EMP_NO added when AVP (Associate Vice President - Delivery) was split out of VP.
 
 CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.inorganic_hierarchy_logs` (
   ID STRING NOT NULL,
-  DATE_AND_TIME TIMESTAMP NOT NULL,
+  LAST_UPDATED TIMESTAMP NOT NULL,
   PLACEMENT_ID INT64,
   PLACEMENT_STATUS STRING,
   DEAL_SHEET_ID INT64,
   CANDIDATE_NAME STRING,
-  CANDIDATE_NEXUS_ID INT64,
-  EFFECTIVE_DATE DATE,
+  CANDIDATE_ID INT64,
+  OWNERSHIP_EFFECTIVE_DATE DATE,
   RECRUITER_EMAIL_ID STRING,
   RECRUITER_NAME STRING,
   INORGANIC_RECRUITER STRING,

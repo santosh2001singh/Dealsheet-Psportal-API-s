@@ -39,13 +39,26 @@ test("compareContractIds orders by numeric suffix not lexicographic", () => {
 });
 
 test("getContractIdConfigForTable returns per-table prefix and start", () => {
+  // cynet health restarts at CHC23000 (Aug 2026); canada/locums keep the original 1000 start.
   const cfg = getContractIdConfigForTable("cynet_health_deal_sheet");
   assert.equal(cfg.prefix, "CHC");
-  assert.equal(cfg.startValue, 1000);
+  assert.equal(cfg.startValue, 23000);
   assert.equal(cfg.docId, "cynet_health_deal_sheet");
+
+  const canada = getContractIdConfigForTable("cynet_health_canada_deal_sheet");
+  assert.equal(canada.prefix, "CAC");
+  assert.equal(canada.startValue, 1000);
 
   const loc = getContractIdConfigForTable("cynet_locums_deal_sheet");
   assert.equal(loc.prefix, "LOC");
+  assert.equal(loc.startValue, 1000);
+});
+
+test("a fresh cynet health sequence starts at CHC23000", () => {
+  const opts = buildSequenceOptionsForTable("cynet_health_deal_sheet");
+  assert.equal(opts.prefix, "CHC");
+  assert.equal(opts.startValue, 23000);
+  assert.equal(formatContractId(opts.prefix, opts.startValue), "CHC23000");
 });
 
 test("buildSequenceOptionsForTable includes docId and prefix", () => {

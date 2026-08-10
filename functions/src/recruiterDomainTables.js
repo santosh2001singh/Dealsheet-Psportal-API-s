@@ -106,9 +106,63 @@ function resolveRunrateTableIdForDealSheetTable(tableId) {
   return config.runrateTableId;
 }
 
+/**
+ * Sync domains. Each scheduled trigger runs exactly one of these, so cynet health can stay live and
+ * untouched while canada / locums are being worked on: a domain's run only ever reads and writes its
+ * own table, and keeps its own checkpoint. Domain is decided by ASSIGNMENT_RECRUITER_EMAIL, the same
+ * signal resolveActiveDealSheetTableId already routes on, so a filtered run and an unfiltered one
+ * land the same rows in the same table.
+ */
+const SYNC_DOMAINS = ["health", "canada", "locums"];
+
+const DOMAIN_TO_ACTIVE_TABLE = new Map([
+  ["health", TABLE_CYNET_HEALTH],
+  ["canada", TABLE_CYNET_HEALTH_CANADA],
+  ["locums", TABLE_CYNET_LOCUMS],
+]);
+
+/**
+ * Normalize a domain name from params/env. Returns null for empty/unknown, which callers must treat
+ * as "no filter — process every domain" (the pre-split behaviour).
+ * @param {unknown} domain
+ * @returns {string|null}
+ */
+function normalizeSyncDomain(domain) {
+  const key = String(domain ?? "").trim().toLowerCase();
+  if (!key) return null;
+  return DOMAIN_TO_ACTIVE_TABLE.has(key) ? key : null;
+}
+
+/**
+ * Active deal sheet table a domain owns.
+ * @param {unknown} domain
+ * @returns {string|null}
+ */
+function resolveActiveDealSheetTableIdForDomain(domain) {
+  const key = normalizeSyncDomain(domain);
+  return key ? DOMAIN_TO_ACTIVE_TABLE.get(key) : null;
+}
+
+/**
+ * True when a row belongs to `domain`. A null/unknown domain matches everything, so callers can pass
+ * the raw param straight through without branching.
+ * @param {unknown} domain
+ * @param {unknown} email - ASSIGNMENT_RECRUITER_EMAIL
+ * @returns {boolean}
+ */
+function rowMatchesSyncDomain(domain, email) {
+  const wanted = resolveActiveDealSheetTableIdForDomain(domain);
+  if (!wanted) return true;
+  return resolveActiveDealSheetTableId(email) === wanted;
+}
+
 module.exports = {
   ACTIVE_DEAL_SHEET_TABLE_IDS,
   resolveActiveDealSheetTableId,
+  SYNC_DOMAINS,
+  normalizeSyncDomain,
+  resolveActiveDealSheetTableIdForDomain,
+  rowMatchesSyncDomain,
   buildActiveDealSheetRoutingSentinel,
   TABLE_CYNET_HEALTH,
   TABLE_CYNET_HEALTH_CANADA,

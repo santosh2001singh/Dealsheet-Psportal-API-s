@@ -21,7 +21,7 @@ test("resolveExtensionRunrateHierarchyColumns drops AVP for all_locums_runrate o
   const locumsCols = resolveExtensionRunrateHierarchyColumns("all_locums_runrate");
   assert.ok(!locumsCols.includes("AVP"));
   // Every other confirmed-present column stays.
-  for (const col of ["TEAM_LEAD", "ATL", "RM", "ACCOUNT_MANAGER", "SECONDARY_AM", "ASSOCIATE_AM", "GRP_DIR_ASSOC_GRP_DIR", "VP_SRVP"]) {
+  for (const col of ["TEAM_LEAD", "ATL", "RM", "ACCOUNT_MANAGER", "SECONDARY_AM", "ASSOCIATE_AM", "ASSOCIATE_DELIVERY_DIRECTOR", "VP"]) {
     assert.ok(locumsCols.includes(col), `expected ${col} to remain for all_locums_runrate`);
   }
 });

@@ -1,5 +1,5 @@
 /**
- * Compute W2_PAY_RATE_NEW and chained FINAL_*_NEW / NEW_MARGIN fields.
+ * Compute W2_PAY_RATE_NEW and chained FINAL_*_NEW / CALCULATED_MARGIN fields.
  */
 
 function toNumberOrZero(v) {
@@ -60,7 +60,7 @@ function computeW2PayRateNew(row) {
   const taxable = toNumberOrZero(row?.TOTAL_BONUS_TAXABLE);
   const nonTaxable = toNumberOrZero(row?.TOTAL_BONUS_NON_TAXABLE);
   const po = toNumberOrZero(row?.PO_HOURS);
-  const orient = toNumberOrZero(row?.ORIENTATION_HOURS);
+  const orient = toNumberOrZero(row?.NBO_HOURS);
 
   const stateBranch = useRegularHours
     ? rh1 * fwh * pay
@@ -90,7 +90,7 @@ function computeFinalPayRateNew(row, w2PayRateNew) {
   const fwh = toNumberOrZero(row?.FIRST_WEEK_HOURS);
   const swh = toNumberOrZero(row?.SECOND_WEEK_HOURS);
   const po = toNumberOrZero(row?.PO_HOURS);
-  const orient = toNumberOrZero(row?.ORIENTATION_HOURS);
+  const orient = toNumberOrZero(row?.NBO_HOURS);
   const denom = po - orient;
   if (!Number.isFinite(denom) || denom === 0) return null;
 
@@ -102,7 +102,7 @@ function computeFinalCostNew(row, finalPayRateNew) {
   if (finalPayRateNew == null) return null;
 
   const po = toNumberOrZero(row?.PO_HOURS);
-  const orient = toNumberOrZero(row?.ORIENTATION_HOURS);
+  const orient = toNumberOrZero(row?.NBO_HOURS);
   const denom = po - orient;
   if (!Number.isFinite(denom) || denom === 0) return null;
 
@@ -112,7 +112,7 @@ function computeFinalCostNew(row, finalPayRateNew) {
 
 function computeFinalBillRateNew(row) {
   const po = toNumberOrZero(row?.PO_HOURS);
-  const orient = toNumberOrZero(row?.ORIENTATION_HOURS);
+  const orient = toNumberOrZero(row?.NBO_HOURS);
   const denom = po - orient;
   if (!Number.isFinite(denom) || denom === 0) return null;
 
@@ -159,13 +159,13 @@ function computeNewRateFamily(row) {
   const FINAL_PAY_RATE_NEW = computeFinalPayRateNew(row, W2_PAY_RATE_NEW);
   const FINAL_COST_NEW = computeFinalCostNew(row, FINAL_PAY_RATE_NEW);
   const FINAL_BILL_RATE_NEW = computeFinalBillRateNew(row);
-  const NEW_MARGIN = computeNewMargin(row, FINAL_BILL_RATE_NEW, FINAL_COST_NEW);
+  const CALCULATED_MARGIN = computeNewMargin(row, FINAL_BILL_RATE_NEW, FINAL_COST_NEW);
   return {
     W2_PAY_RATE_NEW: round2(W2_PAY_RATE_NEW),
     FINAL_PAY_RATE_NEW: round2(FINAL_PAY_RATE_NEW),
     FINAL_COST_NEW: round2(FINAL_COST_NEW),
     FINAL_BILL_RATE_NEW: round2(FINAL_BILL_RATE_NEW),
-    NEW_MARGIN: round2(NEW_MARGIN),
+    CALCULATED_MARGIN: round2(CALCULATED_MARGIN),
   };
 }
 

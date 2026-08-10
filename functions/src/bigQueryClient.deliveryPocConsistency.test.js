@@ -10,10 +10,10 @@ const {
 
 test("AVP outranks ACCOUNT_MANAGER for DELIVERY_POC (Batasha-type case)", () => {
   const row = {
-    VP_SRVP: "NA",
+    VP: "NA",
     AVP: "Maneet Gupta",
     AVP_EMP_NO: "CY2088",
-    GRP_DIR_ASSOC_GRP_DIR: null,
+    ASSOCIATE_DELIVERY_DIRECTOR: null,
     DELIVERY_DIRECTOR: null,
     ACCOUNT_MANAGER: "Hardik Khurana",
     ACCOUNT_MANAGER_EMP_NO: "CY2121",
@@ -29,9 +29,9 @@ test("AVP outranks ACCOUNT_MANAGER for DELIVERY_POC (Batasha-type case)", () => 
 
 test("DELIVERY_DIRECTOR wins when VP/AVP/GRP_DIR absent but above ACCOUNT_MANAGER", () => {
   const row = {
-    VP_SRVP: "NA",
+    VP: "NA",
     AVP: null,
-    GRP_DIR_ASSOC_GRP_DIR: null,
+    ASSOCIATE_DELIVERY_DIRECTOR: null,
     DELIVERY_DIRECTOR: "Deepti Sharma",
     DELIVERY_DIRECTOR_EMP_NO: "CY1166",
     ACCOUNT_MANAGER: "Someone Else",
@@ -42,10 +42,10 @@ test("DELIVERY_DIRECTOR wins when VP/AVP/GRP_DIR absent but above ACCOUNT_MANAGE
   assert.equal(picked.empNo, "CY1166");
 });
 
-test("VP_SRVP still outranks AVP", () => {
+test("VP still outranks AVP", () => {
   const row = {
-    VP_SRVP: "Top Boss",
-    VP_SRVP_EMP_NO: "CY1",
+    VP: "Top Boss",
+    VP_EMP_NO: "CY1",
     AVP: "Maneet Gupta",
     AVP_EMP_NO: "CY2088",
   };
@@ -61,14 +61,14 @@ test("name 'NA' with populated emp-no -> emp-no forced to 'NA'", () => {
     TEAM_LEAD_EMP_NO: "CY1554",
     ACCOUNT_MANAGER: "NA",
     ACCOUNT_MANAGER_EMP_NO: "CY1615",
-    GRP_DIR_ASSOC_GRP_DIR: "Deepti Sharma",
-    GRP_DIR_ASSOC_GRP_DIR_EMP_NO: "CY1166",
+    ASSOCIATE_DELIVERY_DIRECTOR: "Deepti Sharma",
+    ASSOCIATE_DELIVERY_DIRECTOR_EMP_NO: "CY1166",
   };
   const out = applyHierarchyNameEmpConsistency(row);
   assert.equal(out.TEAM_LEAD_EMP_NO, "NA");
   assert.equal(out.ACCOUNT_MANAGER_EMP_NO, "NA");
   // present name -> emp-no untouched
-  assert.equal(out.GRP_DIR_ASSOC_GRP_DIR_EMP_NO, "CY1166");
+  assert.equal(out.ASSOCIATE_DELIVERY_DIRECTOR_EMP_NO, "CY1166");
 });
 
 test("null / blank name also clears emp-no to 'NA'", () => {
@@ -107,14 +107,14 @@ test("DELIVERY_POC pair is also enforced", () => {
 test("pickInorganicRestrictedDeliveryPocForRow: VP wins when all 4 present", () => {
   const { pickInorganicRestrictedDeliveryPocForRow } = require("./bigQueryClient");
   const row = {
-    VP_SRVP: "Top Boss",
-    VP_SRVP_EMP_NO: "CY1",
+    VP: "Top Boss",
+    VP_EMP_NO: "CY1",
     AVP: "Middle Manager",
     AVP_EMP_NO: "CY2088",
     DELIVERY_DIRECTOR: "Deepti Sharma",
     DELIVERY_DIRECTOR_EMP_NO: "CY1166",
-    GRP_DIR_ASSOC_GRP_DIR: "Group Lead",
-    GRP_DIR_ASSOC_GRP_DIR_EMP_NO: "CY999",
+    ASSOCIATE_DELIVERY_DIRECTOR: "Group Lead",
+    ASSOCIATE_DELIVERY_DIRECTOR_EMP_NO: "CY999",
     ACCOUNT_MANAGER: "Hardik Khurana",
     ACCOUNT_MANAGER_EMP_NO: "CY2121",
     RM: "Sahil Kumar",
@@ -128,12 +128,12 @@ test("pickInorganicRestrictedDeliveryPocForRow: VP wins when all 4 present", () 
 test("pickInorganicRestrictedDeliveryPocForRow: AVP picked when VP absent", () => {
   const { pickInorganicRestrictedDeliveryPocForRow } = require("./bigQueryClient");
   const row = {
-    VP_SRVP: null,
+    VP: null,
     AVP: "Maneet Gupta",
     AVP_EMP_NO: "CY2088",
     DELIVERY_DIRECTOR: "Deepti Sharma",
     DELIVERY_DIRECTOR_EMP_NO: "CY1166",
-    GRP_DIR_ASSOC_GRP_DIR: null,
+    ASSOCIATE_DELIVERY_DIRECTOR: null,
     ACCOUNT_MANAGER: "Hardik Khurana",
     ACCOUNT_MANAGER_EMP_NO: "CY2121",
   };
@@ -145,10 +145,10 @@ test("pickInorganicRestrictedDeliveryPocForRow: AVP picked when VP absent", () =
 test("pickInorganicRestrictedDeliveryPocForRow: ACCOUNT_MANAGER ignored (not in restricted list)", () => {
   const { pickInorganicRestrictedDeliveryPocForRow } = require("./bigQueryClient");
   const row = {
-    VP_SRVP: null,
+    VP: null,
     AVP: null,
     DELIVERY_DIRECTOR: null,
-    GRP_DIR_ASSOC_GRP_DIR: null,
+    ASSOCIATE_DELIVERY_DIRECTOR: null,
     ACCOUNT_MANAGER: "Hardik Khurana",
     ACCOUNT_MANAGER_EMP_NO: "CY2121",
     RM: "Sahil Kumar",
@@ -161,11 +161,11 @@ test("pickInorganicRestrictedDeliveryPocForRow: ACCOUNT_MANAGER ignored (not in 
 test("pickInorganicRestrictedDeliveryPocForRow: GRP_DIR picked when VP/AVP/DELIVERY_DIRECTOR absent", () => {
   const { pickInorganicRestrictedDeliveryPocForRow } = require("./bigQueryClient");
   const row = {
-    VP_SRVP: "NA",
+    VP: "NA",
     AVP: null,
     DELIVERY_DIRECTOR: null,
-    GRP_DIR_ASSOC_GRP_DIR: "Deepti Sharma",
-    GRP_DIR_ASSOC_GRP_DIR_EMP_NO: "CY1166",
+    ASSOCIATE_DELIVERY_DIRECTOR: "Deepti Sharma",
+    ASSOCIATE_DELIVERY_DIRECTOR_EMP_NO: "CY1166",
     ACCOUNT_MANAGER: "Hardik Khurana",
     ACCOUNT_MANAGER_EMP_NO: "CY2121",
   };

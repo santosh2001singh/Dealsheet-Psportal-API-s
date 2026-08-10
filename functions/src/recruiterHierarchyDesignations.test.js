@@ -3,15 +3,16 @@ const assert = require("node:assert/strict");
 
 const {
   isCsmHierarchyExcludedTitle,
+  isCsmHierarchyExcludedRow,
   resolveCsmLevelsFromChain,
   resolveHierarchyColumnForTitle,
 } = require("./recruiterHierarchyDesignations");
 
 test("resolveHierarchyColumnForTitle handles real '<role> - Delivery' title suffixes", () => {
-  // The bug: "Vice President - Delivery" (Amy Gupta's actual directory title) didn't match VP_SRVP.
-  assert.equal(resolveHierarchyColumnForTitle("Vice President - Delivery"), "VP_SRVP");
-  assert.equal(resolveHierarchyColumnForTitle("Vice President"), "VP_SRVP");
-  // Associate VP is its own designation now (split out of VP_SRVP).
+  // The bug: "Vice President - Delivery" (Amy Gupta's actual directory title) didn't match VP.
+  assert.equal(resolveHierarchyColumnForTitle("Vice President - Delivery"), "VP");
+  assert.equal(resolveHierarchyColumnForTitle("Vice President"), "VP");
+  // Associate VP is its own designation now (split out of VP).
   assert.equal(resolveHierarchyColumnForTitle("AVP - Delivery"), "AVP");
   assert.equal(resolveHierarchyColumnForTitle("Associate Vice President - Delivery"), "AVP");
   assert.equal(resolveHierarchyColumnForTitle("AVP"), "AVP");
@@ -21,8 +22,8 @@ test("resolveHierarchyColumnForTitle handles real '<role> - Delivery' title suff
   assert.equal(resolveHierarchyColumnForTitle("Recruitment Manager"), "RM");
   assert.equal(resolveHierarchyColumnForTitle("Associate Delivery Manager"), "ASSOCIATE_AM");
   // Group-director titles whose suffix is NOT in the trailing-qualifier allowlist.
-  assert.equal(resolveHierarchyColumnForTitle("Director - Business Operations"), "GRP_DIR_ASSOC_GRP_DIR");
-  assert.equal(resolveHierarchyColumnForTitle("Director delivery for Public Sector"), "GRP_DIR_ASSOC_GRP_DIR");
+  assert.equal(resolveHierarchyColumnForTitle("Director - Business Operations"), "ASSOCIATE_DELIVERY_DIRECTOR");
+  assert.equal(resolveHierarchyColumnForTitle("Director delivery for Public Sector"), "ASSOCIATE_DELIVERY_DIRECTOR");
   // Non-roles still resolve to null (suffix strip must not create false matches).
   assert.equal(resolveHierarchyColumnForTitle("Chief Growth Officer (CGO)"), null);
   assert.equal(resolveHierarchyColumnForTitle("Some Team - Delivery"), null);
@@ -44,6 +45,33 @@ test("resolveCsmLevelsFromChain maps hierarchy_level 1/2/3 to LEVEL_2/3/4_CSM", 
     { hierarchy_level: "1", manager_name: "Jodi Stanton", manager_title: "AVP Client Relationship & Strategy" },
     { hierarchy_level: "2", manager_name: "Ron Bagga", manager_title: "Chief Growth Officer (CGO)" },
     { hierarchy_level: "3", manager_name: "Nick Budhiraja", manager_title: "CO-CEO" },
+  ]);
+  assert.deepEqual(levels, {
+    LEVEL_2_CSM: "Jodi Stanton",
+    LEVEL_3_CSM: null,
+    LEVEL_4_CSM: null,
+  });
+});
+
+test("isCsmHierarchyExcludedRow falls back to the person-level flag when the row's title is NULL", () => {
+  // manager_title is NULL on some snapshots for managers who carry an excluded title on others.
+  assert.equal(isCsmHierarchyExcludedRow({ manager_title: null, manager_excluded_ever: true }), true);
+  assert.equal(isCsmHierarchyExcludedRow({ manager_title: null, manager_excluded_ever: false }), false);
+  // The row's own title still excludes on its own, flag absent or not.
+  assert.equal(isCsmHierarchyExcludedRow({ manager_title: "CO-CEO" }), true);
+  assert.equal(isCsmHierarchyExcludedRow({ manager_title: "Chief Growth Officer (CGO)", manager_excluded_ever: false }), true);
+  assert.equal(isCsmHierarchyExcludedRow({ manager_title: "AVP Client Relationship & Strategy" }), false);
+  assert.equal(isCsmHierarchyExcludedRow(null), false);
+});
+
+test("resolveCsmLevelsFromChain excludes C-level managers on NULL-title snapshots", () => {
+  // Regression: the 2026-03-13 snapshot of Shadowlyn Cochran's chain has manager_title NULL at
+  // every level, so the row-level title check passed and Ron Bagga (CGO) / Nick Budhiraja (CO-CEO)
+  // were written into LEVEL_3_CSM / LEVEL_4_CSM. The person-level flag now excludes them anyway.
+  const levels = resolveCsmLevelsFromChain([
+    { hierarchy_level: "1", manager_name: "Jodi Stanton", manager_title: null, manager_excluded_ever: false },
+    { hierarchy_level: "2", manager_name: "Ron Bagga", manager_title: null, manager_excluded_ever: true },
+    { hierarchy_level: "3", manager_name: "Nick Budhiraja", manager_title: null, manager_excluded_ever: true },
   ]);
   assert.deepEqual(levels, {
     LEVEL_2_CSM: "Jodi Stanton",
