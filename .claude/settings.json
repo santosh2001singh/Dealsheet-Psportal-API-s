@@ -87,7 +87,17 @@
       "Bash(bq --project_id=cynetdatabase query --use_legacy_sql=false --format=csv \"SELECT table_id, row_count, TIMESTAMP_MILLIS\\(last_modified_time\\) last_mod FROM \\\\`cynetdatabase.rr_project_data.__TABLES__\\\\` WHERE table_id='deal_sheet_cluster_trace'\")",
       "Bash(bq --project_id=cynetdatabase query --use_legacy_sql=false --format=csv \"SELECT WHY_BLANK, COUNT\\(*\\) c FROM \\\\`cynetdatabase.rr_project_data.deal_sheet_cluster_trace\\\\` WHERE WHY_BLANK IS NOT NULL GROUP BY 1 ORDER BY 2 DESC LIMIT 8\")",
       "Bash(bq --project_id=cynetdatabase query --use_legacy_sql=false --format=csv \"SELECT RECRUITER_NAME, EMAIL_ID, EFFECTIVE_DATE, OLD_CLUSTER, NEW_CLUSTER, TOWER_HEAD, REMARKS FROM \\\\`cynetdatabase.Cluster_Data.rec_cluster_historical_data\\\\` WHERE LOWER\\(TRIM\\(EMAIL_ID\\)\\)='suraj.r2@cynethealth.com' ORDER BY EFFECTIVE_DATE\")",
-      "Bash(bq --project_id=cynetdatabase query --use_legacy_sql=false --format=csv \"SELECT RECRUITER_NAME, EMAIL_ID, EFFECTIVE_DATE, OLD_CLUSTER, NEW_CLUSTER FROM \\\\`cynetdatabase.Cluster_Data.rec_cluster_historical_data\\\\` WHERE LOWER\\(RECRUITER_NAME\\) LIKE '%suraj%' OR LOWER\\(EMAIL_ID\\) LIKE '%suraj%' ORDER BY RECRUITER_NAME, EFFECTIVE_DATE\")"
+      "Bash(bq --project_id=cynetdatabase query --use_legacy_sql=false --format=csv \"SELECT RECRUITER_NAME, EMAIL_ID, EFFECTIVE_DATE, OLD_CLUSTER, NEW_CLUSTER FROM \\\\`cynetdatabase.Cluster_Data.rec_cluster_historical_data\\\\` WHERE LOWER\\(RECRUITER_NAME\\) LIKE '%suraj%' OR LOWER\\(EMAIL_ID\\) LIKE '%suraj%' ORDER BY RECRUITER_NAME, EFFECTIVE_DATE\")",
+      "Bash(bq --project_id=cynetdatabase query --use_legacy_sql=false --format=csv \"SELECT EMPLOYEE_NAME, EMP_NO, DESIGNATION, STATUS FROM \\\\`cynetdatabase.MISC.directory_employees\\\\` WHERE EMP_NO='CY1714' OR LOWER\\(EMPLOYEE_NAME\\) LIKE '%mohit arora%' LIMIT 5\")",
+      "Bash(bq --project_id=cynetdatabase query --use_legacy_sql=false --format=csv \"SELECT column_name FROM \\\\`cynetdatabase.MISC.INFORMATION_SCHEMA.COLUMNS\\\\` WHERE table_name='directory_employees' AND \\(LOWER\\(column_name\\) LIKE '%desig%' OR LOWER\\(column_name\\) LIKE '%emp%' OR LOWER\\(column_name\\) LIKE '%name%' OR LOWER\\(column_name\\) LIKE '%status%'\\) ORDER BY 1\")",
+      "Bash(bq --project_id=cynetdatabase query --use_legacy_sql=false --format=csv \"SELECT column_name FROM \\\\`cynetdatabase.MISC.INFORMATION_SCHEMA.COLUMNS\\\\` WHERE table_name='directory_employees' ORDER BY ordinal_position\")",
+      "Bash(bq --project_id=cynetdatabase query --use_legacy_sql=false --format=csv \"SELECT name_full, external_id, email, title, status FROM \\\\`cynetdatabase.MISC.directory_employees\\\\` WHERE external_id='CY1714' OR LOWER\\(name_full\\) LIKE '%mohit arora%'\")",
+      "Bash(node --check functions/src/extensionParentBackfill.js)",
+      "Bash(bq --project_id=cynetdatabase rm -f -t cynetdatabase:rr_project_data._clone_ext_bf2)",
+      "Bash(bq --project_id=cynetdatabase rm -f -t cynetdatabase:rr_project_data._clone_ext_bf)",
+      "Bash(node --test functions/src/extensionParentBackfill.test.js)",
+      "Bash(bq --project_id=cynetdatabase query --use_legacy_sql=false --format=csv \"SELECT COUNT\\(*\\) c FROM \\\\`cynetdatabase.rr_project_data.all_CH_data_runrate\\\\` WHERE CONTRACT_ID='CHC23149'\")",
+      "Bash(bq --project_id=cynetdatabase query --use_legacy_sql=false --format=csv \"SELECT CONTRACT_ID, START_DATE, TENTATIVE_END_DATE, FACILITY_NAME, PARENT_CLIENT_NAME, SKU_NUMBER, INTERNAL_JOB_ID FROM \\\\`cynetdatabase.rr_project_data.all_CH_data_runrate\\\\` WHERE CAST\\(CANDIDATE_ID AS STRING\\)='30984028' ORDER BY START_DATE\")"
     ]
   }
 }

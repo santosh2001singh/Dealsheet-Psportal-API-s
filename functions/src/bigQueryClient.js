@@ -49,6 +49,10 @@ const {
 } = require("./departmentDataStatus");
 const { backfillExtensionRehire } = require("./extensionRehire");
 const { backfillClusterRegions } = require("./clusterRegionResolver");
+// Required lazily inside the wrapper: extensionParentBackfill reads
+// EXTENSION_PARENT_DEAL_INHERIT_COLUMNS back off this module, so a top-level require here would be a
+// cycle and would see an empty exports object.
+let backfillExtensionParentInherit = null;
 
 let bigquery;
 const tableFqn = `${config.projectId}.${config.datasetId}.${config.tableId}`;
@@ -3003,27 +3007,39 @@ function buildLegacyContractLookupKey(row) {
   const nexusKey = candidateId !== "" && jobId !== "" ? `${candidateId}|${jobId}` : null;
 
   const email = row.CANDIDATE_EMAIL == null ? "" : String(row.CANDIDATE_EMAIL).trim().toLowerCase();
-  const startDate = row.START_DATE == null ? "" : String(row.START_DATE).trim().slice(0, 10);
+  const dateOnly = (v) => {
+    const s = v == null ? "" : String(v).trim().slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : "";
+  };
+  const startDate = dateOnly(row.START_DATE);
+  const endDate = dateOnly(row.END_DATE);
+  const tentativeEndDate = dateOnly(row.TENTATIVE_END_DATE);
   const facility =
     row.FACILITY_NAME == null ? "" : String(row.FACILITY_NAME).trim().toLowerCase();
   const parentClient =
     row.PARENT_CLIENT_NAME == null ? "" : String(row.PARENT_CLIENT_NAME).trim().toLowerCase();
 
-  // Primary match rule, specified by the data team: candidate (id OR email) + START_DATE falling
-  // inside the run-rate row's START..TENTATIVE_END span + facility + parent client. All four parts
-  // are required — the candidate half is satisfied by either identifier, since 4,653 of 21,849
-  // run-rate rows carry no CANDIDATE_ID at all but every one of them has an email.
+  // Primary match rule, specified by the data team: candidate (id OR email) + facility + parent
+  // client, plus ANY ONE of the deal row's three dates falling inside the run-rate row's window.
+  // The candidate half is satisfied by either identifier, since 4,653 of 21,849 run-rate rows carry
+  // no CANDIDATE_ID at all but every one of them has an email.
   //
-  // The span (rather than an exact START_DATE) is what makes this work: a contract Nexus re-issues
-  // mid-flight comes back with a shifted START_DATE, so the deal row's date lands inside the
-  // original run-rate row's window instead of on its edge. Measured over the 2,354 live DEAL rows,
-  // exact-date matching resolved 1,439 and the span resolved 1,864.
+  // Why any-of rather than START_DATE alone (Aug 2026): Nexus re-issues a contract mid-flight with a
+  // SHIFTED start, so the deal row can begin BEFORE the run-rate row it belongs to and START_DATE
+  // then falls outside the window entirely. Jemal Saleh's deal started 2026-03-15 against a run-rate
+  // window of 2026-03-28..2026-12-12 — START_DATE missed, END_DATE (2026-03-31) and
+  // TENTATIVE_END_DATE (2026-06-27) both landed inside, and because nothing matched the row minted a
+  // second CONTRACT_ID (CHC23149) for a contract that already had one (CHC21804).
+  //
+  // Requiring all three dates instead was measured and rejected: it collapses matches from 1,865 to
+  // 709, because a BOOKED/STARTED placement has no END_DATE yet. Any-of resolves 1,905 with the same
+  // 5 ambiguous rows as before.
   const spanKey =
     (candidateId !== "" || email !== "") &&
-    /^\d{4}-\d{2}-\d{2}$/.test(startDate) &&
+    (startDate !== "" || endDate !== "" || tentativeEndDate !== "") &&
     facility !== "" &&
     parentClient !== ""
-      ? { candidateId, email, startDate, facility, parentClient }
+      ? { candidateId, email, startDate, endDate, tentativeEndDate, facility, parentClient }
       : null;
 
   if (!spanKey && !nexusKey) return null;
@@ -3047,6 +3063,8 @@ function buildSpanKeyString(spanKey) {
     spanKey.candidateId ?? "",
     spanKey.email ?? "",
     spanKey.startDate ?? "",
+    spanKey.endDate ?? "",
+    spanKey.tentativeEndDate ?? "",
     spanKey.facility ?? "",
     spanKey.parentClient ?? "",
   ].join("|");
@@ -3064,10 +3082,11 @@ function buildSpanKeyString(spanKey) {
  * history fall through to a freshly minted id.
  *
  * Two match tiers, tried in order — the first that matches wins:
- *   1. The data team's rule (primary): candidate (CANDIDATE_ID OR CANDIDATE_EMAIL) + START_DATE
- *      inside the run-rate row's START..TENTATIVE_END span + FACILITY_NAME + PARENT_CLIENT_NAME.
- *      All four parts required. See buildLegacyContractLookupKey for why the span beats an exact
- *      date (1,864 vs 1,439 of the 2,354 live DEAL rows).
+ *   1. The data team's rule (primary): candidate (CANDIDATE_ID OR CANDIDATE_EMAIL) + FACILITY_NAME +
+ *      PARENT_CLIENT_NAME, plus ANY ONE of the deal row's START_DATE / END_DATE /
+ *      TENTATIVE_END_DATE falling inside the run-rate row's window. The window is
+ *      START_DATE .. COALESCE(END_DATE, TENTATIVE_END_DATE). See buildLegacyContractLookupKey for why
+ *      any-of rather than START_DATE alone, and why requiring all three was rejected.
  *   2. CANDIDATE_ID + INTERNAL_JOB_ID (fallback): exact Nexus identity, 17,005 of 21,849 run-rate
  *      rows. Tier 1 owns the decision; this only catches what it cannot see. Both tiers were
  *      measured head to head on live data: tier 1 resolves 442 rows tier 2 misses, tier 2 resolves
@@ -3121,10 +3140,15 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
   const byNexusKey = new Map();
 
   if (spanKeysByString.size > 0) {
+    // A blank date becomes CAST(NULL AS DATE): `NULL BETWEEN a AND b` is NULL, so an absent date
+    // simply never satisfies its arm of the OR — no extra guard needed.
+    const dateLit = (v) =>
+      v == null || v === "" ? "CAST(NULL AS DATE)" : `DATE '${escapeSqlString(v)}'`;
     const structs = [...spanKeysByString.values()].map(
       (k) =>
         `STRUCT('${escapeSqlString(k.candidateId)}' AS cand, '${escapeSqlString(k.email)}' AS em, ` +
-        `DATE '${escapeSqlString(k.startDate)}' AS st, '${escapeSqlString(k.facility)}' AS fac, ` +
+        `${dateLit(k.startDate)} AS st, ${dateLit(k.endDate)} AS ed, ` +
+        `${dateLit(k.tentativeEndDate)} AS te, '${escapeSqlString(k.facility)}' AS fac, ` +
         `'${escapeSqlString(k.parentClient)}' AS pc)`
     );
     // The candidate half matches on either identifier; a blank one on the deal row simply never
@@ -3140,18 +3164,20 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
           w.cand AS cand,
           w.em AS em,
           CAST(w.st AS STRING) AS st,
+          CAST(w.ed AS STRING) AS ed,
+          CAST(w.te AS STRING) AS te,
           w.fac AS fac,
           w.pc AS pc,
           r.CONTRACT_ID AS contract_id,
           r.SKU_NUMBER AS sku_number,
           ${manualSelect},
           ROW_NUMBER() OVER (
-            PARTITION BY w.cand, w.em, w.st, w.fac, w.pc
-            -- An exact START_DATE hit wins over a merely-spanning one. The span is inclusive, so a
+            PARTITION BY w.cand, w.em, w.st, w.ed, w.te, w.fac, w.pc
+            -- An exact START_DATE hit wins over a merely-spanning one. The window is inclusive, so a
             -- re-booking at the same facility sits inside its own predecessor's window too (the
             -- previous contract runs to 2026-02-28, the new one starts 2026-02-23) and ordering by
             -- START_DATE alone would hand the row to the contract it just replaced. Preferring the
-            -- exact match keeps the span as what it was meant to be: a fallback for shifted dates.
+            -- exact match keeps the window as what it was meant to be: a fallback for shifted dates.
             ORDER BY
               CASE WHEN r.START_DATE = w.st THEN 0 ELSE 1 END ASC,
               r.START_DATE DESC,
@@ -3162,13 +3188,20 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
         JOIN wanted w
           ON ( (w.cand != '' AND CAST(r.CANDIDATE_ID AS STRING) = w.cand)
                OR (w.em != '' AND LOWER(TRIM(r.CANDIDATE_EMAIL)) = w.em) )
-         AND w.st BETWEEN r.START_DATE AND IFNULL(r.TENTATIVE_END_DATE, r.START_DATE)
+         -- ANY ONE of the deal row's three dates inside the run-rate window is enough. A shifted
+         -- re-issue can push START_DATE outside it while END/TENTATIVE_END still land inside.
+         AND ( w.st BETWEEN r.START_DATE AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE)
+            OR w.ed BETWEEN r.START_DATE AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE)
+            OR w.te BETWEEN r.START_DATE AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE) )
          AND LOWER(TRIM(r.FACILITY_NAME)) = w.fac
          AND LOWER(TRIM(r.PARENT_CLIENT_NAME)) = w.pc
         WHERE r.CONTRACT_ID IS NOT NULL AND TRIM(r.CONTRACT_ID) != ''
           AND r.START_DATE IS NOT NULL
+          -- The window needs an end: END_DATE preferred, TENTATIVE_END_DATE when it is absent.
+          AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE) IS NOT NULL
       )
-      SELECT cand, em, st, fac, pc, contract_id, sku_number, ${manualOut} FROM ranked WHERE rn = 1
+      SELECT cand, em, st, ed, te, fac, pc, contract_id, sku_number, ${manualOut}
+      FROM ranked WHERE rn = 1
     `;
     const found = await queryObjects(sql, spanKeysByString.size);
     for (const r of found) {
@@ -3176,6 +3209,8 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
         r.cand ?? "",
         r.em ?? "",
         String(r.st ?? "").slice(0, 10),
+        String(r.ed ?? "").slice(0, 10),
+        String(r.te ?? "").slice(0, 10),
         r.fac ?? "",
         r.pc ?? "",
       ].join("|");
@@ -7451,6 +7486,40 @@ async function backfillExtensionRehireForDealSheets(options = {}) {
 }
 
 /**
+ * Fill inherited fields on EXTENSION rows whose parent DEAL was synced AFTER them.
+ *
+ * applyExtensionInheritForInsertRows only looks for the parent at insert time, so an extension that
+ * arrives first is written with CONTRACT_ID / SKU_NUMBER / hierarchy / ops all null and nothing ever
+ * goes back for it. Fill-if-empty, UPDATE-only, idempotent — see extensionParentBackfill.js.
+ * @param {object} [options] - { datasetId }
+ * @returns {Promise<{updated:number|null, byTable:Object<string,number>}>}
+ */
+async function backfillExtensionParentInheritForDealSheets(options = {}) {
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+
+  if (backfillExtensionParentInherit == null) {
+    ({ backfillExtensionParentInherit } = require("./extensionParentBackfill"));
+  }
+
+  const result = await backfillExtensionParentInherit(
+    { projectId: config.projectId, datasetId },
+    // Multi-statement script: bigquery.query returns the rows of the final SELECT (per-table counts).
+    { queryFn: (sql) => queryObjects(sql, 100) }
+  );
+
+  const byTableStr = Object.entries(result.byTable)
+    .map(([t, n]) => `${t}=${n}`)
+    .join(" ");
+  logDetail(
+    `[deal sheet] EXTENSION parent-deal late-arrival backfill: filledRows=${result.updated == null ? "n/a" : result.updated} ${byTableStr}`
+  );
+  return result;
+}
+
+/**
  * Fill RECRUITER_CLUSTER_REGION / CLIENT_CLUSTER_REGION / CLUSTER_TYPE on the cynet health deal sheet
  * (active + ended) with where each side sat AT THE TIME OF THE PLACEMENT, then rebuild the trace table
  * holding the full per-row reasoning. See clusterRegionResolver.js for the rules.
@@ -7812,6 +7881,7 @@ module.exports = {
   backfillDeliveryPocForActive,
   backfillExtensionRehireForDealSheets,
   backfillClusterRegionsForDealSheets,
+  backfillExtensionParentInheritForDealSheets,
   applyPreviousRecruiterOnRecruiterChange,
   finalizeDealSheetRowForResponse,
 };

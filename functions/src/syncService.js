@@ -58,6 +58,7 @@ const {
   backfillDeliveryPocForActive,
   backfillExtensionRehireForDealSheets,
   backfillClusterRegionsForDealSheets,
+  backfillExtensionParentInheritForDealSheets,
   backfillExtensionLegacyPreviousRecruiterForActive,
   finalizeDealSheetRowForResponse,
   hasBusinessColumnChanges,
@@ -2592,7 +2593,9 @@ async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
   //  3) EXTENSION PREVIOUS_RECRUITER from Cluster_Data.ownership_data when still empty.
   //  4) EXT_OR_REHIRE_BY_RMG ("Extension/Rehire") recompute across active + ended tables — a new
   //     extension has to flip its PARENT DEAL row to 'EXTENSION', which insert-time rules cannot do.
-  //  5) RECRUITER_CLUSTER_REGION / CLIENT_CLUSTER_REGION / CLUSTER_TYPE on the cynet health tables
+  //  5) EXTENSION rows whose parent DEAL was synced AFTER them: insert-time inherit found no parent,
+  //     so CONTRACT_ID / SKU_NUMBER / hierarchy / ops were left null. Nothing else goes back for them.
+  //  6) RECRUITER_CLUSTER_REGION / CLIENT_CLUSTER_REGION / CLUSTER_TYPE on the cynet health tables
   //     (fill-if-empty), plus the cluster trace rebuild. Post-sync because the recruiter history and
   //     the client cluster tables move independently of any one placement.
   let empNoNaResult = { updated: null };
@@ -2629,6 +2632,17 @@ async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
     );
   }
 
+  let extParentResult = { updated: null };
+  try {
+    extParentResult = await backfillExtensionParentInheritForDealSheets({
+      datasetId: dealSheetDatasetId,
+    });
+  } catch (epErr) {
+    logLine(
+      `[deal sheet] EXTENSION parent-deal late-arrival backfill failed (non-fatal): ${String(epErr?.message || epErr).slice(0, 200)}`
+    );
+  }
+
   let clusterRegionResult = { updated: null };
   try {
     clusterRegionResult = await backfillClusterRegionsForDealSheets({
@@ -2641,7 +2655,7 @@ async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
   }
 
   const elapsedStr = formatDuration(Date.now() - startMs);
-  logLine(`[ownership change logs] effective-date overwrite DONE ownershipUpdated=${result.updated == null ? "n/a" : result.updated} dealSheetUpdated=${dealSheetResult.updated == null ? "n/a" : dealSheetResult.updated} empNoNaFixed=${empNoNaResult.updated == null ? "n/a" : empNoNaResult.updated} deliveryPocFixed=${pocResult.updated == null ? "n/a" : pocResult.updated} prevRecruiterFixed=${prevRecruiterResult.updated == null ? "n/a" : prevRecruiterResult.updated} extensionRehireFixed=${extensionRehireResult.updated == null ? "n/a" : extensionRehireResult.updated} clusterRegionFilled=${clusterRegionResult.updated == null ? "n/a" : clusterRegionResult.updated} elapsed=${elapsedStr}`);
+  logLine(`[ownership change logs] effective-date overwrite DONE ownershipUpdated=${result.updated == null ? "n/a" : result.updated} dealSheetUpdated=${dealSheetResult.updated == null ? "n/a" : dealSheetResult.updated} empNoNaFixed=${empNoNaResult.updated == null ? "n/a" : empNoNaResult.updated} deliveryPocFixed=${pocResult.updated == null ? "n/a" : pocResult.updated} prevRecruiterFixed=${prevRecruiterResult.updated == null ? "n/a" : prevRecruiterResult.updated} extensionRehireFixed=${extensionRehireResult.updated == null ? "n/a" : extensionRehireResult.updated} extParentFilled=${extParentResult.updated == null ? "n/a" : extParentResult.updated} clusterRegionFilled=${clusterRegionResult.updated == null ? "n/a" : clusterRegionResult.updated} elapsed=${elapsedStr}`);
   return {
     updated: result.updated,
     dealSheetUpdated: dealSheetResult.updated,

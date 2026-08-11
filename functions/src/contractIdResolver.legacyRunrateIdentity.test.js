@@ -39,16 +39,56 @@ function fetchStub(entries, spy) {
 }
 
 test("buildLegacyContractLookupKey: builds both tiers when the row has full identity", () => {
-  const key = buildLegacyContractLookupKey(dealRow());
+  const key = buildLegacyContractLookupKey(
+    dealRow({ END_DATE: "2026-09-01", TENTATIVE_END_DATE: "2026-10-15" })
+  );
   assert.deepEqual(key.spanKey, {
     candidateId: "8629683",
     email: "wesbyq@aol.com",
     startDate: "2026-06-01",
+    endDate: "2026-09-01",
+    tentativeEndDate: "2026-10-15",
     facility: "the mount sinai hospital",
     parentClient: "mount sinai health system",
   });
   assert.equal(key.nexusKey, "8629683|35450411");
   assert.equal(key.rowKey, "ds:5213876");
+});
+
+// Any ONE of the three dates is enough to form the key. A BOOKED/STARTED placement has no END_DATE
+// yet, and requiring all three was measured to collapse matches from 1,865 to 709.
+test("buildLegacyContractLookupKey: any one of the three dates forms the key", () => {
+  const onlyStart = buildLegacyContractLookupKey(dealRow());
+  assert.equal(onlyStart.spanKey.startDate, "2026-06-01");
+  assert.equal(onlyStart.spanKey.endDate, "");
+  assert.equal(onlyStart.spanKey.tentativeEndDate, "");
+
+  const onlyEnd = buildLegacyContractLookupKey(dealRow({ START_DATE: null, END_DATE: "2026-09-01" }));
+  assert.ok(onlyEnd.spanKey, "END_DATE alone is enough");
+  assert.equal(onlyEnd.spanKey.startDate, "");
+  assert.equal(onlyEnd.spanKey.endDate, "2026-09-01");
+
+  const onlyTent = buildLegacyContractLookupKey(
+    dealRow({ START_DATE: null, TENTATIVE_END_DATE: "2026-10-15" })
+  );
+  assert.ok(onlyTent.spanKey, "TENTATIVE_END_DATE alone is enough");
+  assert.equal(onlyTent.spanKey.tentativeEndDate, "2026-10-15");
+});
+
+test("buildLegacyContractLookupKey: no usable date at all leaves the primary key null", () => {
+  const key = buildLegacyContractLookupKey(
+    dealRow({ START_DATE: null, END_DATE: null, TENTATIVE_END_DATE: null })
+  );
+  assert.equal(key.spanKey, null);
+  assert.equal(key.nexusKey, "8629683|35450411", "the fallback tier is still available");
+});
+
+test("buildLegacyContractLookupKey: a malformed date is dropped, not carried through", () => {
+  const key = buildLegacyContractLookupKey(
+    dealRow({ START_DATE: "06/01/2026", END_DATE: "2026-09-01" })
+  );
+  assert.equal(key.spanKey.startDate, "", "06/01/2026 is not an ISO date");
+  assert.equal(key.spanKey.endDate, "2026-09-01");
 });
 
 // The primary key needs all four parts. Facility and parent client are what the data team's rule
