@@ -48,6 +48,7 @@ const {
   normalizeNameKey,
 } = require("./departmentDataStatus");
 const { backfillExtensionRehire } = require("./extensionRehire");
+const { backfillClusterRegions } = require("./clusterRegionResolver");
 
 let bigquery;
 const tableFqn = `${config.projectId}.${config.datasetId}.${config.tableId}`;
@@ -7450,6 +7451,39 @@ async function backfillExtensionRehireForDealSheets(options = {}) {
 }
 
 /**
+ * Fill RECRUITER_CLUSTER_REGION / CLIENT_CLUSTER_REGION / CLUSTER_TYPE on the cynet health deal sheet
+ * (active + ended) with where each side sat AT THE TIME OF THE PLACEMENT, then rebuild the trace table
+ * holding the full per-row reasoning. See clusterRegionResolver.js for the rules.
+ *
+ * FILL-IF-EMPTY: all three stay in MANUAL_COLUMNS and a hand-edited value is never overwritten, so
+ * this is safe to re-run. Post-sync rather than insert-time, because the recruiter history and the
+ * client cluster tables move independently of any one placement — a recruiter's region change has to
+ * be picked up by rows that were inserted before it was recorded.
+ * @param {object} [options] - { datasetId, skipTrace }
+ * @returns {Promise<{updated:number|null, byTable:Object<string,number>, traceTableId:string|null}>}
+ */
+async function backfillClusterRegionsForDealSheets(options = {}) {
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+
+  const result = await backfillClusterRegions(
+    { projectId: config.projectId, datasetId, skipTrace: options.skipTrace === true },
+    // Multi-statement script: bigquery.query returns the rows of the final SELECT (per-table counts).
+    { queryFn: (sql) => queryObjects(sql, 100) }
+  );
+
+  const byTableStr = Object.entries(result.byTable)
+    .map(([t, n]) => `${t}=${n}`)
+    .join(" ");
+  logDetail(
+    `[deal sheet] cluster/region fill: updatedRows=${result.updated == null ? "n/a" : result.updated} ${byTableStr} trace=${result.traceTableId || "skipped"}`
+  );
+  return result;
+}
+
+/**
  * Keep ownership_change_logs' placement dates in sync with the placement's CURRENT (latest)
  * deal-sheet row, matched by PLACEMENT_ID. Every row for that PLACEMENT_ID is overwritten, with the
  * two date columns following the row's own rule (both anchored on the SAME placement, so the two
@@ -7777,6 +7811,7 @@ module.exports = {
   backfillHierarchyEmpNoNaForActive,
   backfillDeliveryPocForActive,
   backfillExtensionRehireForDealSheets,
+  backfillClusterRegionsForDealSheets,
   applyPreviousRecruiterOnRecruiterChange,
   finalizeDealSheetRowForResponse,
 };
