@@ -969,6 +969,42 @@ function sumOrNull(values) {
   return total;
 }
 
+/**
+ * GROSS_MARGIN for Cynet Health deal sheets (locums/canada carry their own MARGIN logic).
+ *
+ * Branch order mirrors the source sheet formula exactly — FT, then the Cynet Locum
+ * dentist carve-out, then the missing-bill-rate guard:
+ *   FT                            -> 0
+ *   Cynet Locum + Dentist         -> FINAL_BILL_RATE - FINAL_COST
+ *   FINAL_BILL_RATE "NA" / blank  -> 0
+ *   otherwise                     -> FINAL_BILL_RATE - FINAL_PAY_RATE
+ *
+ * Computed from the old rate family only; the FINAL_*_NEW family feeds CALCULATED_MARGIN.
+ * @param {Record<string, *>} row
+ * @param {number|null} finalBillRate
+ * @param {number|null} finalPayRate
+ * @param {number|null} finalCost
+ * @returns {number}
+ */
+function computeGrossMargin(row, finalBillRate, finalPayRate, finalCost) {
+  const placementType = row?.PLACEMENT_TYPE == null
+    ? ""
+    : String(row.PLACEMENT_TYPE).trim().toUpperCase();
+  if (placementType === "FT") return 0;
+
+  const parentClientName = row?.PARENT_CLIENT_NAME == null
+    ? ""
+    : String(row.PARENT_CLIENT_NAME).trim();
+  const position = row?.SPECIALTY == null ? "" : String(row.SPECIALTY).trim().toUpperCase();
+  if (parentClientName === "Cynet Locum" && position === "DENTIST") {
+    // Sheet parity: blank rates coerce to 0 here rather than falling through to the NA guard.
+    return round2((finalBillRate ?? 0) - (finalCost ?? 0));
+  }
+
+  if (finalBillRate == null) return 0;
+  return round2(finalBillRate - (finalPayRate ?? 0));
+}
+
 /** Placement statuses for which DAYS_WORKED = END_DATE - START_DATE is computed. */
 const DAYS_WORKED_ELIGIBLE_STATUSES = new Set([
   "ENDED",
@@ -1087,6 +1123,7 @@ function computeDerivedPlacementFields(row) {
     FINAL_BILL_RATE: finalBillRate,
     FINAL_COST: finalCost,
     NET_MARGIN: netMargin,
+    GROSS_MARGIN: computeGrossMargin(row, finalBillRate, finalPayRate, finalCost),
     GM_OT: gmOt,
     DAYS_WORKED: daysWorked,
   };
@@ -1582,6 +1619,7 @@ const API_OWNED_COLUMNS = new Set([
   "FINAL_HOLIDAY_PAY_RATE",
   "FINAL_CALL_BACK_PAY_RATE",
   "NET_MARGIN",
+  "GROSS_MARGIN",
   "GM_OT",
   "DAYS_WORKED",
   "W2_PAY_RATE_NEW",
