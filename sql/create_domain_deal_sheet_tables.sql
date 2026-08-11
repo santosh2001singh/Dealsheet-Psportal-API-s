@@ -68,6 +68,9 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_deal_shee
   CELL_PHONE STRING,
   CANDIDATE_EMAIL STRING,
   DEAL_SHEET_ID INT64,
+  -- Nexus deal sheet's own created_date (ISO instant, e.g. 2026-06-23T17:34:16Z). API-owned: written
+  -- from the deal sheet detail on every sync, never hand-edited.
+  DEAL_SHEET_CREATED_DATE TIMESTAMP,
   PROFESSION STRING,
   PROFESSION_ID INT64,
   HOURLY_GP FLOAT64,
@@ -80,7 +83,10 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_deal_shee
   ONSITE_VP_AVP INT64,
   ONSITE_CLIENT_OWNER INT64,
   ASSOCIATE_SALES_PERSON INT64,
-  CLIENT_NAME_IN_CONREP INT64,
+  -- STRING since Aug 2026 (was INT64, and empty in every table). Holds the client's name as spelled
+  -- in Conrep ("State of NC", "Carle Foundation Hospital - RightSourcing"), matching the run-rate
+  -- column it is filled from. Manual, but carried from the matched run-rate row when blank.
+  CLIENT_NAME_IN_CONREP STRING,
   EDIT_DATE TIMESTAMP,
   EDITED_BY INT64,
   OWNERSHIP_EFFECTIVE_DATE DATE,

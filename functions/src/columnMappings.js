@@ -179,8 +179,15 @@ function mapDealSheetDetailToBq(dealSheet) {
   const meal = toNumberOrNull(dealSheet?.meal_amount);
   const vmsFee = toNumberOrNull(dealSheet?.vms_fee);
 
+  // Nexus sends an ISO instant ("2026-06-23T17:34:16Z"); pass it through as a trimmed string the way
+  // SUBMISSION_DATE does and let BigQuery parse it into the TIMESTAMP column.
+  const createdRaw = dealSheet?.created_date;
+  const createdStr =
+    createdRaw == null || String(createdRaw).trim() === "" ? null : String(createdRaw).trim();
+
   return {
     DEAL_SHEET_ID: dealSheet?.id ?? null,
+    DEAL_SHEET_CREATED_DATE: createdStr,
     WEEKLY_PER_DIEM_NON_TAXED: addNumbersOrNull(lodging, meal),
     DEAL_TYPE: dealSheet?.type ?? null,
     GP_PERCENTAGE: toNumberOrNull(dealSheet?.gross_margin_percentage),
@@ -1498,6 +1505,9 @@ const API_OWNED_COLUMNS = new Set([
   "NEXUS_PARENT_CLIENT_ID",
   "PARENT_CLIENT_NAME",
   "DEAL_SHEET_ID",
+  // Nexus deal sheet's own created_date. API-owned: it is a fact about the deal sheet record, so it
+  // is re-read on every sync rather than frozen (Nexus can back-date a correction).
+  "DEAL_SHEET_CREATED_DATE",
   "DEAL_SHEET_STATUS",
   "INTERNAL_JOB_ID",
   "CANDIDATE_ID",

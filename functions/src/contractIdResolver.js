@@ -31,6 +31,7 @@ const {
   fetchContractIdsForExtensions,
   fetchLegacyContractIdentityForDealRows,
   buildLegacyContractLookupKey,
+  legacyDealManualColumns,
 } = require("./bigQueryClient");
 const { resolveActiveDealSheetTableId } = require("./recruiterDomainTables");
 
@@ -391,6 +392,10 @@ function skuEligibleForLegacyFill(row) {
  * and the legacy row actually carries one — many older run-rate rows have a CONTRACT_ID and no SKU,
  * and a null there must not overwrite anything.
  *
+ * The manual / ops columns in legacyDealManualColumns() come across on the same matched row, also
+ * fill-if-empty, so a DEAL that the run-rate table already tracked keeps the same hand-maintained
+ * detail an EXTENSION of it would inherit. SKU_NUMBER is the only field gated on PLACEMENT_STATUS.
+ *
  * A lookup failure is non-fatal: rows simply fall through to a freshly minted id, which is the
  * pre-existing behaviour. Losing the legacy link on one run is recoverable; failing the whole insert
  * batch is not.
@@ -424,6 +429,7 @@ async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
 
   let reused = 0;
   let skuFilled = 0;
+  let manualFilled = 0;
   for (const row of dealRows) {
     if (row.CONTRACT_ID != null) continue;
     const key = buildLegacyContractLookupKey(row);
@@ -447,11 +453,23 @@ async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
         skuFilled++;
       }
     }
+
+    // Manual / ops columns off the same matched run-rate row, fill-if-empty — the DEAL-side twin of
+    // what EXTENSION rows already inherit. Not gated on PLACEMENT_STATUS: only the SKU above is
+    // withheld from DID NOT START / DID NOT ACCEPT rows, since these describe the contract rather
+    // than an assignment that ran.
+    for (const col of legacyDealManualColumns()) {
+      const legacyValue = identity?.[col];
+      if (legacyValue == null || String(legacyValue).trim() === "") continue;
+      if (row[col] != null && String(row[col]).trim() !== "") continue;
+      row[col] = typeof legacyValue === "string" ? legacyValue.trim() : legacyValue;
+      manualFilled++;
+    }
   }
 
   if (reused > 0) {
     logDetail(
-      `[contractId allocator] legacy run-rate identity applied: dealRows=${dealRows.length} contractIdReused=${reused} skuFilled=${skuFilled}`
+      `[contractId allocator] legacy run-rate identity applied: dealRows=${dealRows.length} contractIdReused=${reused} skuFilled=${skuFilled} manualFieldsFilled=${manualFilled}`
     );
   }
   return reused;

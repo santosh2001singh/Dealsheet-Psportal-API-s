@@ -93,6 +93,13 @@ test("EXTENSION_RUNRATE_MANUAL_COLUMNS covers sales/credentialing/payment + SECO
     "CANDIDATE_PAYMENT_TERMS",
     "SECONDARY_RECRUITER",
     "SECONDARY_RECRUITER_EMP_NO",
+    // Added Aug 2026, when this list also became the DEAL-side manual fill (legacyDealManualColumns).
+    "ENTITY",
+    "FIFTYTWO_TENURE_RTO_LASTDATE",
+    "FIFTYTWO_TENURE_CANDIDATE_STATUS",
+    "ST_DT_PUSHBACK_REASON",
+    // Deal sheet column altered INT64 -> STRING to match the run-rate column it is filled from.
+    "CLIENT_NAME_IN_CONREP",
   ];
   assert.deepEqual([...EXTENSION_RUNRATE_MANUAL_COLUMNS], expected);
   assert.equal(EXTENSION_RUNRATE_MANUAL_COLUMNS.includes("ASSIGNMENT_RECRUITER"), false);

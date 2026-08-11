@@ -14,6 +14,9 @@ const {
   mapDealSheetHoursDetailsToBq,
   formatBillableOrientationPercent,
   coerceApiFloatNullsToZero,
+  API_OWNED_COLUMNS,
+  MANUAL_COLUMNS,
+  SYSTEM_CONTROLLED_COLUMNS,
 } = require("./columnMappings");
 
 test("formatBillableOrientationPercent normalizes Nexus values", () => {
@@ -34,6 +37,40 @@ test("mapDealSheetDetailToBq maps billable orientation from Nexus deal sheet", (
   assert.equal(out.NBO_HOURS, 16);
   assert.equal(out.BILLABLE_ORIENTATION_HRS, 24);
   assert.equal(out.BILLABLE_ORIENTATION, "70.00%");
+});
+
+// DEAL_SHEET_CREATED_DATE is the Nexus deal sheet's own created_date, passed through as the ISO
+// instant Nexus sends and parsed by BigQuery into the TIMESTAMP column (verified against a real
+// streaming insert, which is what the sync uses).
+test("mapDealSheetDetailToBq carries the deal sheet created_date", () => {
+  const out = mapDealSheetDetailToBq({
+    id: 5236068,
+    type: "DEAL",
+    created_date: "2026-06-23T17:34:16Z",
+    modified_date: "2026-07-16T17:18:58Z",
+  });
+  assert.equal(out.DEAL_SHEET_ID, 5236068);
+  assert.equal(out.DEAL_SHEET_CREATED_DATE, "2026-06-23T17:34:16Z");
+});
+
+test("mapDealSheetDetailToBq: created_date is trimmed, and blank becomes null", () => {
+  assert.equal(
+    mapDealSheetDetailToBq({ id: 1, created_date: "  2026-06-23T17:34:16Z  " }).DEAL_SHEET_CREATED_DATE,
+    "2026-06-23T17:34:16Z"
+  );
+  for (const blank of [null, undefined, "", "   "]) {
+    assert.equal(
+      mapDealSheetDetailToBq({ id: 1, created_date: blank }).DEAL_SHEET_CREATED_DATE,
+      null,
+      `created_date ${JSON.stringify(blank)} -> null`
+    );
+  }
+});
+
+test("DEAL_SHEET_CREATED_DATE is API-owned, not manual or system-controlled", () => {
+  assert.equal(API_OWNED_COLUMNS.has("DEAL_SHEET_CREATED_DATE"), true);
+  assert.equal(MANUAL_COLUMNS.has("DEAL_SHEET_CREATED_DATE"), false);
+  assert.equal(SYSTEM_CONTROLLED_COLUMNS.has("DEAL_SHEET_CREATED_DATE"), false);
 });
 
 test("coerceApiFloatNullsToZero defaults billable orientation fields", () => {

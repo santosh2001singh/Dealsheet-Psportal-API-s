@@ -64,6 +64,8 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_ended_dea
   CELL_PHONE STRING,
   CANDIDATE_EMAIL STRING,
   DEAL_SHEET_ID INT64,
+  -- Nexus deal sheet's own created_date — see the active table DDL.
+  DEAL_SHEET_CREATED_DATE TIMESTAMP,
   PROFESSION STRING,
   PROFESSION_ID INT64,
   HOURLY_GP FLOAT64,
@@ -78,7 +80,8 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_ended_dea
   ASSOCIATE_SALES_PERSON INT64,
   ORG_INORG_HIRE_DELIVERY INT64,
   ORG_INORG_HIRE_ONSITE INT64,
-  CLIENT_NAME_IN_CONREP INT64,
+  -- STRING since Aug 2026 (was INT64, and empty in every table) — see the active table DDL.
+  CLIENT_NAME_IN_CONREP STRING,
   EDIT_DATE TIMESTAMP,
   EDITED_BY INT64,
   OWNERSHIP_EFFECTIVE_DATE DATE,
