@@ -295,6 +295,20 @@ function candidatePhoneFromContactInfo(candidate) {
 }
 
 /**
+ * Get candidate secondary cell phone from contact info. Nexus stores it as leap_phone; it is often
+ * the same number as cell_phone, so no attempt is made to dedupe against the primary.
+ */
+function candidateSecondaryCellPhoneFromContactInfo(candidate) {
+  const rows = candidate?.candidate_contact_info;
+  if (!Array.isArray(rows)) return null;
+  for (const row of rows) {
+    const p = trimContactValue(row?.leap_phone);
+    if (p) return p;
+  }
+  return null;
+}
+
+/**
  * Map candidate to BigQuery schema
  */
 function mapCandidateToBq(candidate) {
@@ -309,6 +323,7 @@ function mapCandidateToBq(candidate) {
     CANDIDATE_STATUS: statusCode,
     CANDIDATE_EMAIL: candidateEmailFromContactInfo(candidate) ?? trimContactValue(candidate?.email),
     CELL_PHONE: candidatePhoneFromContactInfo(candidate) ?? trimContactValue(candidate?.phone),
+    SECONDARY_CELL_PHN: candidateSecondaryCellPhoneFromContactInfo(candidate),
   };
 }
 
@@ -1562,6 +1577,9 @@ const API_OWNED_COLUMNS = new Set([
   "CANDIDATE_STATUS",
   "CANDIDATE_EMAIL",
   "CELL_PHONE",
+  // Nexus candidate_contact_info[].leap_phone. Was the manual SECONDARY_EMAIL column until Aug 2026,
+  // renamed and made API-owned when leap_phone was identified as the secondary cell number.
+  "SECONDARY_CELL_PHN",
   "PROVIDER_TYPE",
   "RECRUITER_ID",
   "RECRUITER_EMP_NO",
@@ -1762,7 +1780,6 @@ const MANUAL_COLUMNS = new Set([
   "RM_EMP_NO",
   "SECONDARY_AM",
   "SECONDARY_AM_EMP_NO",
-  "SECONDARY_EMAIL",
   "SECONDARY_RECRUITER",
   "SECONDARY_RECRUITER_EMP_NO",
   "SECONDARY_SALES_PERSON",

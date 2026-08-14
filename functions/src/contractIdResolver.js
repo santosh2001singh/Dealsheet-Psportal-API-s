@@ -430,6 +430,8 @@ async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
   let reused = 0;
   let skuFilled = 0;
   let manualFilled = 0;
+  let initialStartSet = 0;
+  let initialStartRejected = 0;
   for (const row of dealRows) {
     if (row.CONTRACT_ID != null) continue;
     const key = buildLegacyContractLookupKey(row);
@@ -445,12 +447,37 @@ async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
     // DID NOT ACCEPT row never became a working assignment, so it must not inherit the legacy SKU
     // even when the run-rate row carries one — CONTRACT_ID still comes across, since the contract
     // identity is what ties the row to its chain.
+    // Overwrites rather than fills: the SKU belongs to the contract just matched, so a value carried
+    // over from a different contract has to give way. A null on the legacy row still overwrites
+    // nothing — many older run-rate rows have a CONTRACT_ID and no SKU.
     if (skuEligibleForLegacyFill(row)) {
       const legacySku = identity?.SKU_NUMBER;
-      const rowSkuEmpty = row.SKU_NUMBER == null || String(row.SKU_NUMBER).trim() === "";
-      if (rowSkuEmpty && legacySku != null && String(legacySku).trim() !== "") {
-        row.SKU_NUMBER = String(legacySku).trim();
-        skuFilled++;
+      if (legacySku != null && String(legacySku).trim() !== "") {
+        const proposedSku = String(legacySku).trim();
+        if (row.SKU_NUMBER == null || String(row.SKU_NUMBER).trim() !== proposedSku) {
+          row.SKU_NUMBER = proposedSku;
+          skuFilled++;
+        }
+      }
+    }
+
+    // INITIAL_START_DATE is the matched run-rate row's START_DATE: that row IS the contract, so its
+    // start is the contract's true initial start. Unlike the fields above this OVERWRITES, because
+    // Nexus already supplies a value and on a split contract it is the placement's own start, not
+    // the contract's — a rate change on 04-01 within a contract that began 02-02 arrives carrying
+    // 04-01. Every placement-level row of one contract has to report the same initial start.
+    const legacyInitialStart = identity?.INITIAL_START_DATE;
+    if (legacyInitialStart != null && String(legacyInitialStart).trim() !== "") {
+      const proposed = String(legacyInitialStart).trim();
+      const ownStart = row.START_DATE == null ? "" : String(row.START_DATE).trim().slice(0, 10);
+      // An initial start AFTER the row's own start is impossible; that means the row matched a
+      // later contract's window. Leave the existing value alone and surface it rather than
+      // writing a self-contradictory date.
+      if (ownStart !== "" && proposed > ownStart) {
+        initialStartRejected++;
+      } else if (row.INITIAL_START_DATE == null || String(row.INITIAL_START_DATE).trim().slice(0, 10) !== proposed) {
+        row.INITIAL_START_DATE = proposed;
+        initialStartSet++;
       }
     }
 
@@ -469,7 +496,15 @@ async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
 
   if (reused > 0) {
     logDetail(
-      `[contractId allocator] legacy run-rate identity applied: dealRows=${dealRows.length} contractIdReused=${reused} skuFilled=${skuFilled} manualFieldsFilled=${manualFilled}`
+      `[contractId allocator] legacy run-rate identity applied: dealRows=${dealRows.length} contractIdReused=${reused} skuFilled=${skuFilled} initialStartSet=${initialStartSet} manualFieldsFilled=${manualFilled}`
+    );
+  }
+  // Surfaced rather than silently dropped: a proposed INITIAL_START_DATE later than the row's own
+  // START_DATE means the matched run-rate window belongs to a later contract, which is a data
+  // problem on one side or the other and worth seeing.
+  if (initialStartRejected > 0) {
+    logDetail(
+      `[contractId allocator] INITIAL_START_DATE rejected (later than the row's own START_DATE): ${initialStartRejected}`
     );
   }
   return reused;
@@ -500,17 +535,34 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
     deps.allocateContractIdsFn ?? allocateContractIds;
 
   const pendingDealRows = [];
+  const pendingExtensionRows = [];
   for (const row of rowsToInsert) {
     if (row == null) continue;
     if (row.CONTRACT_ID != null) continue;
-    if (normalizeDealTypeKey(row?.DEAL_TYPE) !== "DEAL") continue;
-    pendingDealRows.push(row);
+    const dealTypeKey = normalizeDealTypeKey(row?.DEAL_TYPE);
+    if (dealTypeKey === "DEAL") {
+      pendingDealRows.push(row);
+      continue;
+    }
+    // EXTENSION rows go through the SAME run-rate identity rule as DEALs (tier 1 below) but are
+    // kept out of pendingDealRows so they can never reach the Firestore allocation further down —
+    // minting for an extension produces a standalone id no DEAL row shares.
+    if (dealTypeKey === "EXTENSION") pendingExtensionRows.push(row);
   }
 
   // Legacy identity first: a placement the run-rate table already tracks keeps its original
   // CONTRACT_ID (and SKU_NUMBER) instead of minting a second id for the same contract. Only rows
   // with no run-rate history reach the Firestore sequence below.
   await applyLegacyContractIdentityToDealRows(pendingDealRows, { tableId, ...deps });
+
+  // Same rule for EXTENSION rows: the run-rate row IS the contract, so matching against its
+  // date window is what tells one of a candidate's contracts from the next. The extension-only
+  // tiers (parent DEAL / prior extension) match on identity alone and cannot make that
+  // distinction, so they run as a FALLBACK for extensions this rule cannot place — see
+  // applyExtensionInheritForInsertRows.
+  if (pendingExtensionRows.length > 0) {
+    await applyLegacyContractIdentityToDealRows(pendingExtensionRows, { tableId, ...deps });
+  }
 
   /** @type {Map<string, object[]>} */
   const needsAllocationByKey = new Map();

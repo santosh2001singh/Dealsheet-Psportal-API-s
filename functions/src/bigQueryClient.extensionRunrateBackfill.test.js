@@ -100,10 +100,44 @@ test("EXTENSION_RUNRATE_MANUAL_COLUMNS covers sales/credentialing/payment + SECO
     "ST_DT_PUSHBACK_REASON",
     // Deal sheet column altered INT64 -> STRING to match the run-rate column it is filled from.
     "CLIENT_NAME_IN_CONREP",
+    // Hand-written narrative that only ever existed on the run-rate side — null on every deal sheet
+    // row until it is carried across.
+    "BACKOUT_OR_TERMINATION",
+    "COMMENTS",
   ];
   assert.deepEqual([...EXTENSION_RUNRATE_MANUAL_COLUMNS], expected);
   assert.equal(EXTENSION_RUNRATE_MANUAL_COLUMNS.includes("ASSIGNMENT_RECRUITER"), false);
   assert.equal(EXTENSION_RUNRATE_MANUAL_COLUMNS.includes("RECRUITER_CLUSTER_REGION"), false);
+});
+
+test("the ops columns are inheritable from BOTH the run-rate row and a parent DEAL", () => {
+  // The set the business tracks by hand. Whichever tier places the row — the run-rate date window or
+  // its parent DEAL — has to be able to supply all of them, or a row loses the field purely because
+  // of which tier matched. Both lists are asserted so dropping one from either side fails here.
+  for (const col of [
+    "CLIENT_NAME_IN_CONREP",
+    "ENTITY",
+    "FIFTYTWO_TENURE_RTO_LASTDATE",
+    "FIFTYTWO_TENURE_CANDIDATE_STATUS",
+    "RECRUITMENT_MENTOR",
+    "SECONDARY_RECRUITER",
+    "ST_DT_PUSHBACK_REASON",
+    "CLIENT_RECRUITER",
+    "INVOICE_CYCLE_TO_CLIENT",
+    "CLIENT_PAYMENT_TERMS",
+    "CANDIDATE_PAYMENT_TERMS",
+    "BACKOUT_OR_TERMINATION",
+    "COMMENTS",
+  ]) {
+    assert.ok(
+      EXTENSION_RUNRATE_MANUAL_COLUMNS.includes(col),
+      `${col} is inheritable from the matched run-rate row`
+    );
+    assert.ok(
+      EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes(col),
+      `${col} is inheritable from the parent DEAL`
+    );
+  }
 });
 
 test("EXTENSION_PARENT_DEAL_INHERIT_COLUMNS includes hierarchy and ops fields but not assignment recruiter", () => {

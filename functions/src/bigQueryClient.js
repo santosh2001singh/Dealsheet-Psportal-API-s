@@ -1366,7 +1366,11 @@ async function resolveNewHireDatesForEndedRows(rows, options = {}) {
 }
 
 /**
- * Compute insert ID for deduplication
+ * Compute insert ID for deduplication.
+ *
+ * No longer used by insertAll: since the switch from streaming inserts to load jobs there is no
+ * insertId to attach. Retained because it is exported. Row-level dedupe is done explicitly in the
+ * insert*Batch functions (DEAL_SHEET_ID / PLACEMENT_ID / per-log dedupe keys) before insertAll runs.
  */
 function computeInsertId(obj, absoluteIndex, options = {}) {
   const field =
@@ -1444,57 +1448,106 @@ function computeDealSheetFirstInsertDateStamps() {
 }
 
 /**
- * Insert rows to BigQuery using streaming insert
+ * Build the newline-delimited JSON payload for a load job.
+ *
+ * Split out from insertAll so the row shaping (sanitize + LAST_UPDATED default + date stamps) can be
+ * unit-tested without touching BigQuery. Returns the NDJSON buffer plus the shaped rows.
  */
-async function insertAll(rows, options = {}) {
-  const { datasetId, tableId } = resolveBqDatasetTable(options);
-  const table = bigquery.dataset(datasetId).table(tableId);
-
-  const insertOptions = {
-    ignoreUnknownValues: config.bigQuery.ignoreUnknownValues,
-    skipInvalidRows: config.bigQuery.skipInvalidRows,
-    raw: true,
-  };
-
+function buildLoadJobPayload(rows, options = {}) {
   // Insert-time timestamp for auditing/debugging in BigQuery (TIMESTAMP column).
   // BigQuery accepts RFC3339/ISO-8601 like "2026-04-07T15:04:05.123Z".
   const insertTs = new Date().toISOString();
 
-  const formattedRows = rows.map((row, idx) => {
+  const jsonRows = rows.map((row) => {
     const clean = sanitizeRowForBigQueryStreamingInsert(row);
     const dateTime = clean?.LAST_UPDATED != null && String(clean.LAST_UPDATED).trim() !== ""
       ? clean.LAST_UPDATED
       : insertTs;
-    let json = {
+    const json = {
       ...clean,
       LAST_UPDATED: dateTime,
     };
     if (options.applyDealSheetDateStamps === true) {
       Object.assign(json, computeDealSheetFirstInsertDateStamps(clean, dateTime));
     }
-    return {
-      insertId: computeInsertId(clean, options.insertIdBase + idx, {
-        insertIdField: options.insertIdField,
-      }),
-      json,
-    };
+    // undefined would serialize away silently; null is the explicit "no value" BigQuery expects.
+    for (const [k, v] of Object.entries(json)) {
+      if (v === undefined) json[k] = null;
+    }
+    return json;
   });
 
+  const ndjson = jsonRows.map((r) => JSON.stringify(r)).join("\n");
+  return { jsonRows, buffer: Buffer.from(ndjson, "utf8") };
+}
+
+/**
+ * Insert rows to BigQuery using a LOAD JOB (not the streaming insert API).
+ *
+ * Streaming inserts (tabledata.insertAll) park rows in a streaming buffer for up to ~90 minutes, and
+ * BigQuery refuses any UPDATE/DELETE that would touch that buffer. The post-insert backfills in this
+ * pipeline (DELIVERY_POC, EXT_OR_REHIRE_BY_RMG, cluster/region) run seconds after the insert, so they
+ * failed on every single run. Load jobs write straight to managed storage — no buffer, so those DML
+ * steps succeed immediately.
+ *
+ * Two streaming-only behaviours are replaced rather than lost:
+ *   - skipInvalidRows  -> maxBadRecords (bad rows are skipped, the rest still load)
+ *   - insertId dedupe  -> nothing. It keyed on DEAL_SHEET_ID, but this pipeline appends multiple rows
+ *                         per DEAL_SHEET_ID by design (append-on-change), and BigQuery's dedupe is
+ *                         best-effort within a ~1 minute window, so it never actually fired. The real
+ *                         protection is the explicit DEAL_SHEET_ID/PLACEMENT_ID dedupe in
+ *                         insertEnrichedDealSheetBatch, which is untouched.
+ */
+async function insertAll(rows, options = {}) {
+  if (!rows || rows.length === 0) return { inserted: 0, attempted: 0, errors: [] };
+
+  const { datasetId, tableId } = resolveBqDatasetTable(options);
+  const table = bigquery.dataset(datasetId).table(tableId);
+
+  const { buffer } = buildLoadJobPayload(rows, options);
+
+  const loadOptions = {
+    sourceFormat: "NEWLINE_DELIMITED_JSON",
+    writeDisposition: "WRITE_APPEND",
+    createDisposition: "CREATE_NEVER",
+    ignoreUnknownValues: config.bigQuery.ignoreUnknownValues,
+    // Streaming used skipInvalidRows to drop bad rows and keep the rest; maxBadRecords is the load-job
+    // equivalent. Unbounded so a single malformed row can never fail an otherwise good batch.
+    maxBadRecords: config.bigQuery.skipInvalidRows ? rows.length : 0,
+  };
+
   try {
-    await table.insert(formattedRows, insertOptions);
-    return { inserted: rows.length, attempted: rows.length, errors: [] };
-  } catch (e) {
-    if (e.errors) {
-      const failedRows = new Set();
-      for (const rowError of e.errors) {
-        if (rowError && typeof rowError.row === "number") failedRows.add(rowError.row);
-      }
-      const failedCount = failedRows.size > 0 ? failedRows.size : e.errors.length;
-      const inserted = Math.max(0, rows.length - failedCount);
+    // table.load() only accepts a file path / GCS file, so feed the NDJSON through a write stream.
+    const completed = await new Promise((resolve, reject) => {
+      const stream = table.createWriteStream(loadOptions);
+      stream.on("error", reject);
+      stream.on("job", (job) => {
+        job.on("error", reject);
+        job.on("complete", (meta) => resolve(meta));
+      });
+      stream.end(buffer);
+    });
+
+    // outputRows is what actually landed; rows skipped via maxBadRecords are reported here (and in
+    // status.errors) rather than thrown, mirroring how skipInvalidRows silently dropped rows before.
+    const outputRows = Number(completed?.statistics?.load?.outputRows);
+    const inserted = Number.isFinite(outputRows) ? outputRows : rows.length;
+    const skippedErrors = completed?.status?.errors ?? [];
+    if (inserted < rows.length) {
       logError(
-        `[enriched sync] [BigQuery insertAll] ROW_ERRORS sample=${JSON.stringify(e.errors.slice(0, 3))}`
+        `[enriched sync] [BigQuery insertAll] BAD_ROWS_SKIPPED attempted=${rows.length} inserted=${inserted} sample=${JSON.stringify(skippedErrors.slice(0, 3))}`
       );
-      return { inserted, attempted: rows.length, errors: e.errors };
+    }
+    return { inserted, attempted: rows.length, errors: skippedErrors };
+  } catch (e) {
+    // Load jobs report row problems as job errors rather than per-row entries. Keep the same return
+    // shape (and log prefix) as the streaming path so callers and log greps keep working.
+    const errors = Array.isArray(e?.errors) && e.errors.length > 0 ? e.errors : null;
+    if (errors) {
+      logError(
+        `[enriched sync] [BigQuery insertAll] LOAD_ERRORS sample=${JSON.stringify(errors.slice(0, 3))}`
+      );
+      return { inserted: 0, attempted: rows.length, errors };
     }
     throw e;
   }
@@ -1792,11 +1845,6 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
   // empty (historical recruiter handovers that predate this sync). Freeze-once-set.
   rowsToInsert = await applyExtensionLegacyPreviousRecruiterForInsertRows(rowsToInsert);
 
-  rowsToInsert = await applyExtensionInheritForInsertRows(
-    rowsToInsert,
-    resolveBqDatasetTable(options)
-  );
-
   rowsToInsert = await applyDealRecruiterHierarchyForInsertRows(
     rowsToInsert,
     resolveBqDatasetTable(options)
@@ -1834,6 +1882,17 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     const { allocateContractIdsForInsertableRows } = require("./contractIdResolver");
     await allocateContractIdsForInsertableRows(rowsToInsert, { tableId: options.tableId });
   }
+
+  // AFTER the run-rate identity rule above, deliberately. That rule matches an EXTENSION against the
+  // run-rate row's date window, which is the only thing that can tell one of a candidate's contracts
+  // from the next; the tiers below match on candidate+client identity alone and cannot. Every tier
+  // here is fill-if-empty, so running them second makes them a fallback for extensions the window
+  // could not place (a contract whose run-rate END_DATE has not caught up with the extension yet)
+  // instead of a competitor that wins by going first.
+  rowsToInsert = await applyExtensionInheritForInsertRows(
+    rowsToInsert,
+    resolveBqDatasetTable(options)
+  );
 
   const generatedUuidField =
     typeof options.generatedUuidField === "string" && options.generatedUuidField.trim() !== ""
@@ -2947,6 +3006,22 @@ function normalizeLegacySkuOrNull(value) {
 }
 
 /**
+ * `YYYY-MM-DD` out of a run-rate DATE column, or null.
+ *
+ * BigQuery hands DATE back as a `{ value: "2026-02-02" }` wrapper, so unwrap before stringifying —
+ * the same trap `assignLegacyManualColumns` documents for FIFTYTWO_TENURE_RTO_LASTDATE, where a
+ * wrapper reaching date handling silently became null.
+ */
+function normalizeLegacyDateOnlyOrNull(value) {
+  if (value == null) return null;
+  const raw =
+    typeof value === "object" && !(value instanceof Date) && "value" in value ? value.value : value;
+  if (raw == null) return null;
+  const s = (raw instanceof Date ? raw.toISOString() : String(raw)).trim().slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+}
+
+/**
  * Manual / ops columns a DEAL row takes from its matched legacy run-rate row, fill-if-empty.
  *
  * Deliberately the same list EXTENSION rows use (EXTENSION_RUNRATE_MANUAL_COLUMNS): a placement that
@@ -3170,6 +3245,11 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
           w.pc AS pc,
           r.CONTRACT_ID AS contract_id,
           r.SKU_NUMBER AS sku_number,
+          -- The matched run-rate row is the contract, so its START_DATE is the contract's true
+          -- initial start. A deal sheet splits one contract into several placement-level rows on
+          -- every rate / ownership change, and each of those carries its OWN start; taking it from
+          -- here keeps every row of the contract on the same INITIAL_START_DATE.
+          r.START_DATE AS initial_start_date,
           ${manualSelect},
           ROW_NUMBER() OVER (
             PARTITION BY w.cand, w.em, w.st, w.ed, w.te, w.fac, w.pc
@@ -3200,7 +3280,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
           -- The window needs an end: END_DATE preferred, TENTATIVE_END_DATE when it is absent.
           AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE) IS NOT NULL
       )
-      SELECT cand, em, st, ed, te, fac, pc, contract_id, sku_number, ${manualOut}
+      SELECT cand, em, st, ed, te, fac, pc, contract_id, sku_number, initial_start_date, ${manualOut}
       FROM ranked WHERE rn = 1
     `;
     const found = await queryObjects(sql, spanKeysByString.size);
@@ -3220,6 +3300,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
           {
             CONTRACT_ID: normalizeContractIdOrNull(r.contract_id),
             SKU_NUMBER: normalizeLegacySkuOrNull(r.sku_number),
+            INITIAL_START_DATE: normalizeLegacyDateOnlyOrNull(r.initial_start_date),
           },
           r
         )
@@ -3244,6 +3325,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
           CAST(r.INTERNAL_JOB_ID AS STRING) AS job,
           r.CONTRACT_ID AS contract_id,
           r.SKU_NUMBER AS sku_number,
+          r.START_DATE AS initial_start_date,
           ${manualSelect},
           ROW_NUMBER() OVER (
             PARTITION BY CAST(r.CANDIDATE_ID AS STRING), CAST(r.INTERNAL_JOB_ID AS STRING)
@@ -3255,7 +3337,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
          AND CAST(r.INTERNAL_JOB_ID AS STRING) = w.job
         WHERE r.CONTRACT_ID IS NOT NULL AND TRIM(r.CONTRACT_ID) != ''
       )
-      SELECT cand, job, contract_id, sku_number, ${manualOut} FROM ranked WHERE rn = 1
+      SELECT cand, job, contract_id, sku_number, initial_start_date, ${manualOut} FROM ranked WHERE rn = 1
     `;
     const found = await queryObjects(sql, nexusKeys.size);
     for (const r of found) {
@@ -3265,6 +3347,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
           {
             CONTRACT_ID: normalizeContractIdOrNull(r.contract_id),
             SKU_NUMBER: normalizeLegacySkuOrNull(r.sku_number),
+            INITIAL_START_DATE: normalizeLegacyDateOnlyOrNull(r.initial_start_date),
           },
           r
         )
@@ -3347,6 +3430,12 @@ const EXTENSION_RUNRATE_MANUAL_COLUMNS = [
   "FIFTYTWO_TENURE_CANDIDATE_STATUS",
   "ST_DT_PUSHBACK_REASON",
   "CLIENT_NAME_IN_CONREP",
+  // Both are hand-written narrative that only ever existed on the run-rate side: every one of the
+  // 2,387 DEAL and 2,074 EXTENSION rows in cynet_health_deal_sheet has them null, against 19,844
+  // and 21,613 populated run-rate rows. Nexus does not supply either, so without carrying them
+  // across the deal sheet simply never has them.
+  "BACKOUT_OR_TERMINATION",
+  "COMMENTS",
 ];
 Object.freeze(EXTENSION_RUNRATE_MANUAL_COLUMNS);
 
@@ -3434,6 +3523,18 @@ const EXTENSION_PARENT_DEAL_INHERIT_COLUMNS = [
   "INVOICE_CYCLE_TO_CLIENT",
   "CLIENT_PAYMENT_TERMS",
   "CANDIDATE_PAYMENT_TERMS",
+  // Contract-level ops detail that was already inheritable from the run-rate row but not from a
+  // parent DEAL, so an extension whose contract the run-rate window could not place lost it. These
+  // describe the contract, not the individual booking, so the parent DEAL is just as valid a source.
+  // extensionParentBackfill.js listed the first five separately as EXTRA_PARENT_BACKFILL_COLUMNS;
+  // holding them here instead keeps the insert path and the post-sync repair on one list.
+  "ENTITY",
+  "FIFTYTWO_TENURE_RTO_LASTDATE",
+  "FIFTYTWO_TENURE_CANDIDATE_STATUS",
+  "ST_DT_PUSHBACK_REASON",
+  "CLIENT_NAME_IN_CONREP",
+  "BACKOUT_OR_TERMINATION",
+  "COMMENTS",
   "SKU_NUMBER",
 ];
 Object.freeze(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS);
@@ -3501,10 +3602,17 @@ function buildExtensionContractMatchStructLiterals(rows) {
     const phone = escapeSqlString(
       row.CELL_PHONE == null ? "" : String(row.CELL_PHONE).trim()
     );
+    // Carried so the parent-DEAL join can reject DEALs that start after this extension; a row with
+    // no usable START_DATE yields NULL and the date guard simply lets every candidate through.
+    const startDateSql = (() => {
+      const d = formatDateOnlyForSql(row.START_DATE);
+      return d == null ? "CAST(NULL AS DATE)" : `DATE '${escapeSqlString(d)}'`;
+    })();
 
     structLiterals.push(
       `STRUCT(${Math.trunc(pid)} AS placement_id, ${Math.trunc(cand)} AS candidate_nexus_id, `
-      + `'${email}' AS candidate_email, '${phone}' AS phone_number, ${Math.trunc(client)} AS client_id)`
+      + `'${email}' AS candidate_email, '${phone}' AS phone_number, ${Math.trunc(client)} AS client_id, `
+      + `${startDateSql} AS extension_start_date)`
     );
   }
 
@@ -3617,9 +3725,14 @@ ${parentDealSelectColumns}
           ext.placement_id,
           d.proposed_original_start_date,
 ${parentDealJoinedSelect},
+          -- LATEST qualifying DEAL, not the earliest. The 4-field identity cannot tell one contract
+          -- from another (CLIENT_ID is identical across a candidate's successive contracts at the
+          -- same client), so the extension's own START_DATE is what separates them: the parent is
+          -- the most recent DEAL that had already begun. Earliest-wins handed a Feb-02 contract's
+          -- identity to an extension of the Aug-04 contract that replaced it.
           ROW_NUMBER() OVER (
             PARTITION BY ext.placement_id
-            ORDER BY d.START_DATE ASC NULLS LAST, d.LAST_UPDATED DESC NULLS LAST, d.PLACEMENT_ID ASC NULLS LAST
+            ORDER BY d.START_DATE DESC NULLS LAST, d.LAST_UPDATED DESC NULLS LAST, d.PLACEMENT_ID DESC NULLS LAST
           ) AS rn
         FROM extensions ext
         INNER JOIN deals d
@@ -3627,6 +3740,15 @@ ${parentDealJoinedSelect},
          AND d.candidate_email_norm = ext.candidate_email
          AND d.phone_norm = ext.phone_number
          AND d.CLIENT_ID = ext.client_id
+         -- A DEAL starting AFTER this extension belongs to a LATER contract and must never be its
+         -- parent. Without this, an extension inserted before its own contract's DEAL rows landed
+         -- picked up a future contract's CONTRACT_ID / SKU_NUMBER / INITIAL_START_DATE, leaving an
+         -- INITIAL_START_DATE ahead of the row's own START_DATE — impossible on its face.
+         AND (ext.extension_start_date IS NULL OR d.START_DATE IS NULL
+              OR d.START_DATE <= ext.extension_start_date)
+         -- Only a DEAL that already carries the contract identity can pass it on; an unresolved
+         -- parent would otherwise "match" and hand down nulls.
+         AND d.CONTRACT_ID IS NOT NULL AND TRIM(d.CONTRACT_ID) != ''
       )
       SELECT
         CAST(placement_id AS STRING) AS placement_id,
@@ -3757,7 +3879,7 @@ ${hierarchySelect}
 ${dateSkuJoinedSelect},
           ROW_NUMBER() OVER (
             PARTITION BY ext.placement_id
-            ORDER BY p.START_DATE ASC NULLS LAST, p.LAST_UPDATED DESC NULLS LAST
+            ORDER BY p.START_DATE DESC NULLS LAST, p.LAST_UPDATED DESC NULLS LAST
           ) AS rn
         FROM extensions ext
         INNER JOIN latest_prior_extension p
@@ -3765,6 +3887,12 @@ ${dateSkuJoinedSelect},
          AND p.candidate_email_norm = ext.candidate_email
          AND p.phone_norm = ext.phone_number
          AND p.CLIENT_ID = ext.client_id
+         -- Same contract-boundary guard as the parent-DEAL tier: a prior extension that starts after
+         -- this one belongs to a later contract. Ranked DESC so the nearest preceding extension of
+         -- the SAME contract wins, rather than the oldest extension the identity can reach.
+         AND (ext.extension_start_date IS NULL OR p.START_DATE IS NULL
+              OR p.START_DATE <= ext.extension_start_date)
+         AND p.CONTRACT_ID IS NOT NULL AND TRIM(p.CONTRACT_ID) != ''
       ),
       hierarchy_ranked AS (
         SELECT
@@ -3780,6 +3908,8 @@ ${hierarchyJoinedSelect},
          AND p.candidate_email_norm = ext.candidate_email
          AND p.phone_norm = ext.phone_number
          AND p.CLIENT_ID = ext.client_id
+         AND (ext.extension_start_date IS NULL OR p.START_DATE IS NULL
+              OR p.START_DATE <= ext.extension_start_date)
       )
       SELECT
         CAST(ds.placement_id AS STRING) AS placement_id,
@@ -4772,7 +4902,9 @@ async function fetchLegacyOwnershipRecruiterEntriesBySku(skuList, deps = {}) {
         TRIM(CAST(NEW_EMP_CODE AS STRING)) AS new_emp,
         OLD_ONE AS old_name,
         TRIM(CAST(OLD_EMP_CODE AS STRING)) AS old_emp,
-        CAST(OWNERSHIP_EFFECTIVE_DATE AS STRING) AS eff
+        -- The legacy tracker calls it EFFECTIVE_DATE; only the deal sheet uses the
+        -- OWNERSHIP_EFFECTIVE_DATE spelling.
+        CAST(EFFECTIVE_DATE AS STRING) AS eff
       FROM ${fqn}
       WHERE UPPER(TRIM(CAST(OWNERSHIP_UPDATE AS STRING))) = 'RECRUITER'
         AND TRIM(CAST(SKU_NO AS STRING)) IN (${inList})`;
@@ -4786,7 +4918,7 @@ async function fetchLegacyOwnershipRecruiterEntriesBySku(skuList, deps = {}) {
         newEmp: bqCellString(r, "new_emp", "NEW_EMP", "NEW_EMP_CODE"),
         oldName: normalizeExtensionRunrateBackfillValue(bqCellString(r, "old_name", "OLD_ONE", "OLD_NAME") || null),
         oldEmp: bqCellString(r, "old_emp", "OLD_EMP", "OLD_EMP_CODE"),
-        eff: bqCellString(r, "eff", "OWNERSHIP_EFFECTIVE_DATE"),
+        eff: bqCellString(r, "eff", "EFFECTIVE_DATE"),
       });
     }
   }
@@ -7768,6 +7900,7 @@ module.exports = {
   fetchActiveDealSheetUpdateTargets,
   fetchLatestActiveDealSheetPlacementPairs,
   computeInsertId,
+  buildLoadJobPayload,
   resolveBqDatasetTable,
   fetchDistinctPlacementIdsFromTable,
   fetchLatestRowsByPlacementIds,

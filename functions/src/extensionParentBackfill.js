@@ -44,16 +44,14 @@ const EXTENSION_PARENT_BACKFILL_TABLE_IDS = Object.freeze(["cynet_health_deal_sh
  *
  * INITIAL_START_DATE is handled separately (the parent supplies
  * COALESCE(INITIAL_START_DATE, START_DATE), not the raw column), so it is not listed here.
- * The rest are manual/ops columns that became parent-inheritable in Aug 2026 and are not in the
- * insert-path list.
+ *
+ * Now EMPTY: every column that used to live here moved into
+ * EXTENSION_PARENT_DEAL_INHERIT_COLUMNS so the insert path and this repair pass read one list and
+ * cannot drift. parentBackfillColumns() de-duplicates, so leaving entries here would be harmless —
+ * but a second list is exactly how the two sides fell out of step before. Add new parent-inheritable
+ * columns to EXTENSION_PARENT_DEAL_INHERIT_COLUMNS instead.
  */
-const EXTRA_PARENT_BACKFILL_COLUMNS = Object.freeze([
-  "ENTITY",
-  "FIFTYTWO_TENURE_RTO_LASTDATE",
-  "FIFTYTWO_TENURE_CANDIDATE_STATUS",
-  "ST_DT_PUSHBACK_REASON",
-  "CLIENT_NAME_IN_CONREP",
-]);
+const EXTRA_PARENT_BACKFILL_COLUMNS = Object.freeze([]);
 
 /** DATE/TIMESTAMP columns: compared with a plain IS NULL, never TRIM()ed. */
 const DATE_LIKE_COLUMNS = new Set([
@@ -78,6 +76,10 @@ const GATE_COLUMNS = Object.freeze([
   "PRIMARY_SALES_PERSON",
   "NEW_HIRE_DATE",
   "INITIAL_START_DATE",
+  // Null on every existing row of the table, so without them in the gate a row whose ONLY missing
+  // columns are these two never qualifies and the pass skips it.
+  "BACKOUT_OR_TERMINATION",
+  "COMMENTS",
 ]);
 
 /** Every column this pass writes, in a stable order. */

@@ -94,7 +94,9 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_deal_shee
   GP_PERCENTAGE FLOAT64,
   ONSITE_AM STRING,
   ONSITE_AM_EMAIL STRING,
-  SECONDARY_EMAIL STRING,
+  -- Renamed from SECONDARY_EMAIL in Aug 2026 and switched from manual to API-owned: it now holds the
+  -- candidate's secondary cell number from Nexus candidate_contact_info[].leap_phone.
+  SECONDARY_CELL_PHN STRING,
   PAYMENT_TYPE STRING,
   WEEKLY_WALLET_MONEY FLOAT64,
   PROVIDER_TYPE STRING,

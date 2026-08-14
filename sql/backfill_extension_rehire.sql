@@ -199,28 +199,6 @@ CREATE TEMP TABLE ext_rehire_values AS
     START_DATE AS hist_start
   FROM `cynetdatabase.rr_project_data.all_CH_data_runrate`
   WHERE UPPER(TRIM(CAST(PLACEMENT_STATUS AS STRING))) IN ('STARTED', 'BOOKED', 'ENDED', 'ENDED<30')
-  UNION ALL
-  SELECT
-    CASE
-        WHEN CANDIDATE_ID IS NOT NULL THEN CONCAT('nx:', CAST(CANDIDATE_ID AS STRING))
-        WHEN NULLIF(LOWER(TRIM(CAST(CANDIDATE_EMAIL AS STRING))), '') IS NOT NULL
-          THEN CONCAT('em:', LOWER(TRIM(CAST(CANDIDATE_EMAIL AS STRING))))
-      END AS candidate_key,
-    NULLIF(LOWER(TRIM(CAST(PARENT_CLIENT_NAME AS STRING))), '') AS parent_client_key,
-    START_DATE AS hist_start
-  FROM `cynetdatabase.rr_project_data.all_Health_Canada_data_Runrate`
-  WHERE UPPER(TRIM(CAST(PLACEMENT_STATUS AS STRING))) IN ('STARTED', 'BOOKED', 'ENDED', 'ENDED<30')
-  UNION ALL
-  SELECT
-    CASE
-        WHEN CANDIDATE_ID IS NOT NULL THEN CONCAT('nx:', CAST(CANDIDATE_ID AS STRING))
-        WHEN NULLIF(LOWER(TRIM(CAST(CANDIDATE_EMAIL AS STRING))), '') IS NOT NULL
-          THEN CONCAT('em:', LOWER(TRIM(CAST(CANDIDATE_EMAIL AS STRING))))
-      END AS candidate_key,
-    NULLIF(LOWER(TRIM(CAST(PARENT_CLIENT_NAME AS STRING))), '') AS parent_client_key,
-    START_DATE AS hist_start
-  FROM `cynetdatabase.rr_project_data.all_locums_runrate`
-  WHERE UPPER(TRIM(CAST(PLACEMENT_STATUS AS STRING))) IN ('STARTED', 'BOOKED', 'ENDED', 'ENDED<30')
   ),
   repeat_deals AS (
     -- A DEAL is a REPEAT when the candidate has ANY strictly earlier placement — same client or a
