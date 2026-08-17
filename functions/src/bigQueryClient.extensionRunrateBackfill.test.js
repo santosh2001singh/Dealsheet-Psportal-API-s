@@ -1116,3 +1116,114 @@ test("applyExtensionInheritForInsertRows: an existing SKU wins over an inherit s
   );
   assert.equal(out[0].SKU_NUMBER, "H14672");
 });
+
+test("parent DEAL hierarchy overwrites a stale name Nexus carried over from an earlier contract", async () => {
+  // Rabia Rawji (Aug 2026): EXTENSION 5248970 of CHC22062 arrived from Nexus already carrying
+  // ASSOCIATE_DELIVERY_DIRECTOR "Aniket Ahuja" — the director of her PREVIOUS contract CHC17277.
+  // Its parent DEAL 5205159 (CHC22062) holds the correct "Kapil Chaudhary". Fill-if-empty skipped
+  // the field because it was non-empty, so the stale name survived while CONTRACT_ID /
+  // INITIAL_START_DATE (both empty) inherited correctly off the very same parent row.
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      CANDIDATE_ID: 25471544,
+      CLIENT_ID: 1953556,
+      PLACEMENT_ID: 1464468,
+      CONTRACT_ID: null,
+      INITIAL_START_DATE: null,
+      ASSOCIATE_DELIVERY_DIRECTOR: "Aniket Ahuja",
+      ASSOCIATE_DELIVERY_DIRECTOR_EMP_NO: "CY2171",
+      ASSIGNMENT_RECRUITER: "Varun Khandelwal (R1N)",
+      ASSIGNMENT_RECRUITER_EMAIL: "varun.k@cynethealth.com",
+    },
+  ];
+
+  const parentFetchFn = async () =>
+    new Map([
+      [
+        "1464468",
+        {
+          CONTRACT_ID: "CHC22062",
+          INITIAL_START_DATE: "2026-06-08",
+          ASSOCIATE_DELIVERY_DIRECTOR: "Kapil Chaudhary",
+          ASSOCIATE_DELIVERY_DIRECTOR_EMP_NO: "CY3650",
+        },
+      ],
+    ]);
+
+  const out = await applyExtensionInheritForInsertRows(rows, {}, {
+    parentFetchFn,
+    priorExtensionFetchFn: noPriorExtensionFetch,
+    runrateFetchFn: async () => new Map(),
+    resolveContractIdsFn: noContractIdResolution,
+  });
+
+  assert.equal(out[0].ASSOCIATE_DELIVERY_DIRECTOR, "Kapil Chaudhary");
+  assert.equal(out[0].ASSOCIATE_DELIVERY_DIRECTOR_EMP_NO, "CY3650");
+  // The fields that already worked must keep working.
+  assert.equal(out[0].CONTRACT_ID, "CHC22062");
+  assert.equal(out[0].INITIAL_START_DATE, "2026-06-08");
+  // Non-hierarchy row data is untouched.
+  assert.equal(out[0].ASSIGNMENT_RECRUITER, "Varun Khandelwal (R1N)");
+});
+
+test("parent DEAL hierarchy overwrite leaves the row alone when the parent has no hierarchy value", async () => {
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      CANDIDATE_ID: 111,
+      CLIENT_ID: 55,
+      PLACEMENT_ID: 999,
+      CONTRACT_ID: null,
+      ASSOCIATE_DELIVERY_DIRECTOR: "Existing Director",
+      ASSOCIATE_DELIVERY_DIRECTOR_EMP_NO: "CY-EXIST",
+      ASSIGNMENT_RECRUITER_EMAIL: "current.recruiter@cynetcorp.com",
+    },
+  ];
+
+  const parentFetchFn = async () =>
+    new Map([
+      ["999", { CONTRACT_ID: "CHC2002", ASSOCIATE_DELIVERY_DIRECTOR: null }],
+    ]);
+
+  const out = await applyExtensionInheritForInsertRows(rows, {}, {
+    parentFetchFn,
+    priorExtensionFetchFn: noPriorExtensionFetch,
+    runrateFetchFn: async () => new Map(),
+    resolveContractIdsFn: noContractIdResolution,
+  });
+
+  // A null/blank parent value must never blank out what the row already carries.
+  assert.equal(out[0].ASSOCIATE_DELIVERY_DIRECTOR, "Existing Director");
+  assert.equal(out[0].ASSOCIATE_DELIVERY_DIRECTOR_EMP_NO, "CY-EXIST");
+  assert.equal(out[0].CONTRACT_ID, "CHC2002");
+});
+
+test("prior-EXTENSION tier stays fill-if-empty and cannot overwrite parent DEAL hierarchy", async () => {
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      CANDIDATE_ID: 111,
+      CLIENT_ID: 55,
+      PLACEMENT_ID: 999,
+      CONTRACT_ID: null,
+      ASSOCIATE_DELIVERY_DIRECTOR: "Stale From Nexus",
+      ASSIGNMENT_RECRUITER_EMAIL: "current.recruiter@cynetcorp.com",
+    },
+  ];
+
+  const parentFetchFn = async () =>
+    new Map([["999", { ASSOCIATE_DELIVERY_DIRECTOR: "Correct Parent Director" }]]);
+  const priorExtensionFetchFn = async () =>
+    new Map([["999", { ASSOCIATE_DELIVERY_DIRECTOR: "Older Extension Director" }]]);
+
+  const out = await applyExtensionInheritForInsertRows(rows, {}, {
+    parentFetchFn,
+    priorExtensionFetchFn,
+    runrateFetchFn: async () => new Map(),
+    resolveContractIdsFn: noContractIdResolution,
+  });
+
+  // Parent DEAL wins outright; the prior-extension tier must not overwrite it afterwards.
+  assert.equal(out[0].ASSOCIATE_DELIVERY_DIRECTOR, "Correct Parent Director");
+});

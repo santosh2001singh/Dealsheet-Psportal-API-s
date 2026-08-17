@@ -1878,6 +1878,8 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     // Phase B: allocate Firestore-backed CONTRACT_IDs only for rows that will
     // actually be inserted (defer allocation pattern). Rows already carrying a
     // CONTRACT_ID from Phase A (resolveContractIdsForRows) are left untouched.
+    // Phase B also re-checks BigQuery by DEAL_SHEET_ID before minting (safety net
+    // when Phase A missed due to timing or lookup failure).
     // Lazy require to avoid module-load circular dependency with contractIdResolver.
     const { allocateContractIdsForInsertableRows } = require("./contractIdResolver");
     await allocateContractIdsForInsertableRows(rowsToInsert, { tableId: options.tableId });
@@ -2756,7 +2758,7 @@ async function fetchContractIdsByDealSheetIds(dealSheetIds, options = {}) {
           CONTRACT_ID AS contract_id,
           ROW_NUMBER() OVER (
             PARTITION BY DEAL_SHEET_ID
-            ORDER BY EDIT_DATE DESC
+            ORDER BY LAST_UPDATED DESC NULLS LAST, CONTRACT_ID ASC
           ) AS rn
         FROM all_rows
         WHERE CAST(DEAL_SHEET_ID AS STRING) IN (${inList})
@@ -3619,22 +3621,44 @@ function buildExtensionContractMatchStructLiterals(rows) {
   return structLiterals;
 }
 
-function mergeExtensionBackfillFields(row, backfill, fieldsToFill) {
+/**
+ * @param {object} row
+ * @param {object} backfill
+ * @param {string[]} fieldsToFill Filled only when the row's own value is empty.
+ * @param {string[]} [fieldsToOverwrite] Filled even over a non-empty row value. Used for the
+ *   parent-DEAL hierarchy on EXTENSION rows: Nexus ships the extension with whatever hierarchy the
+ *   candidate's *earlier* contract carried, so fill-if-empty leaves that stale name in place and the
+ *   parent DEAL's correct hierarchy never lands (an extension of CHC22062 kept the CHC17277
+ *   associate delivery director). The parent DEAL is authoritative for its own contract chain.
+ */
+function mergeExtensionBackfillFields(row, backfill, fieldsToFill, fieldsToOverwrite = []) {
   if (!backfill) return { row, changed: false };
 
   let next = row;
   let changed = false;
-  for (const field of fieldsToFill) {
-    if (!isEmptyDateFieldValue(next[field])) continue;
+  const applyField = (field, allowOverwrite) => {
+    if (!allowOverwrite && !isEmptyDateFieldValue(next[field])) return;
     const value = backfill[field];
-    if (value == null || (typeof value === "string" && value.trim() === "")) continue;
+    if (value == null || (typeof value === "string" && value.trim() === "")) return;
+    if (isSameExtensionBackfillValue(next[field], value)) return;
     if (!changed) {
       next = { ...row };
       changed = true;
     }
     next[field] = value;
-  }
+  };
+
+  for (const field of fieldsToFill) applyField(field, false);
+  for (const field of fieldsToOverwrite) applyField(field, true);
   return { row: next, changed };
+}
+
+/** True when an inherit value would be a no-op against what the row already holds. */
+function isSameExtensionBackfillValue(current, incoming) {
+  if (current == null || incoming == null) return false;
+  const a = typeof current === "string" ? current.trim() : current;
+  const b = typeof incoming === "string" ? incoming.trim() : incoming;
+  return String(a) === String(b);
 }
 
 function extensionBackfillEntryHasValues(entry, fieldsToFill) {
@@ -4353,7 +4377,15 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
       ? await resolveContractIdsFn(matchedRunrateRows, options, deps)
       : new Map();
 
-  const parentFields = ["INITIAL_START_DATE", ...EXTENSION_PARENT_DEAL_INHERIT_COLUMNS];
+  // Hierarchy the parent DEAL owns outright: overwrite it on the extension rather than filling only
+  // when empty, so a stale name carried over from the candidate's previous contract cannot survive.
+  // Restricted to fields the parent-DEAL query actually selects; everything else stays fill-if-empty.
+  const parentHierarchyOverwriteFields = DEAL_RECRUITER_HIERARCHY_FIELDS.filter((col) =>
+    EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes(col)
+  );
+  const parentFields = ["INITIAL_START_DATE", ...EXTENSION_PARENT_DEAL_INHERIT_COLUMNS].filter(
+    (col) => !parentHierarchyOverwriteFields.includes(col)
+  );
   const priorManualExtraColumns = EXTENSION_RUNRATE_MANUAL_COLUMNS.filter(
     (col) => !DEAL_RECRUITER_HIERARCHY_FIELDS.includes(col)
   );
@@ -4393,7 +4425,8 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
     const parentMerged = mergeExtensionBackfillFields(
       current,
       parentByPlacementId.get(key),
-      parentFields
+      parentFields,
+      parentHierarchyOverwriteFields
     );
     if (parentMerged.changed) {
       current = parentMerged.row;

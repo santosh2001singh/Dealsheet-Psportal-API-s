@@ -511,6 +511,58 @@ async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
 }
 
 /**
+ * Phase B safety net: reuse CONTRACT_ID already stored for this DEAL_SHEET_ID in BigQuery.
+ * Phase A runs at enrich time; if it missed (race/timing), this prevents a second mint.
+ *
+ * @param {object[]} dealRows
+ * @param {object} [deps]
+ * @returns {Promise<number>} rows that took an existing id
+ */
+async function applyExistingContractIdsByDealSheetId(dealRows, deps = {}) {
+  if (!dealRows || dealRows.length === 0) return 0;
+
+  const fetchContractIdsByDealSheetIdsFn =
+    deps.fetchContractIdsByDealSheetIdsFn ?? fetchContractIdsByDealSheetIds;
+
+  const dealSheetIds = [];
+  const dsSeen = new Set();
+  for (const row of dealRows) {
+    if (row == null || row.CONTRACT_ID != null) continue;
+    const dsid = toInt64OrNull(row?.DEAL_SHEET_ID);
+    if (dsid == null) continue;
+    const key = String(dsid);
+    if (dsSeen.has(key)) continue;
+    dsSeen.add(key);
+    dealSheetIds.push(key);
+  }
+  if (dealSheetIds.length === 0) return 0;
+
+  let existingByDealSheetId = new Map();
+  try {
+    const result = await fetchContractIdsByDealSheetIdsFn(dealSheetIds, deps.bqOptions);
+    if (result instanceof Map) existingByDealSheetId = result;
+  } catch (err) {
+    logDetail(
+      `[contractId allocator] fetchContractIdsByDealSheetIds failed (continuing to mint): ${String(err?.message || err).slice(0, 200)}`
+    );
+    return 0;
+  }
+
+  let reused = 0;
+  for (const row of dealRows) {
+    if (row == null || row.CONTRACT_ID != null) continue;
+    const dsKey =
+      row?.DEAL_SHEET_ID == null ? "" : String(toInt64OrNull(row.DEAL_SHEET_ID) ?? "").trim();
+    if (dsKey === "") continue;
+    const existingId = existingByDealSheetId.get(dsKey);
+    if (existingId == null) continue;
+    row.CONTRACT_ID = normalizeContractIdOrNull(existingId);
+    if (row.CONTRACT_ID != null) reused++;
+  }
+  return reused;
+}
+
+/**
  * Phase B — allocate CONTRACT_IDs for DEAL rows in the final post-filter insert batch.
  *
  * DEAL_TYPE='DEAL' rows are the ONLY rows in the system that mint a CONTRACT_ID; the
@@ -564,6 +616,11 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
     await applyLegacyContractIdentityToDealRows(pendingExtensionRows, { tableId, ...deps });
   }
 
+  const reusedExistingByDealSheetId = await applyExistingContractIdsByDealSheetId(
+    pendingDealRows,
+    deps
+  );
+
   /** @type {Map<string, object[]>} */
   const needsAllocationByKey = new Map();
   /** @type {object[]} */
@@ -584,11 +641,16 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
   const allocationKeys = [...needsAllocationByKey.keys()];
   const totalToAllocate = allocationKeys.length + noKeyAllocationRows.length;
 
-  if (totalToAllocate === 0) return rowsToInsert;
+  if (totalToAllocate === 0) {
+    logDetail(
+      `[contractId allocator] table=${tableId || "none"} insertable=${rowsToInsert.length} allocated=0 reusedExistingByDealSheetId=${reusedExistingByDealSheetId} uniqueKeys=0 noKey=0 extensionPropagated=0`
+    );
+    return rowsToInsert;
+  }
 
   if (!sequenceOptions) {
     logDetail(
-      `[contractId allocator] skipped: missing tableId sequence config (tableId=${tableId || "none"}, need=${totalToAllocate})`
+      `[contractId allocator] skipped: missing tableId sequence config (tableId=${tableId || "none"}, need=${totalToAllocate}) reusedExistingByDealSheetId=${reusedExistingByDealSheetId}`
     );
     return rowsToInsert;
   }
@@ -641,7 +703,7 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
   }
 
   logDetail(
-    `[contractId allocator] table=${tableId || "none"} insertable=${rowsToInsert.length} allocated=${allocatedCount} uniqueKeys=${allocationKeys.length} noKey=${noKeyAllocationRows.length} extensionPropagated=${extensionPropagated}`
+    `[contractId allocator] table=${tableId || "none"} insertable=${rowsToInsert.length} allocated=${allocatedCount} reusedExistingByDealSheetId=${reusedExistingByDealSheetId} uniqueKeys=${allocationKeys.length} noKey=${noKeyAllocationRows.length} extensionPropagated=${extensionPropagated}`
   );
 
   return rowsToInsert;

@@ -38,6 +38,8 @@ function makeAllocator(state) {
   };
 }
 
+const emptyDealSheetIdFetch = { fetchContractIdsByDealSheetIdsFn: async () => new Map() };
+
 test("Phase B allocates for a DEAL row", async () => {
   const state = { calls: 0, requested: 0 };
   const rows = [makeRow()];
@@ -45,6 +47,7 @@ test("Phase B allocates for a DEAL row", async () => {
   await allocateContractIdsForInsertableRows(rows, {
     sequenceOptions: SEQUENCE_OPTIONS,
     allocateContractIdsFn: makeAllocator(state),
+    ...emptyDealSheetIdFetch,
   });
 
   assert.equal(rows[0].CONTRACT_ID, "CHC23000");
@@ -58,6 +61,7 @@ test("Phase B never allocates for an EXTENSION row", async () => {
   await allocateContractIdsForInsertableRows(rows, {
     sequenceOptions: SEQUENCE_OPTIONS,
     allocateContractIdsFn: makeAllocator(state),
+    ...emptyDealSheetIdFetch,
   });
 
   assert.equal(rows[0].CONTRACT_ID, null);
@@ -81,6 +85,7 @@ test("Phase B allocates only for the DEAL rows in a mixed batch", async () => {
   await allocateContractIdsForInsertableRows(rows, {
     sequenceOptions: SEQUENCE_OPTIONS,
     allocateContractIdsFn: makeAllocator(state),
+    ...emptyDealSheetIdFetch,
   });
 
   assert.equal(dealRow.CONTRACT_ID, "CHC23000");
@@ -95,6 +100,7 @@ test("Phase B leaves an already-set CONTRACT_ID alone", async () => {
   await allocateContractIdsForInsertableRows(rows, {
     sequenceOptions: SEQUENCE_OPTIONS,
     allocateContractIdsFn: makeAllocator(state),
+    ...emptyDealSheetIdFetch,
   });
 
   assert.equal(rows[0].CONTRACT_ID, "CHC12345");
@@ -170,4 +176,32 @@ test("an in-batch EXTENSION inherits from its parent DEAL, not a fresh id", asyn
   assert.equal(dealRow.CONTRACT_ID, "CHC23000");
   assert.equal(extensionRow.CONTRACT_ID, "CHC23000", "extension shares its parent DEAL's id");
   assert.equal(state.requested, 1, "one id for the DEAL; the extension inherited it");
+});
+
+test("Phase B reuses existing CONTRACT_ID from BigQuery by DEAL_SHEET_ID and does not mint", async () => {
+  const state = { calls: 0, requested: 0 };
+  const rows = [makeRow({ DEAL_SHEET_ID: 5102931, CONTRACT_ID: null })];
+
+  await allocateContractIdsForInsertableRows(rows, {
+    sequenceOptions: SEQUENCE_OPTIONS,
+    allocateContractIdsFn: makeAllocator(state),
+    fetchContractIdsByDealSheetIdsFn: async () => new Map([["5102931", "CHC23325"]]),
+  });
+
+  assert.equal(rows[0].CONTRACT_ID, "CHC23325");
+  assert.equal(state.calls, 0, "must not mint when BQ already has a CONTRACT_ID for this deal sheet");
+});
+
+test("Phase B still mints when BigQuery has no CONTRACT_ID for the deal sheet", async () => {
+  const state = { calls: 0, requested: 0 };
+  const rows = [makeRow({ DEAL_SHEET_ID: 9999999, CONTRACT_ID: null })];
+
+  await allocateContractIdsForInsertableRows(rows, {
+    sequenceOptions: SEQUENCE_OPTIONS,
+    allocateContractIdsFn: makeAllocator(state),
+    fetchContractIdsByDealSheetIdsFn: async () => new Map(),
+  });
+
+  assert.equal(rows[0].CONTRACT_ID, "CHC23000");
+  assert.equal(state.requested, 1);
 });

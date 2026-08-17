@@ -295,14 +295,50 @@ function candidatePhoneFromContactInfo(candidate) {
 }
 
 /**
- * Get candidate secondary cell phone from contact info. Nexus stores it as leap_phone; it is often
- * the same number as cell_phone, so no attempt is made to dedupe against the primary.
+ * Secondary email from contact info: secondary_email first, then leap_email.
+ */
+function secondaryEmailFromContactRow(info) {
+  if (!info || typeof info !== "object") return null;
+  return (
+    trimContactValue(info.secondary_email) ?? trimContactValue(info.leap_email) ?? null
+  );
+}
+
+/**
+ * Get candidate secondary email from contact info.
+ */
+function candidateSecondaryEmailFromContactInfo(candidate) {
+  const rows = candidate?.candidate_contact_info;
+  if (!Array.isArray(rows)) return null;
+  for (const row of rows) {
+    const e = secondaryEmailFromContactRow(row);
+    if (e) return e;
+  }
+  return null;
+}
+
+/**
+ * Secondary phone from contact info: leap_phone first, then work_phone, then home_phone.
+ * No dedupe against cell_phone — leap_phone is often the same number as the primary.
+ */
+function secondaryCellPhoneFromContactRow(info) {
+  if (!info || typeof info !== "object") return null;
+  return (
+    trimContactValue(info.leap_phone) ??
+    trimContactValue(info.work_phone) ??
+    trimContactValue(info.home_phone) ??
+    null
+  );
+}
+
+/**
+ * Get candidate secondary cell phone from contact info.
  */
 function candidateSecondaryCellPhoneFromContactInfo(candidate) {
   const rows = candidate?.candidate_contact_info;
   if (!Array.isArray(rows)) return null;
   for (const row of rows) {
-    const p = trimContactValue(row?.leap_phone);
+    const p = secondaryCellPhoneFromContactRow(row);
     if (p) return p;
   }
   return null;
@@ -322,6 +358,7 @@ function mapCandidateToBq(candidate) {
     CANDIDATE_NAME: name,
     CANDIDATE_STATUS: statusCode,
     CANDIDATE_EMAIL: candidateEmailFromContactInfo(candidate) ?? trimContactValue(candidate?.email),
+    SECONDARY_EMAIL: candidateSecondaryEmailFromContactInfo(candidate),
     CELL_PHONE: candidatePhoneFromContactInfo(candidate) ?? trimContactValue(candidate?.phone),
     SECONDARY_CELL_PHN: candidateSecondaryCellPhoneFromContactInfo(candidate),
   };
@@ -1292,8 +1329,9 @@ function mapJobSubmittalToBq(submittalRow, jobObj) {
 
 /**
  * Map deal sheet rates list to BigQuery schema.
- * CA state uses PR_GREATER_THAN_EIGHT / BR_GREATER_THAN_EIGHT for OT rates;
- * all other states use PR_GREATER_THAN_FOURTY / BR_GREATER_THAN_FOURTY.
+ * CA and AK use PR_GREATER_THAN_EIGHT / BR_GREATER_THAN_EIGHT for OT rates
+ * (same states as the regular-hours OT split); all other states use
+ * PR_GREATER_THAN_FOURTY / BR_GREATER_THAN_FOURTY.
  */
 function mapDealSheetRatesListToBq(rateRows, clientState) {
   if (!rateRows || !rateRows.length) return {};
@@ -1310,12 +1348,9 @@ function mapDealSheetRatesListToBq(rateRows, clientState) {
     return v === undefined ? null : v;
   }
 
-  const stateNorm = clientState == null || String(clientState).trim() === ""
-    ? null
-    : String(clientState).trim().toUpperCase();
-  const isCa = stateNorm === "CA";
-  const otCode = isCa ? "PR_GREATER_THAN_EIGHT" : "PR_GREATER_THAN_FOURTY";
-  const clientOtCode = isCa ? "BR_GREATER_THAN_EIGHT" : "BR_GREATER_THAN_FOURTY";
+  const useEightHourOtRates = usesRegularHoursOtSplit(clientState);
+  const otCode = useEightHourOtRates ? "PR_GREATER_THAN_EIGHT" : "PR_GREATER_THAN_FOURTY";
+  const clientOtCode = useEightHourOtRates ? "BR_GREATER_THAN_EIGHT" : "BR_GREATER_THAN_FOURTY";
 
   return {
     CLIENT_HOLIDAY_RATE: pick("BR_HOLIDAY_RATE"),
@@ -1576,9 +1611,10 @@ const API_OWNED_COLUMNS = new Set([
   "CANDIDATE_NAME",
   "CANDIDATE_STATUS",
   "CANDIDATE_EMAIL",
+  // Nexus candidate_contact_info[].secondary_email, then leap_email.
+  "SECONDARY_EMAIL",
   "CELL_PHONE",
-  // Nexus candidate_contact_info[].leap_phone. Was the manual SECONDARY_EMAIL column until Aug 2026,
-  // renamed and made API-owned when leap_phone was identified as the secondary cell number.
+  // Nexus candidate_contact_info[]: leap_phone, then work_phone, then home_phone.
   "SECONDARY_CELL_PHN",
   "PROVIDER_TYPE",
   "RECRUITER_ID",

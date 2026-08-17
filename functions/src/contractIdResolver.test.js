@@ -6,6 +6,8 @@ const {
   pickDealContractIdFromBatch,
 } = require("./contractIdResolver");
 
+const emptyDealSheetIdFetch = { fetchContractIdsByDealSheetIdsFn: async () => new Map() };
+
 test("allocateContractIdsForInsertableRows assigns CHC id to DEAL row", async () => {
   const rows = [
     {
@@ -20,6 +22,7 @@ test("allocateContractIdsForInsertableRows assigns CHC id to DEAL row", async ()
   await allocateContractIdsForInsertableRows(rows, {
     tableId: "cynet_health_deal_sheet",
     allocateContractIdsFn: async () => ["CHC1000"],
+    ...emptyDealSheetIdFetch,
   });
 
   assert.equal(rows[0].CONTRACT_ID, "CHC1000");
@@ -46,6 +49,7 @@ test("allocateContractIdsForInsertableRows propagates id to EXTENSION in same ba
   await allocateContractIdsForInsertableRows(rows, {
     tableId: "cynet_health_canada_deal_sheet",
     allocateContractIdsFn: async () => ["CAC1000"],
+    ...emptyDealSheetIdFetch,
   });
 
   assert.equal(rows[0].CONTRACT_ID, "CAC1000");
@@ -60,6 +64,7 @@ test("allocateContractIdsForInsertableRows skips when tableId missing", async ()
       called = true;
       return ["CHC1000"];
     },
+    ...emptyDealSheetIdFetch,
   });
   assert.equal(called, false);
   assert.equal(rows[0].CONTRACT_ID, null);

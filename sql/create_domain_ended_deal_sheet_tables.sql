@@ -63,6 +63,8 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_ended_dea
   DAYS_WORKED INT64,
   CELL_PHONE STRING,
   CANDIDATE_EMAIL STRING,
+  -- API-owned: candidate_contact_info[].secondary_email, then leap_email.
+  SECONDARY_EMAIL STRING,
   DEAL_SHEET_ID INT64,
   -- Nexus deal sheet's own created_date — see the active table DDL.
   DEAL_SHEET_CREATED_DATE TIMESTAMP,
@@ -89,7 +91,7 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_ended_dea
   GP_PERCENTAGE FLOAT64,
   ONSITE_AM STRING,
   ONSITE_AM_EMAIL STRING,
-  -- Renamed from SECONDARY_EMAIL in Aug 2026 — see the active table DDL.
+  -- API-owned: candidate_contact_info[] leap_phone, then work_phone, then home_phone.
   SECONDARY_CELL_PHN STRING,
   PAYMENT_TYPE STRING,
   WEEKLY_WALLET_MONEY FLOAT64,

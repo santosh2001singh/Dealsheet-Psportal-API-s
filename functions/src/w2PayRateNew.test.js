@@ -12,6 +12,7 @@ const {
 const {
   mapDealSheetDetailToBq,
   mapDealSheetHoursDetailsToBq,
+  mapDealSheetRatesListToBq,
   formatBillableOrientationPercent,
   coerceApiFloatNullsToZero,
   API_OWNED_COLUMNS,
@@ -112,6 +113,57 @@ test("mapDealSheetHoursDetailsToBq fills REGULAR_HOURS for CA and AK, not TX", (
   assert.equal(ak.REGULAR_HOURS_2, 36);
   assert.equal(tx.REGULAR_HOURS_1, 0);
   assert.equal(tx.REGULAR_HOURS_2, 0);
+});
+
+const mixedOtRateRows = [
+  { bill_rate_code: "PR_GREATER_THAN_EIGHT", rate: 24 },
+  { bill_rate_code: "BR_GREATER_THAN_EIGHT", rate: 81.6 },
+  { bill_rate_code: "PR_GREATER_THAN_FOURTY", rate: 85 },
+  { bill_rate_code: "BR_GREATER_THAN_FOURTY", rate: 106.08 },
+  { bill_rate_code: "PR_REGULAR_PAY_RATE", rate: 16 },
+  { bill_rate_code: "BR_REGULAR_BILL_RATE", rate: 81.6 },
+];
+
+test("mapDealSheetRatesListToBq picks 8-hour OT codes for CA and AK, 40-hour for TX", () => {
+  const ca = mapDealSheetRatesListToBq(mixedOtRateRows, "CA");
+  const ak = mapDealSheetRatesListToBq(mixedOtRateRows, "ak");
+  const tx = mapDealSheetRatesListToBq(mixedOtRateRows, "TX");
+  assert.equal(ca.OT_RATE, 24);
+  assert.equal(ca.CLIENT_OT_RATE, 81.6);
+  assert.equal(ak.OT_RATE, 24);
+  assert.equal(ak.CLIENT_OT_RATE, 81.6);
+  assert.equal(tx.OT_RATE, 85);
+  assert.equal(tx.CLIENT_OT_RATE, 106.08);
+});
+
+test("AK Rose Taylor fixture: 8-hour OT rates yield CALCULATED_MARGIN 9.55", () => {
+  const family = computeNewRateFamily({
+    CLIENT_STATE: "AK",
+    PLACEMENT_TYPE: "CT",
+    SCHEDULE_HOURS_1: 40,
+    SCHEDULE_HOURS_2: 0,
+    REGULAR_HOURS_1: 32,
+    REGULAR_HOURS_2: 0,
+    FIRST_WEEK_HOURS: 15,
+    SECOND_WEEK_HOURS: 0,
+    PAY_RATE: 16,
+    OT_RATE: 24,
+    TOTAL_BONUS_TAXABLE: 0,
+    TOTAL_BONUS_NON_TAXABLE: 275,
+    PO_HOURS: 600,
+    NBO_HOURS: 0,
+    BILL_RATE: 81.6,
+    CLIENT_OT_RATE: 81.6,
+    CLIENT_MSP_FEE: 0,
+    WEEKLY_PER_DIEM_NON_TAXED: 1796,
+    BILLABLE_ORIENTATION_HRS: 0,
+    BILLABLE_ORIENTATION: "0.00%",
+  });
+  assert.equal(family.W2_PAY_RATE_NEW, 22.11);
+  assert.equal(family.FINAL_PAY_RATE_NEW, 71.05);
+  assert.equal(family.FINAL_COST_NEW, 72.05);
+  assert.equal(family.FINAL_BILL_RATE_NEW, 81.6);
+  assert.equal(family.CALCULATED_MARGIN, 9.55);
 });
 
 /** Shared row where regular-hours split differs from the 40-hour weekly path. */
