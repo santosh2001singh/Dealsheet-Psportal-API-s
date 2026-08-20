@@ -17,9 +17,9 @@ test("scope is the cynet health active table", () => {
   assert.deepEqual([...EXTENSION_PARENT_BACKFILL_TABLE_IDS], ["cynet_health_deal_sheet"]);
 });
 
-test("all 40 inherited columns are filled, contract identity included", () => {
+test("all 62 inherited columns are filled, contract identity included", () => {
   const cols = parentBackfillColumns();
-  assert.equal(cols.length, 40);
+  assert.equal(cols.length, 62);
   for (const expected of [
     "CONTRACT_ID",
     "SKU_NUMBER",

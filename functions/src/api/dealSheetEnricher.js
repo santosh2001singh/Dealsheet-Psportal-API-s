@@ -998,9 +998,10 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     const weekSplitPart = isCanadaRecruiter
       ? {}
       : computeWeekSplit({
-        scheduleHours1: hoursPart.SCHEDULE_HOURS_1,
+        week1: detail?.job_duration_1,
+        week2: detail?.job_duration_2,
+        totalWeeks: hoursRow?.total_weeks,
         scheduleHours2: hoursPart.SCHEDULE_HOURS_2,
-        initialWeeks: dealSheetPart.PROJECT_DURATION,
       });
 
     const candidateObj = !candId
@@ -1115,18 +1116,19 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     );
   }
 
-  // Resolve emp-no for both the current recruiter (ASSIGNMENT_RECRUITER_EMAIL -> RECRUITER_EMP_NO)
-  // and, on a handover DEAL, the previous recruiter (PREVIOUS_RECRUITER_EMAIL -> PREVIOUS_RECRUITER_EMP_NO).
+  // Resolve emp-no for the current recruiter (ASSIGNMENT_RECRUITER_EMAIL -> RECRUITER_EMP_NO). The
+  // previous recruiter is no longer resolved here — PREVIOUS_RECRUITER_* is not written to the deal
+  // sheet, and the ownership log takes the outgoing recruiter's emp-no straight off the baseline row
+  // (applyPreviousRecruiterOnRecruiterChange -> __PREV_RECRUITER_EMP_NO).
   const recruiterEmails = [];
   const recruiterEmailSeen = new Set();
   for (const row of combined) {
-    for (const email of [row?.ASSIGNMENT_RECRUITER_EMAIL, row?.__PREV_RECRUITER_EMAIL]) {
-      if (email == null) continue;
-      const norm = String(email).trim().toLowerCase();
-      if (!norm || recruiterEmailSeen.has(norm)) continue;
-      recruiterEmailSeen.add(norm);
-      recruiterEmails.push(norm);
-    }
+    const email = row?.ASSIGNMENT_RECRUITER_EMAIL;
+    if (email == null) continue;
+    const norm = String(email).trim().toLowerCase();
+    if (!norm || recruiterEmailSeen.has(norm)) continue;
+    recruiterEmailSeen.add(norm);
+    recruiterEmails.push(norm);
   }
   if (recruiterEmails.length > 0) {
     const directoryByEmail = await fetchEmployeeDirectoryByEmails(recruiterEmails);
@@ -1134,14 +1136,9 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       const email = row?.ASSIGNMENT_RECRUITER_EMAIL;
       const norm = email == null ? "" : String(email).trim().toLowerCase();
       row.RECRUITER_EMP_NO = norm ? directoryByEmail.get(norm)?.employeeId ?? null : null;
-      const prevEmail = row?.__PREV_RECRUITER_EMAIL;
-      const prevNorm = prevEmail == null ? "" : String(prevEmail).trim().toLowerCase();
-      // Stash previous recruiter's emp-no on a temp field too; the real PREVIOUS_RECRUITER_EMP_NO is
-      // filled (when empty) later, after manual-column carry-forward.
-      if (prevNorm) row.__PREV_RECRUITER_EMP_NO = directoryByEmail.get(prevNorm)?.employeeId ?? null;
     }
     logLine(
-      `[enriched sync] STEP 3/4 ENRICH: RECRUITER_EMP_NO / previous-recruiter emp-no resolved from ${directoryByEmail.size}/${recruiterEmails.length} unique email(s)`
+      `[enriched sync] STEP 3/4 ENRICH: RECRUITER_EMP_NO resolved from ${directoryByEmail.size}/${recruiterEmails.length} unique email(s)`
     );
   }
 

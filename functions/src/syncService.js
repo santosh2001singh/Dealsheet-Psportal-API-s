@@ -46,7 +46,6 @@ const {
   insertInorganicHierarchyLogBatch,
   fetchDealSheetOwnershipChangePairsFromActive,
   fetchContractOwnershipChangePairsFromActive,
-  fetchRecruiterHandoverOwnershipLogRows,
   buildRecruiterHandoverOwnershipLogRows,
   buildOwnershipChangeLogRows,
   buildContractOwnershipChangeLogRows,
@@ -59,7 +58,6 @@ const {
   backfillExtensionRehireForDealSheets,
   backfillClusterRegionsForDealSheets,
   backfillExtensionParentInheritForDealSheets,
-  backfillExtensionLegacyPreviousRecruiterForActive,
   finalizeDealSheetRowForResponse,
   hasBusinessColumnChanges,
   applyDidNotAcceptDateOverrides,
@@ -88,6 +86,9 @@ const {
   resolveActiveDealSheetTableIdForDomain,
   buildActiveDealSheetRoutingSentinel,
   resolveEndedDealSheetTableId,
+  resolveActiveDealSheetTableIdForRow,
+  resolveEndedDealSheetTableIdForRow,
+  rowMatchesSyncDomainForRow,
   buildEndedDealSheetRoutingSentinel,
 } = require("./recruiterDomainTables");
 
@@ -924,7 +925,7 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   const explicitBqTable = typeof params.bq_table === "string" && params.bq_table.trim() !== "";
   const effectiveTableId = explicitBqTable
     ? params.bq_table.trim()
-    : resolveActiveDealSheetTableId(row.ASSIGNMENT_RECRUITER_EMAIL);
+    : resolveActiveDealSheetTableIdForRow(row);
 
   const baselineScope =
     String(params.baseline_scope || "composite").trim().toLowerCase() === "deal_sheet_id"
@@ -1237,7 +1238,7 @@ async function backfillPlacementRecordFromNexus(params = {}) {
   const explicitBqTable = typeof params.bq_table === "string" && params.bq_table.trim() !== "";
   const effectiveTableId = explicitBqTable
     ? params.bq_table.trim()
-    : resolveActiveDealSheetTableId(row.ASSIGNMENT_RECRUITER_EMAIL);
+    : resolveActiveDealSheetTableIdForRow(row);
 
   if (!applyUpdate) {
     return {
@@ -1593,7 +1594,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
       ? buildEndedDealSheetRoutingSentinel(config.projectId, effectiveDatasetId)
       : buildActiveDealSheetRoutingSentinel(config.projectId, effectiveDatasetId);
   const insertRoutedResolveTableId = useEndedDomainRouting
-    ? (row) => resolveEndedDealSheetTableId(row?.ASSIGNMENT_RECRUITER_EMAIL)
+    ? (row) => resolveEndedDealSheetTableIdForRow(row)
     : undefined;
   const transformRowsFn = typeof params.transform_rows_fn === "function" ? params.transform_rows_fn : null;
   // Same lower bound as transformRowsFn, but re-checked inside the insert pipeline against the FINAL
@@ -1803,7 +1804,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
     // Domain-scoped run: drop rows belonging to the other domains before anything touches BigQuery,
     // so a canada/locums run can never write to (or allocate ids against) cynet health.
     const domainScoped = syncDomain
-      ? combined.filter((row) => rowMatchesSyncDomain(syncDomain, row?.ASSIGNMENT_RECRUITER_EMAIL))
+      ? combined.filter((row) => rowMatchesSyncDomainForRow(syncDomain, row))
       : combined;
     if (syncDomain && domainScoped.length !== combined.length) {
       totalRowsSkippedOtherDomain += combined.length - domainScoped.length;
@@ -2506,10 +2507,10 @@ async function syncOwnershipChangeLogsFromBigQuery(params = {}) {
     rows.push(...buildOwnershipChangeLogRows(latest, previous));
   }
 
-  // Recruiter-handover logs (single-row: submittal recruiter -> deal-sheet recruiter on a DEAL),
-  // incl. the vacated-hierarchy-role row. Independent of the latest-vs-previous pair scan above.
-  const handoverRows = await fetchRecruiterHandoverOwnershipLogRows({ datasetId: dealSheetDatasetId });
-  rows.push(...handoverRows);
+  // NOTE: the table-wide recruiter-handover scan is gone — it read PREVIOUS_RECRUITER_EMAIL off the
+  // deal sheet, which is no longer written. RECRUITER handovers (and the vacated-hierarchy-role row)
+  // already come out of the latest-vs-previous pair scan above via buildOwnershipChangeLogRows; the
+  // refresh endpoint additionally builds them in-memory from __PREV_RECRUITER_* on a recruiter change.
 
   // CONTRACT_ID chain: consecutive placements (by START_DATE) with ownership role diffs.
   const contractPairs = await fetchContractOwnershipChangePairsFromActive({
@@ -2542,14 +2543,13 @@ async function syncOwnershipChangeLogsFromBigQuery(params = {}) {
 
   const elapsedStr = formatDuration(Date.now() - startMs);
   logLine(
-    `[ownership change logs BQ scan] DONE inserted=${result.inserted} changedPairs=${pairs.size} contractChainPairs=${contractPairs.size} contractChainBuilt=${contractChainBuilt} handoverRows=${handoverRows.length} builtRows=${rows.length} candidateInfoUpdated=${candidateInfoOverwrite?.updated ?? "n/a"} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
+    `[ownership change logs BQ scan] DONE inserted=${result.inserted} changedPairs=${pairs.size} contractChainPairs=${contractPairs.size} contractChainBuilt=${contractChainBuilt} builtRows=${rows.length} candidateInfoUpdated=${candidateInfoOverwrite?.updated ?? "n/a"} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
   );
 
   return {
     inserted: result.inserted,
     total: pairs.size,
     contractChainPairs: contractPairs.size,
-    handoverRows: handoverRows.length,
     builtRows: rows.length,
     candidateInfoUpdated: candidateInfoOverwrite?.updated ?? null,
     errorBatches: result.errorBatches,
@@ -2610,17 +2610,6 @@ async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
   } catch (pocErr) {
     logLine(`[deal sheet] DELIVERY_POC backfill failed (non-fatal): ${String(pocErr?.message || pocErr).slice(0, 200)}`);
   }
-  let prevRecruiterResult = { updated: null };
-  try {
-    prevRecruiterResult = await backfillExtensionLegacyPreviousRecruiterForActive({
-      datasetId: dealSheetDatasetId,
-    });
-  } catch (prevErr) {
-    logLine(
-      `[deal sheet] extension previous-recruiter backfill failed (non-fatal): ${String(prevErr?.message || prevErr).slice(0, 200)}`
-    );
-  }
-
   let extensionRehireResult = { updated: null };
   try {
     extensionRehireResult = await backfillExtensionRehireForDealSheets({
@@ -2655,13 +2644,12 @@ async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
   }
 
   const elapsedStr = formatDuration(Date.now() - startMs);
-  logLine(`[ownership change logs] effective-date overwrite DONE ownershipUpdated=${result.updated == null ? "n/a" : result.updated} dealSheetUpdated=${dealSheetResult.updated == null ? "n/a" : dealSheetResult.updated} empNoNaFixed=${empNoNaResult.updated == null ? "n/a" : empNoNaResult.updated} deliveryPocFixed=${pocResult.updated == null ? "n/a" : pocResult.updated} prevRecruiterFixed=${prevRecruiterResult.updated == null ? "n/a" : prevRecruiterResult.updated} extensionRehireFixed=${extensionRehireResult.updated == null ? "n/a" : extensionRehireResult.updated} extParentFilled=${extParentResult.updated == null ? "n/a" : extParentResult.updated} clusterRegionFilled=${clusterRegionResult.updated == null ? "n/a" : clusterRegionResult.updated} elapsed=${elapsedStr}`);
+  logLine(`[ownership change logs] effective-date overwrite DONE ownershipUpdated=${result.updated == null ? "n/a" : result.updated} dealSheetUpdated=${dealSheetResult.updated == null ? "n/a" : dealSheetResult.updated} empNoNaFixed=${empNoNaResult.updated == null ? "n/a" : empNoNaResult.updated} deliveryPocFixed=${pocResult.updated == null ? "n/a" : pocResult.updated} extensionRehireFixed=${extensionRehireResult.updated == null ? "n/a" : extensionRehireResult.updated} extParentFilled=${extParentResult.updated == null ? "n/a" : extParentResult.updated} clusterRegionFilled=${clusterRegionResult.updated == null ? "n/a" : clusterRegionResult.updated} elapsed=${elapsedStr}`);
   return {
     updated: result.updated,
     dealSheetUpdated: dealSheetResult.updated,
     empNoNaFixed: empNoNaResult.updated,
     deliveryPocFixed: pocResult.updated,
-    prevRecruiterFixed: prevRecruiterResult.updated,
     extensionRehireFixed: extensionRehireResult.updated,
     elapsed: elapsedStr,
   };

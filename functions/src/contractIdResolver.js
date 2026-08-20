@@ -33,7 +33,10 @@ const {
   buildLegacyContractLookupKey,
   legacyDealManualColumns,
 } = require("./bigQueryClient");
-const { resolveActiveDealSheetTableId } = require("./recruiterDomainTables");
+const {
+  resolveActiveDealSheetTableId,
+  resolveActiveDealSheetTableIdForRow,
+} = require("./recruiterDomainTables");
 
 function toInt64OrNull(value) {
   if (value == null || value === "") return null;
@@ -169,7 +172,7 @@ async function resolveContractIdsForRows(rows, deps = {}) {
   const resolveTableIdFn =
     typeof deps.resolveTableIdFn === "function"
       ? deps.resolveTableIdFn
-      : (row) => resolveActiveDealSheetTableId(row?.ASSIGNMENT_RECRUITER_EMAIL);
+      : (row) => resolveActiveDealSheetTableIdForRow(row);
 
   const allocateContractIdsFn =
     deps.allocateContractIdsFn ?? allocateContractIds;
@@ -602,9 +605,32 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
     if (dealTypeKey === "EXTENSION") pendingExtensionRows.push(row);
   }
 
-  // Legacy identity first: a placement the run-rate table already tracks keeps its original
+  // A placement's OWN existing id comes first, before any matching. Contract identity is decided
+  // once, at first insert, and is immutable after that: ch_rate_change_logs / ownership_change_logs /
+  // ch_termination_reason_logs are all keyed on it, and EXTENSION rows inherit it from their parent
+  // DEAL. So if this DEAL_SHEET_ID already carries an id anywhere in the table, that id IS the
+  // answer — nothing below may propose a different one.
+  //
+  // This used to run AFTER the run-rate matcher below, which let the matcher overwrite an id the
+  // placement already had. When the run-rate table shifted underneath (a second contract for the
+  // same candidate/client, or a DID NOT ACCEPT stub sharing a START_DATE) the same placement came
+  // back with a different id on a later run — live example (DEAL_SHEET_ID 5139885 / PLACEMENT_ID
+  // 1441464, Aug 2026): CHC20908 on 08-17 became CHC20892 on 08-18 with every business field
+  // identical. Reusing first makes the matcher what it should be: a source for placements that have
+  // NO id yet, never a re-deriver for ones that do.
+  //
+  // Deliberately covers EXTENSION rows too (they were previously excluded), since an extension's id
+  // is just as immutable as a DEAL's.
+  const reusedExistingByDealSheetId =
+    (await applyExistingContractIdsByDealSheetId(pendingDealRows, deps)) +
+    (pendingExtensionRows.length > 0
+      ? await applyExistingContractIdsByDealSheetId(pendingExtensionRows, deps)
+      : 0);
+
+  // Legacy identity next: a placement the run-rate table already tracks keeps its original
   // CONTRACT_ID (and SKU_NUMBER) instead of minting a second id for the same contract. Only rows
-  // with no run-rate history reach the Firestore sequence below.
+  // with no run-rate history reach the Firestore sequence below. Rows that took an existing id
+  // above are skipped here — every function in this chain ignores a row whose CONTRACT_ID is set.
   await applyLegacyContractIdentityToDealRows(pendingDealRows, { tableId, ...deps });
 
   // Same rule for EXTENSION rows: the run-rate row IS the contract, so matching against its
@@ -615,11 +641,6 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
   if (pendingExtensionRows.length > 0) {
     await applyLegacyContractIdentityToDealRows(pendingExtensionRows, { tableId, ...deps });
   }
-
-  const reusedExistingByDealSheetId = await applyExistingContractIdsByDealSheetId(
-    pendingDealRows,
-    deps
-  );
 
   /** @type {Map<string, object[]>} */
   const needsAllocationByKey = new Map();

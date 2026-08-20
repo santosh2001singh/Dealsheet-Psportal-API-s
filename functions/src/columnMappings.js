@@ -386,11 +386,10 @@ function mapDealSheetUsersToBq(dealSheet, recruiterUser, salesRepUser, submittal
   const recruiterObj = recruiterUser ?? recruiterFromSubmittal;
   const salesRepIdFromSubmittal = toIntOrNull(submittalRow?.sales_rep);
 
-  // PREVIOUS_RECRUITER is NO LONGER derived from the job-submittal recruiter. Business rule: only the
-  // deal-sheet's recruiter is the owner; a "previous recruiter" is recorded solely when the deal-sheet
-  // recruiter actually CHANGES across an update-append (applyPreviousRecruiterOnRecruiterChange), i.e.
-  // new recruiter -> current, the outgoing one -> previous. (EXTENSION rows can also backfill previous
-  // from the legacy ownership tracker.) So no __PREV_RECRUITER_* is captured from the submittal here.
+  // PREVIOUS_RECRUITER is not written to the deal sheet at all any more — the frontend derives it.
+  // A recruiter change across an update-append is still captured in memory
+  // (applyPreviousRecruiterOnRecruiterChange -> __PREV_RECRUITER_*) purely to emit the RECRUITER
+  // ownership_change_logs row. Nothing is captured from the submittal here.
 
   return {
     RECRUITER_ID: recruiterIdFromDealSheet ?? recruiterFromSubmittal?.id ?? null,
@@ -767,8 +766,33 @@ function mapTravelAllowanceToAdditionalBonus(rows) {
   return { ADDITIONAL_BONUS: sum };
 }
 
+/** Nexus travel-allowance type meaning "no allowance was agreed". */
+const TRAVEL_ALLOWANCE_TYPE_NONE = "NONE";
+
+/**
+ * True for the "no travel allowance" placeholder Nexus returns per deal sheet.
+ *
+ * Nexus emits a travel-allowance record for a deal sheet whether or not one was agreed; the empty
+ * case looks like `{ deal_sheet_travel_allowance_type: "NONE", total_amount: 0.0, ... }` with every
+ * amount zeroed. Those carry no information and would otherwise log one row per deal sheet.
+ *
+ * Both halves must hold — see the call site for why either on its own would discard real data.
+ *
+ * @param {Record<string, *>|null|undefined} item - a deal-sheet-travel-allowances API item
+ * @returns {boolean}
+ */
+function isEmptyTravelAllowanceItem(item) {
+  const type = String(item?.deal_sheet_travel_allowance_type ?? "")
+    .trim()
+    .toUpperCase();
+  const total = toNumberOrNull(item?.total_amount) ?? 0;
+  return type === TRAVEL_ALLOWANCE_TYPE_NONE && total === 0;
+}
+
 /**
  * Build one audit log row per deal-sheet travel allowance (synthetic BONUS line item).
+ *
+ * "No allowance" placeholders are skipped — see isEmptyTravelAllowanceItem.
  */
 function mapTravelAllowanceLogRowsForDealSheet(travelRows, contextRow, captureTimestamp) {
   if (!travelRows || !travelRows.length) return [];
@@ -794,6 +818,15 @@ function mapTravelAllowanceLogRowsForDealSheet(travelRows, contextRow, captureTi
     const lineId = toIntOrNull(item?.id);
     const value = toNumberOrNull(item?.total_amount) ?? 0;
     if (lineId == null && value === 0) continue;
+    // A "no travel allowance" placeholder: Nexus returns one row per deal sheet whether or not any
+    // allowance was actually agreed, so type NONE with a zero total is the empty case, not a real
+    // line item. Logging those put one meaningless VALUE=0 row in ch_additional_cost_logs for
+    // practically every deal — pure volume with no financial meaning.
+    //
+    // BOTH conditions are required. Either alone would drop real data: a typed allowance (MILEAGE,
+    // FLIGHT, …) can legitimately total 0 while still recording that it was agreed, and a row typed
+    // NONE can still carry a non-zero total that has to be accounted for.
+    if (isEmptyTravelAllowanceItem(item)) continue;
     const first = toNumberOrNull(item?.first_check_amount);
     const last = toNumberOrNull(item?.last_check_amount);
     const notes =
@@ -1833,11 +1866,10 @@ const MANUAL_COLUMNS = new Set([
   "VP",
   "VP_EMP_NO",
   "WEEKLY_WALLET_MONEY",
-  // Set only on a recruiter reassignment (applyPreviousRecruiterOnRecruiterChange, bigQueryClient.js);
-  // otherwise carried forward from baseline like any manual column so the value persists.
+  // No longer written by the sync (the frontend derives previous recruiter itself). Kept as a manual
+  // column so values already stored on existing rows still carry forward instead of going blank.
+  // PREVIOUS_RECRUITER_EMAIL and PREVIOUS_RECRUITER_EMP_NO are dropped from the deal-sheet schema.
   "PREVIOUS_RECRUITER_NAME",
-  "PREVIOUS_RECRUITER_EMAIL",
-  "PREVIOUS_RECRUITER_EMP_NO",
 ]);
 Object.freeze(MANUAL_COLUMNS);
 
@@ -1865,6 +1897,8 @@ module.exports = {
   mapAdditionalCostLogRowsForDealSheet,
   mapTravelAllowanceToAdditionalBonus,
   mapTravelAllowanceLogRowsForDealSheet,
+  isEmptyTravelAllowanceItem,
+  TRAVEL_ALLOWANCE_TYPE_NONE,
   mapDealSheetClientCostsToAdditionalBonus,
   mapClientCostLogRowsForDealSheet,
   mapDealSheetRateChangeToBq,

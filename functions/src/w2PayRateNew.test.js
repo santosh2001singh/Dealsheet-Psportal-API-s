@@ -136,6 +136,36 @@ test("mapDealSheetRatesListToBq picks 8-hour OT codes for CA and AK, 40-hour for
   assert.equal(tx.CLIENT_OT_RATE, 106.08);
 });
 
+test("Kinta NC 3-day fixture: week buckets 0 / 0.43 yield CALCULATED_MARGIN 7.98", () => {
+  const family = computeNewRateFamily({
+    CLIENT_STATE: "NC",
+    PLACEMENT_TYPE: "CT",
+    SCHEDULE_HOURS_1: 36,
+    SCHEDULE_HOURS_2: 48,
+    REGULAR_HOURS_1: 0,
+    REGULAR_HOURS_2: 0,
+    FIRST_WEEK_HOURS: 0,
+    SECOND_WEEK_HOURS: 0.43,
+    PAY_RATE: 30,
+    OT_RATE: 46.25,
+    TOTAL_BONUS_TAXABLE: 81.7,
+    TOTAL_BONUS_NON_TAXABLE: 60.2,
+    PO_HOURS: 20.64,
+    NBO_HOURS: 0,
+    BILL_RATE: 57,
+    CLIENT_OT_RATE: 57,
+    CLIENT_MSP_FEE: 0,
+    WEEKLY_PER_DIEM_NON_TAXED: 0,
+    BILLABLE_ORIENTATION_HRS: 0,
+    BILLABLE_ORIENTATION: "0.00%",
+  });
+  assert.equal(family.W2_PAY_RATE_NEW, 48.02);
+  assert.equal(family.FINAL_PAY_RATE_NEW, 48.02);
+  assert.equal(family.FINAL_COST_NEW, 49.02);
+  assert.equal(family.FINAL_BILL_RATE_NEW, 57);
+  assert.equal(family.CALCULATED_MARGIN, 7.98);
+});
+
 test("AK Rose Taylor fixture: 8-hour OT rates yield CALCULATED_MARGIN 9.55", () => {
   const family = computeNewRateFamily({
     CLIENT_STATE: "AK",

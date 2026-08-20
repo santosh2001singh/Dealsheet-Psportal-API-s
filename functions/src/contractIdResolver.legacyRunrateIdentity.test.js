@@ -50,6 +50,9 @@ test("buildLegacyContractLookupKey: builds both tiers when the row has full iden
     tentativeEndDate: "2026-10-15",
     facility: "the mount sinai hospital",
     parentClient: "mount sinai health system",
+    // Nexus client ids ride along beside the names; blank here because dealRow() sets neither.
+    facilityId: "",
+    parentClientId: "",
   });
   assert.equal(key.nexusKey, "8629683|35450411");
   assert.equal(key.rowKey, "ds:5213876");
@@ -199,7 +202,10 @@ test("a row that can only form the fallback key still resolves through it", asyn
   assert.equal(row.CONTRACT_ID, "CHC22144");
 });
 
-test("an existing SKU_NUMBER on the row is never overwritten", async () => {
+// The SKU belongs to the contract just matched, so a value carried over from a DIFFERENT contract
+// has to give way — see the overwrite note in applyLegacyContractIdentityToDealRows. A null on the
+// legacy row still overwrites nothing, which the next test covers.
+test("the matched contract's SKU_NUMBER replaces a SKU from another contract", async () => {
   const row = dealRow({ SKU_NUMBER: "H99999" });
   await applyLegacyContractIdentityToDealRows([row], {
     tableId: "cynet_health_deal_sheet",
@@ -207,7 +213,7 @@ test("an existing SKU_NUMBER on the row is never overwritten", async () => {
       ["ds:5213876", { CONTRACT_ID: "CHC22144", SKU_NUMBER: "H134597_H15175" }],
     ]),
   });
-  assert.equal(row.SKU_NUMBER, "H99999");
+  assert.equal(row.SKU_NUMBER, "H134597_H15175");
 });
 
 test("no run-rate match leaves CONTRACT_ID null so Firestore mints a fresh id", async () => {

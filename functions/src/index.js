@@ -31,6 +31,7 @@ const {
 } = require("./syncService");
 const { syncPeopleStrongEmployeeDetailsToBigQuery } = require("./peoplestrongEmployeeDetailsService");
 const { logLine, logError, withTimingAsync } = require("./logger");
+const { withRunLock } = require("./syncRunLock");
 const { startDateOnOrAfterUtcMin, effectiveMinFilterDate } = require("./columnMappings");
 const { transformOfferRejectedEndedRowsForBigQuery } = require("./offerRejectedRowTransform");
 
@@ -175,7 +176,30 @@ exports.dealSheetSync = onRequest(
           `[dealSheetSync] Invoking syncEnrichedDealSheetCandidatesToBigQuery (submittals -> deal-sheet-candidates -> enrich -> BigQuery)`
         );
 
-        return syncEnrichedDealSheetCandidatesToBigQuery(params);
+        // Serialised against the scheduled insert trigger and against any other manual call for the
+        // same target. This is the entry point the Aug 19 2026 incident came through: a socket hangup
+        // was read as "the run died", a manual re-run was fired, and the original run was in fact
+        // still alive — two loops then wrote every batch twice. The lock key follows the destination
+        // table so a manual call aimed at a different table is never blocked by an unrelated run.
+        const lockKey = `insert-table:${(bqDatasetRaw || "default")}.${(bqTableRaw || "default")}`;
+        const { ran, result: syncResult } = await withRunLock(
+          lockKey,
+          { label: "dealSheetSync" },
+          () => syncEnrichedDealSheetCandidatesToBigQuery(params)
+        );
+        if (!ran) {
+          logLine(
+            `[dealSheetSync] SKIPPED: another sync is already running for ${lockKey}. Its checkpoint resumes where it left off — re-running now would duplicate every row it inserts.`
+          );
+          return {
+            skipped: true,
+            reason: "another sync is already running for this target",
+            inserted: 0,
+            candidatesProcessed: 0,
+            errorBatches: 0,
+          };
+        }
+        return syncResult;
       });
 
       const executionTimeMs = Date.now() - wallStartMs;
@@ -707,7 +731,28 @@ function buildDealSheetInsertTrigger(domain, label, schedule) {
       logLine(
         `[${label}] Gen2 onSchedule domain=${domain} region=${REGION} timeoutSeconds=${SCHEDULE_TIMEOUT_SEC} scheduleTime=${event.scheduleTime || "n/a"} jobName=${event.jobName || "n/a"}`
       );
-      return withTimingAsync(label, () => runDealSheetInsertSyncForDomain(domain, label));
+      // One run per domain at a time. A socket hangup does not kill a run (the retry layer keeps
+      // going and the page checkpoint keeps hasMore=yes), so a manual re-run started on top of a
+      // still-live one used to give two loops over the same submittal pages — every insert batch
+      // landed twice. See syncRunLock.js for the Aug 19 2026 incident this prevents.
+      return withTimingAsync(label, async () => {
+        const { ran, result } = await withRunLock(
+          `insert-${domain}`,
+          // No runId passed on purpose: acquireRunLock mints a unique one per acquire.
+          // event.jobName is identical on every scheduled firing, so deriving the runId from it gave
+          // every run the same id — and two runs sharing an id defeat the holder checks in
+          // releaseRunLock / refreshRunLock (a finishing run would release its successor's lock).
+          { label },
+          () => runDealSheetInsertSyncForDomain(domain, label)
+        );
+        if (!ran) {
+          logLine(
+            `[${label}] SKIPPED: another ${domain} insert run is still in progress. Its page checkpoint resumes where it left off — no work is lost.`
+          );
+          return { skipped: true, reason: "run already in progress" };
+        }
+        return result;
+      });
     }
   );
 }
@@ -848,7 +893,25 @@ function buildDealSheetUpdateTrigger(domain, label, schedule) {
       logLine(
         `[${label}] Gen2 onSchedule domain=${domain} region=${REGION} timeoutSeconds=${SCHEDULE_TIMEOUT_SEC} scheduleTime=${event.scheduleTime || "n/a"} jobName=${event.jobName || "n/a"}`
       );
-      return withTimingAsync(label, () => runDealSheetUpdateSyncForDomain(domain, label));
+      // Same one-run-per-domain rule as the insert trigger above.
+      return withTimingAsync(label, async () => {
+        const { ran, result } = await withRunLock(
+          `update-${domain}`,
+          // No runId passed on purpose: acquireRunLock mints a unique one per acquire.
+          // event.jobName is identical on every scheduled firing, so deriving the runId from it gave
+          // every run the same id — and two runs sharing an id defeat the holder checks in
+          // releaseRunLock / refreshRunLock (a finishing run would release its successor's lock).
+          { label },
+          () => runDealSheetUpdateSyncForDomain(domain, label)
+        );
+        if (!ran) {
+          logLine(
+            `[${label}] SKIPPED: another ${domain} update run is still in progress. Its checkpoint resumes where it left off — no work is lost.`
+          );
+          return { skipped: true, reason: "run already in progress" };
+        }
+        return result;
+      });
     }
   );
 }

@@ -32,6 +32,45 @@ function resolveActiveDealSheetTableId(email) {
   return TABLE_CYNET_HEALTH;
 }
 
+/** OFFERING value that marks a placement as locums business regardless of who recruited it. */
+const OFFERING_LOCUMS = "LOCUMS";
+
+/**
+ * True when the row's OFFERING says this is locums business.
+ *
+ * OFFERING comes from the Nexus job, not from the recruiter, so it is the authority on what KIND of
+ * business a placement is. The recruiter email only says who owns it.
+ */
+function isLocumsOffering(row) {
+  return (
+    String(row?.OFFERING ?? "")
+      .trim()
+      .toUpperCase() === OFFERING_LOCUMS
+  );
+}
+
+/**
+ * Table a row belongs in, deciding on the row rather than the recruiter email alone.
+ *
+ * A recruiter on @cynethealth.com can place locums business — the GOV desk does exactly this, e.g.
+ * "Demi Sharma (GOV)" <demi.s@cynethealth.com> with OFFERING=LOCUMS, JOB_TYPE=LOCUM,
+ * PROFESSION=Physician and a @cynetlocums.com onsite AM. Routing on the email alone put those rows in
+ * cynet_health_deal_sheet, where locums-specific derivations (pay/bill/margin) do not apply and the
+ * health reporting counts business that is not health's.
+ *
+ * OFFERING wins over the email for the US pair only. A @cynethealth.ca recruiter stays on the Canada
+ * table: Canada is a separate legal entity, so its rows must not be pulled into a US table by the
+ * kind of work they describe.
+ *
+ * @param {Record<string, *>|null|undefined} row
+ * @returns {string} BigQuery table id for rr_project_data
+ */
+function resolveActiveDealSheetTableIdForRow(row) {
+  const byEmail = resolveActiveDealSheetTableId(row?.ASSIGNMENT_RECRUITER_EMAIL);
+  if (byEmail === TABLE_CYNET_HEALTH && isLocumsOffering(row)) return TABLE_CYNET_LOCUMS;
+  return byEmail;
+}
+
 /** Checkpoint / log label when writes fan out to domain tables (not a real table name). */
 function buildActiveDealSheetRoutingSentinel(projectId, datasetId) {
   const p = String(projectId || "").trim() || "unknown_project";
@@ -68,6 +107,19 @@ function resolveEndedDealSheetTableId(email) {
     if (norm.endsWith(suffix)) return tableId;
   }
   return TABLE_ENDED_CYNET_HEALTH;
+}
+
+/**
+ * Ended-table twin of resolveActiveDealSheetTableIdForRow — same OFFERING-over-email rule, so a
+ * placement does not change domain when it moves from the active table to the ended one.
+ *
+ * @param {Record<string, *>|null|undefined} row
+ * @returns {string} BigQuery ended deal sheet table id
+ */
+function resolveEndedDealSheetTableIdForRow(row) {
+  const byEmail = resolveEndedDealSheetTableId(row?.ASSIGNMENT_RECRUITER_EMAIL);
+  if (byEmail === TABLE_ENDED_CYNET_HEALTH && isLocumsOffering(row)) return TABLE_ENDED_CYNET_LOCUMS;
+  return byEmail;
 }
 
 function buildEndedDealSheetRoutingSentinel(projectId, datasetId) {
@@ -156,9 +208,33 @@ function rowMatchesSyncDomain(domain, email) {
   return resolveActiveDealSheetTableId(email) === wanted;
 }
 
+/**
+ * Row-aware twin of rowMatchesSyncDomain: decides on the whole row so OFFERING is honoured.
+ *
+ * This is what keeps a locums placement out of the health run. The health domain filter previously
+ * saw only ASSIGNMENT_RECRUITER_EMAIL, so a @cynethealth.com recruiter's OFFERING=LOCUMS row passed
+ * the filter and was inserted into cynet_health_deal_sheet. Deciding on the row sends it to the
+ * locums run instead — and because both the filter and the insert-time table resolver now use the
+ * same rule, a row is claimed by exactly one domain.
+ *
+ * @param {unknown} domain
+ * @param {Record<string, *>|null|undefined} row
+ * @returns {boolean}
+ */
+function rowMatchesSyncDomainForRow(domain, row) {
+  const wanted = resolveActiveDealSheetTableIdForDomain(domain);
+  if (!wanted) return true;
+  return resolveActiveDealSheetTableIdForRow(row) === wanted;
+}
+
 module.exports = {
   ACTIVE_DEAL_SHEET_TABLE_IDS,
   resolveActiveDealSheetTableId,
+  resolveActiveDealSheetTableIdForRow,
+  resolveEndedDealSheetTableIdForRow,
+  rowMatchesSyncDomainForRow,
+  isLocumsOffering,
+  OFFERING_LOCUMS,
   SYNC_DOMAINS,
   normalizeSyncDomain,
   resolveActiveDealSheetTableIdForDomain,

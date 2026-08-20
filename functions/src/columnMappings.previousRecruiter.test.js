@@ -3,8 +3,8 @@ const assert = require("node:assert/strict");
 
 const { mapDealSheetUsersToBq } = require("./columnMappings");
 const {
-  applyPreviousRecruiterFillForInsertRows,
   applyPreviousRecruiterOnRecruiterChange,
+  buildRecruiterHandoverOwnershipLogRows,
 } = require("./bigQueryClient");
 
 const currentRecruiterUser = { id: 561722, first_name: "Sonam", last_name: "Chaudhary (R4A)", email: "sonam.c@cynethealth.com" };
@@ -63,12 +63,14 @@ test("mapDealSheetUsersToBq: EXTENSION never stashes previous recruiter from sub
   assert.equal(out.PREVIOUS_RECRUITER_EMAIL, undefined);
 });
 
+
 // ---------------------------------------------------------------------------
-// Mechanism B — the ONLY source of a previous recruiter: the deal-sheet's
-// recruiter actually changes between the baseline row and the incoming row.
+// Mechanism B — a deal-sheet recruiter change across an update-append. The
+// outgoing recruiter is captured on the IN-MEMORY __PREV_RECRUITER_* temp
+// fields only; PREVIOUS_RECRUITER_* is never written to the deal sheet.
 // ---------------------------------------------------------------------------
 
-test("applyPreviousRecruiterOnRecruiterChange: deal-sheet recruiter change -> outgoing recruiter becomes previous", () => {
+test("applyPreviousRecruiterOnRecruiterChange: recruiter change captures outgoing recruiter on temp fields only", () => {
   const { row, changed } = applyPreviousRecruiterOnRecruiterChange(
     {
       ASSIGNMENT_RECRUITER: "Sonam Chaudhary (R4A)",
@@ -82,69 +84,85 @@ test("applyPreviousRecruiterOnRecruiterChange: deal-sheet recruiter change -> ou
     }
   );
   assert.equal(changed, true);
-  assert.equal(row.PREVIOUS_RECRUITER_NAME, "Shim Kashung (R2N)");
-  assert.equal(row.PREVIOUS_RECRUITER_EMAIL, "shim.k@cynethealth.com");
-  assert.equal(row.PREVIOUS_RECRUITER_EMP_NO, "CY1554");
-  // Current owner stays the new recruiter.
+  // In-memory only — feeds the ownership log.
+  assert.equal(row.__PREV_RECRUITER_NAME, "Shim Kashung (R2N)");
+  assert.equal(row.__PREV_RECRUITER_EMAIL, "shim.k@cynethealth.com");
+  assert.equal(row.__PREV_RECRUITER_EMP_NO, "CY1554");
+  // The deal-sheet columns stay untouched.
+  assert.equal(row.PREVIOUS_RECRUITER_NAME, undefined);
+  assert.equal(row.PREVIOUS_RECRUITER_EMAIL, undefined);
+  assert.equal(row.PREVIOUS_RECRUITER_EMP_NO, undefined);
+  // Current owner stays the new recruiter; effective date still stamped.
   assert.equal(row.ASSIGNMENT_RECRUITER_EMAIL, "sonam.c@cynethealth.com");
+  assert.equal(row.OWNERSHIP_EFFECTIVE_DATE, "2026-06-09");
 });
 
-test("applyPreviousRecruiterOnRecruiterChange: same recruiter -> no previous, unchanged", () => {
+test("applyPreviousRecruiterOnRecruiterChange: same recruiter -> no capture, unchanged", () => {
   const { row, changed } = applyPreviousRecruiterOnRecruiterChange(
     { ASSIGNMENT_RECRUITER_EMAIL: "sonam.c@cynethealth.com" },
     { ASSIGNMENT_RECRUITER_EMAIL: "Sonam.C@cynethealth.com" } // case-insensitive match
   );
   assert.equal(changed, false);
+  assert.equal(row.__PREV_RECRUITER_EMAIL, undefined);
   assert.equal(row.PREVIOUS_RECRUITER_EMAIL, undefined);
 });
 
-test("applyPreviousRecruiterOnRecruiterChange: no baseline recruiter (first insert) -> no previous", () => {
+test("applyPreviousRecruiterOnRecruiterChange: no baseline recruiter (first insert) -> no capture", () => {
   const { row, changed } = applyPreviousRecruiterOnRecruiterChange(
     { ASSIGNMENT_RECRUITER_EMAIL: "sonam.c@cynethealth.com" },
     { ASSIGNMENT_RECRUITER_EMAIL: null }
   );
   assert.equal(changed, false);
+  assert.equal(row.__PREV_RECRUITER_EMAIL, undefined);
   assert.equal(row.PREVIOUS_RECRUITER_EMAIL, undefined);
 });
 
 // ---------------------------------------------------------------------------
-// applyPreviousRecruiterFillForInsertRows — fills the frozen manual column from
-// a captured temp value (used by the EXTENSION legacy backfill path). Kept as-is.
+// The ownership log still fires on a handover — now sourced from the in-memory
+// temp fields rather than the (removed) PREVIOUS_RECRUITER_EMAIL column.
 // ---------------------------------------------------------------------------
 
-test("applyPreviousRecruiterFillForInsertRows: fills PREVIOUS_RECRUITER when empty (existing deal backfill)", () => {
-  const out = applyPreviousRecruiterFillForInsertRows([
+test("buildRecruiterHandoverOwnershipLogRows: builds RECRUITER row from __PREV_RECRUITER_* temp fields", async () => {
+  const rows = await buildRecruiterHandoverOwnershipLogRows(
+    [
+      {
+        DEAL_TYPE: "DEAL",
+        PLACEMENT_ID: "1452278",
+        ASSIGNMENT_RECRUITER: "Sonam Chaudhary (R4A)",
+        ASSIGNMENT_RECRUITER_EMAIL: "sonam.c@cynethealth.com",
+        RECRUITER_EMP_NO: "CY9001",
+        __PREV_RECRUITER_NAME: "Shim Kashung (R2N)",
+        __PREV_RECRUITER_EMAIL: "shim.k@cynethealth.com",
+        __PREV_RECRUITER_EMP_NO: "CY1554",
+      },
+    ],
     {
-      DEAL_TYPE: "DEAL",
-      PREVIOUS_RECRUITER_NAME: null,
-      PREVIOUS_RECRUITER_EMAIL: null,
-      PREVIOUS_RECRUITER_EMP_NO: null,
-      __PREV_RECRUITER_NAME: "Shim Kashung (R2N)",
-      __PREV_RECRUITER_EMAIL: "shim.k@cynethealth.com",
-      __PREV_RECRUITER_EMP_NO: "CY1554",
-    },
-  ]);
-  assert.equal(out[0].PREVIOUS_RECRUITER_NAME, "Shim Kashung (R2N)");
-  assert.equal(out[0].PREVIOUS_RECRUITER_EMAIL, "shim.k@cynethealth.com");
-  assert.equal(out[0].PREVIOUS_RECRUITER_EMP_NO, "CY1554");
+      directoryFetchFn: async () => new Map(),
+      hierarchyFetchFn: async () => new Map(),
+    }
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].OWNERSHIP_ROLE, "RECRUITER");
+  assert.equal(rows[0].PREVIOUS_OWNER_NAME, "Shim Kashung (R2N)");
+  assert.equal(rows[0].PREVIOUS_OWNER_EMP_NO, "CY1554");
+  assert.equal(rows[0].NEW_OWNER_NAME, "Sonam Chaudhary (R4A)");
+  assert.equal(rows[0].NEW_OWNER_EMP_NO, "CY9001");
 });
 
-test("applyPreviousRecruiterFillForInsertRows: never overwrites an already-set PREVIOUS_RECRUITER (frozen)", () => {
-  const out = applyPreviousRecruiterFillForInsertRows([
+test("buildRecruiterHandoverOwnershipLogRows: a stale PREVIOUS_RECRUITER_EMAIL column is ignored", async () => {
+  const rows = await buildRecruiterHandoverOwnershipLogRows(
+    [
+      {
+        DEAL_TYPE: "DEAL",
+        ASSIGNMENT_RECRUITER_EMAIL: "sonam.c@cynethealth.com",
+        // Left over on an old row; no temp field -> no handover log.
+        PREVIOUS_RECRUITER_EMAIL: "shim.k@cynethealth.com",
+      },
+    ],
     {
-      PREVIOUS_RECRUITER_EMAIL: "already.set@cynethealth.com",
-      PREVIOUS_RECRUITER_NAME: "Already Set",
-      __PREV_RECRUITER_EMAIL: "shim.k@cynethealth.com",
-      __PREV_RECRUITER_NAME: "Shim Kashung (R2N)",
-    },
-  ]);
-  assert.equal(out[0].PREVIOUS_RECRUITER_EMAIL, "already.set@cynethealth.com");
-  assert.equal(out[0].PREVIOUS_RECRUITER_NAME, "Already Set");
-});
-
-test("applyPreviousRecruiterFillForInsertRows: no temp -> untouched", () => {
-  const out = applyPreviousRecruiterFillForInsertRows([
-    { DEAL_TYPE: "DEAL", PREVIOUS_RECRUITER_EMAIL: null },
-  ]);
-  assert.equal(out[0].PREVIOUS_RECRUITER_EMAIL, null);
+      directoryFetchFn: async () => new Map(),
+      hierarchyFetchFn: async () => new Map(),
+    }
+  );
+  assert.equal(rows.length, 0);
 });

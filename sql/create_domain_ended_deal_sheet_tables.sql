@@ -207,8 +207,6 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_ended_dea
   LEVEL_4_CSM STRING,
   -- See the notes on these two groups in create_domain_deal_sheet_tables.sql.
   PREVIOUS_RECRUITER_NAME STRING,
-  PREVIOUS_RECRUITER_EMAIL STRING,
-  PREVIOUS_RECRUITER_EMP_NO STRING,
   OWNERSHIP_DELETED BOOL,
   IS_EXTENSION BOOL,
   IS_FUTURE_ENDED BOOL,

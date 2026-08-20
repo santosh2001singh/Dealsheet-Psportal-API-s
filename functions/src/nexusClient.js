@@ -123,6 +123,10 @@ async function nexusGetJson(url, accessToken) {
       accept: "application/json",
       Authorization: `Bearer ${accessToken}`,
     },
+    // A hung socket would otherwise wait forever and drain the whole run's time budget — see
+    // config.requestTimeoutMs. ECONNABORTED from a timeout is already treated as transient by
+    // isTransientNexusError, so the retry wrapper picks it up.
+    timeout: config.requestTimeoutMs,
   });
   return response.data;
 }
@@ -197,6 +201,9 @@ async function nexusFetchAllJson(urls, accessToken) {
         Authorization: `Bearer ${accessToken}`,
       },
       validateStatus: () => true,
+      // Bounds every parallel request in the wave. One stuck URL used to hold up its whole batch,
+      // and with retries on top a single dead socket could consume tens of minutes.
+      timeout: config.requestTimeoutMs,
     })
   );
 

@@ -44,6 +44,17 @@ const config = {
   maxRetries: parseInt(process.env.MAX_RETRIES || "3", 10),
   /** Delay between fetch chunks; slightly higher default for API stability */
   batchDelayMs: parseInt(process.env.BATCH_DELAY_MS || "100", 10),
+  /**
+   * Per-request Nexus timeout. Without one, axios waits forever on a hung socket: a run on Aug 19
+   * 2026 processed 9 submittal pages in 28 min at a steady ~3 min/page, then sat on page 10 for 22+
+   * min against ECONNRESET retries until the 30-min function timeout killed it. A dead socket must
+   * fail fast so the retry (and then the individual-URL fallback) can make progress instead of the
+   * whole run's budget draining into one request.
+   *
+   * 45s is well above a healthy Nexus response and well below the function timeout, so a request that
+   * hits it is genuinely stuck rather than merely slow.
+   */
+  requestTimeoutMs: parseInt(process.env.NEXUS_REQUEST_TIMEOUT_MS || "45000", 10),
 
   nexus: {
     baseUrl:

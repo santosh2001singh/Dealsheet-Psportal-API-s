@@ -78,6 +78,8 @@ test("EXTENSION_RUNRATE_HIERARCHY_COLUMNS excludes assignment-recruiter identity
   for (const col of EXTENSION_RUNRATE_HIERARCHY_COLUMNS) {
     assert.equal(col.endsWith("_EMP_NO"), false, `${col} must not be an EMP_NO companion column`);
   }
+  assert.equal(EXTENSION_RUNRATE_HIERARCHY_COLUMNS.includes("DELIVERY_DIRECTOR"), true);
+  assert.equal(EXTENSION_RUNRATE_HIERARCHY_COLUMNS.includes("DELIVERY_DIRECTOR_EMP_NO"), false);
 });
 
 test("EXTENSION_RUNRATE_MANUAL_COLUMNS covers sales/credentialing/payment + SECONDARY_RECRUITER", () => {
@@ -104,6 +106,30 @@ test("EXTENSION_RUNRATE_MANUAL_COLUMNS covers sales/credentialing/payment + SECO
     // row until it is carried across.
     "BACKOUT_OR_TERMINATION",
     "COMMENTS",
+    // Added Aug 2026: the rest of the hand-maintained ops set. Each was measured well populated on
+    // the run-rate side and 100% empty on every deal sheet row, so the deal sheet only ever gets
+    // them by inheriting them here.
+    "TYPE_OF_CLIENT",
+    "ACC_DIR_OR_VERT_HEAD",
+    "WEEKLY_WALLET_MONEY",
+    "DIVERSITY_STATUS",
+    "PO_RECEIVED",
+    "PAYLOCITY_ID",
+    "BGC_CATEGORY1",
+    "BGC_AMOUNT1",
+    "BGC_CATEGORY2",
+    "BGC_AMOUNT2",
+    "BGC_CATEGORY3",
+    "BGC_AMOUNT3",
+    "BGC_TOTAL_BGV_COST",
+    "BGC_AGENCY_NAME",
+    "ONB_CAND_DOB",
+    "ONB_I9_RECIEVED",
+    "ONB_E_VERIFY",
+    "ONB_SUPP_DOC1",
+    "ONB_SUPP_DOC1_EXP_DT",
+    "ONB_SUPP_DOC2",
+    "ONB_SUPP_DOC2_EXP_DT",
   ];
   assert.deepEqual([...EXTENSION_RUNRATE_MANUAL_COLUMNS], expected);
   assert.equal(EXTENSION_RUNRATE_MANUAL_COLUMNS.includes("ASSIGNMENT_RECRUITER"), false);
@@ -113,22 +139,10 @@ test("EXTENSION_RUNRATE_MANUAL_COLUMNS covers sales/credentialing/payment + SECO
 test("the ops columns are inheritable from BOTH the run-rate row and a parent DEAL", () => {
   // The set the business tracks by hand. Whichever tier places the row — the run-rate date window or
   // its parent DEAL — has to be able to supply all of them, or a row loses the field purely because
-  // of which tier matched. Both lists are asserted so dropping one from either side fails here.
-  for (const col of [
-    "CLIENT_NAME_IN_CONREP",
-    "ENTITY",
-    "FIFTYTWO_TENURE_RTO_LASTDATE",
-    "FIFTYTWO_TENURE_CANDIDATE_STATUS",
-    "RECRUITMENT_MENTOR",
-    "SECONDARY_RECRUITER",
-    "ST_DT_PUSHBACK_REASON",
-    "CLIENT_RECRUITER",
-    "INVOICE_CYCLE_TO_CLIENT",
-    "CLIENT_PAYMENT_TERMS",
-    "CANDIDATE_PAYMENT_TERMS",
-    "BACKOUT_OR_TERMINATION",
-    "COMMENTS",
-  ]) {
+  // of which tier matched. Driven off the run-rate list itself rather than a hand-copied roster, so
+  // a column added there in future is covered here automatically instead of silently skipping the
+  // parent-DEAL tier.
+  for (const col of EXTENSION_RUNRATE_MANUAL_COLUMNS) {
     assert.ok(
       EXTENSION_RUNRATE_MANUAL_COLUMNS.includes(col),
       `${col} is inheritable from the matched run-rate row`
@@ -630,6 +644,74 @@ test("applyExtensionInheritForInsertRows also merges runrate-matched hierarchy *
   assert.equal(out[0].TEAM_LEAD_EMP_NO, "CY2393");
   assert.equal(out[0].RM, "Ajay Kumar");
   assert.equal(out[0].RM_EMP_NO, "Already Set Manually");
+});
+
+test("applyExtensionInheritForInsertRows fills DELIVERY_DIRECTOR and EMP_NO from runrate when empty", async () => {
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      CONTRACT_ID: null,
+      CANDIDATE_ID: 111,
+      CLIENT_ID: 55,
+      PLACEMENT_ID: 999,
+      DELIVERY_DIRECTOR: null,
+      DELIVERY_DIRECTOR_EMP_NO: null,
+    },
+  ];
+
+  const runrateFetchFn = async () =>
+    new Map([
+      [
+        "999",
+        {
+          DELIVERY_DIRECTOR: "Deepti Sharma",
+          DELIVERY_DIRECTOR_EMP_NO: "CY1166",
+        },
+      ],
+    ]);
+
+  const out = await applyExtensionInheritForInsertRows(rows, {}, {
+    parentFetchFn: noParentFetch,
+    priorExtensionFetchFn: noPriorExtensionFetch,
+    runrateFetchFn,
+    resolveContractIdsFn: noContractIdResolution,
+  });
+  assert.equal(out[0].DELIVERY_DIRECTOR, "Deepti Sharma");
+  assert.equal(out[0].DELIVERY_DIRECTOR_EMP_NO, "CY1166");
+});
+
+test("applyExtensionInheritForInsertRows does not overwrite an already-set DELIVERY_DIRECTOR from runrate", async () => {
+  const rows = [
+    {
+      DEAL_TYPE: "EXTENSION",
+      CONTRACT_ID: null,
+      CANDIDATE_ID: 111,
+      CLIENT_ID: 55,
+      PLACEMENT_ID: 999,
+      DELIVERY_DIRECTOR: "Already Set",
+      DELIVERY_DIRECTOR_EMP_NO: "CY-EXIST",
+    },
+  ];
+
+  const runrateFetchFn = async () =>
+    new Map([
+      [
+        "999",
+        {
+          DELIVERY_DIRECTOR: "Deepti Sharma",
+          DELIVERY_DIRECTOR_EMP_NO: "CY1166",
+        },
+      ],
+    ]);
+
+  const out = await applyExtensionInheritForInsertRows(rows, {}, {
+    parentFetchFn: noParentFetch,
+    priorExtensionFetchFn: noPriorExtensionFetch,
+    runrateFetchFn,
+    resolveContractIdsFn: noContractIdResolution,
+  });
+  assert.equal(out[0].DELIVERY_DIRECTOR, "Already Set");
+  assert.equal(out[0].DELIVERY_DIRECTOR_EMP_NO, "CY-EXIST");
 });
 
 test("applyExtensionInheritForInsertRows backfills SKU_NUMBER: parent DEAL wins, else runrate match", async () => {

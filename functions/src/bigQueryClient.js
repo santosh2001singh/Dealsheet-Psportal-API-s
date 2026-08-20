@@ -6,12 +6,13 @@
 const { BigQuery } = require("@google-cloud/bigquery");
 const { randomUUID } = require("crypto");
 const config = require("./config");
-const { logLine, logDetail, logError } = require("./logger");
+const { logDetail, logError } = require("./logger");
 const { shouldExcludeRowFromBigQuery } = require("./bqRowExclusions");
 const {
   ACTIVE_DEAL_SHEET_TABLE_IDS,
   ENDED_DEAL_SHEET_TABLE_IDS,
   resolveActiveDealSheetTableId,
+  resolveActiveDealSheetTableIdForRow,
   resolvePairedActiveTableId,
   resolveRunrateTableIdForDealSheetTable,
 } = require("./recruiterDomainTables");
@@ -830,11 +831,9 @@ function hasBusinessColumnChanges(incomingRow, existingRow, ignoreFieldsSet) {
     const existingTent = normalizeForCompare(existingRow?.TENTATIVE_END_DATE);
     if (incomingTent !== existingTent) return true;
   }
-  // A handover DEAL whose previous recruiter (from the submittal) is not yet stored should append a
-  // row so the fill-when-empty PREVIOUS_RECRUITER lands (it is a MANUAL column, not compared above).
-  const incomingPrevEmail = normalizeForCompare(incomingRow?.__PREV_RECRUITER_EMAIL);
-  const existingPrevEmail = normalizeForCompare(existingRow?.PREVIOUS_RECRUITER_EMAIL);
-  if (incomingPrevEmail != null && existingPrevEmail == null) return true;
+  // PREVIOUS_RECRUITER_* is no longer written to the deal sheet, so there is no fill-when-empty
+  // append to force here — a recruiter handover already shows up as an ASSIGNMENT_RECRUITER_EMAIL
+  // change in the business-column comparison above.
   return false;
 }
 
@@ -901,6 +900,39 @@ function applyIsRejectedResetForChangedUpdate(incomingRow, baselineRow) {
 }
 
 /**
+ * Carry the baseline CONTRACT_ID onto an update-append row.
+ *
+ * A placement's contract identity is decided ONCE, at its first insert, and is immutable from then
+ * on: ch_rate_change_logs / ownership_change_logs / ch_termination_reason_logs are all keyed on it,
+ * and EXTENSION rows inherit it from their parent DEAL. An update-append is the SAME placement, so
+ * it must reuse the id the baseline already carries.
+ *
+ * Without this the id was silently re-derived on every update. CONTRACT_ID is not in
+ * MANUAL_COLUMNS, so applyManualColumnsCarryForward never copied it; a freshly-enriched row reaches
+ * the insert path with CONTRACT_ID null, and the allocator further down then re-matched it against
+ * the run-rate table from scratch. When that match landed on a different one of the candidate's
+ * overlapping contracts, the same placement changed id between two appends — live example
+ * (DEAL_SHEET_ID 5139885 / PLACEMENT_ID 1441464, Aug 2026): CHC20908 on 08-17, CHC20892 on 08-18,
+ * every business field identical. Fixing the run-rate match determinism alone is not enough, since
+ * the run-rate table itself changes underneath; the id has to stop being re-derived at all.
+ *
+ * Only fills a null: a baseline with no id leaves the row to the allocator, which is what a
+ * placement with no contract identity yet is supposed to do.
+ *
+ * @returns {{row: object, carried: boolean}}
+ */
+function applyContractIdCarryForward(incomingRow, baselineRow) {
+  if (!baselineRow || !incomingRow || typeof incomingRow !== "object") {
+    return { row: incomingRow, carried: false };
+  }
+  const baselineId = normalizeContractIdOrNull(baselineRow.CONTRACT_ID);
+  if (baselineId == null) return { row: incomingRow, carried: false };
+  const incomingId = normalizeContractIdOrNull(incomingRow.CONTRACT_ID);
+  if (incomingId === baselineId) return { row: incomingRow, carried: false };
+  return { row: { ...incomingRow, CONTRACT_ID: baselineId }, carried: true };
+}
+
+/**
  * Copy explicit MANUAL_COLUMNS from baseline onto incoming before append-on-change insert.
  * Strips enrich-spread manual keys first so baseline always wins (incl. null).
  */
@@ -953,10 +985,11 @@ function applyTentativeDateFreeze(incomingRow, baselineRow) {
 }
 
 /**
- * On an update-append where ASSIGNMENT_RECRUITER_EMAIL changed vs baseline, stamp the OUTGOING
- * recruiter's identity onto PREVIOUS_RECRUITER_NAME/EMAIL/EMP_NO from the baseline row. When the
- * recruiter is unchanged these columns are left as-is (they are MANUAL_COLUMNS, so already carried
- * forward from baseline by applyManualColumnsCarryForward before this runs).
+ * On an update-append where ASSIGNMENT_RECRUITER_EMAIL changed vs baseline, capture the OUTGOING
+ * recruiter's identity on the IN-MEMORY temp fields __PREV_RECRUITER_NAME/EMAIL/EMP_NO (read by
+ * buildRecruiterHandoverOwnershipLogRows to emit the RECRUITER ownership log). These temp fields are
+ * stripped before the BigQuery insert — PREVIOUS_RECRUITER_* is no longer written to the deal sheet
+ * (the frontend derives it itself), so the deal-sheet columns are left untouched here.
  *
  * Also VACATES any frozen hierarchy role the NEW recruiter used to hold on this placement: if the
  * new recruiter's RECRUITER_EMP_NO matches a hierarchy role's emp-no on the baseline row (e.g. they
@@ -977,9 +1010,10 @@ function applyPreviousRecruiterOnRecruiterChange(incomingRow, baselineRow) {
   if (baseEmail === "" || incEmail === baseEmail) return { row: incomingRow, changed: false };
   const next = {
     ...incomingRow,
-    PREVIOUS_RECRUITER_NAME: baselineRow.ASSIGNMENT_RECRUITER ?? null,
-    PREVIOUS_RECRUITER_EMAIL: baselineRow.ASSIGNMENT_RECRUITER_EMAIL ?? null,
-    PREVIOUS_RECRUITER_EMP_NO: baselineRow.RECRUITER_EMP_NO ?? null,
+    // In-memory only (stripped before insert) — feeds the RECRUITER ownership log, not the deal sheet.
+    __PREV_RECRUITER_NAME: baselineRow.ASSIGNMENT_RECRUITER ?? null,
+    __PREV_RECRUITER_EMAIL: baselineRow.ASSIGNMENT_RECRUITER_EMAIL ?? null,
+    __PREV_RECRUITER_EMP_NO: baselineRow.RECRUITER_EMP_NO ?? null,
     // Recruiter changed -> stamp OWNERSHIP_EFFECTIVE_DATE = TENTATIVE_END_DATE + 1, the same value the
     // ownership_change_logs RECRUITER row gets. Kept in sync via overwriteDealSheetEffectiveDatesFromTentative
     // (never overwritten to extension START_DATE / MIN by CONTRACT_ID).
@@ -1765,6 +1799,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     let moveRunrateForcedFalse = 0;
     let moveRunrateKeptNull = 0;
     let isRejectedResetCount = 0;
+    let contractIdCarriedCount = 0;
     let manualColumnsCarriedTotal = 0;
     let tentativeFrozenCount = 0;
     let newHireFrozenCount = 0;
@@ -1817,11 +1852,13 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
         if (moveRunrateAdjusted.forcedFalse) moveRunrateForcedFalse++;
         if (moveRunrateAdjusted.keptNull) moveRunrateKeptNull++;
         if (withRejectedReset?.IS_REJECTED === "False") isRejectedResetCount++;
+        const contractIdCarried = applyContractIdCarryForward(withRejectedReset, existing);
+        if (contractIdCarried.carried) contractIdCarriedCount++;
         // Mark as an update-append (has a baseline): hierarchy is carried forward verbatim and
         // must NOT be re-derived from the directory. Re-deriving would re-fill a field a
         // recruiter-hierarchy MOVE deliberately vacated (see applyRecruiterHierarchyMovesToDealSheet)
         // and put the same person in two fields. Freeze = set once at first insert.
-        filtered.push({ ...withRejectedReset, __CARRIED_FORWARD_UPDATE: true });
+        filtered.push({ ...contractIdCarried.row, __CARRIED_FORWARD_UPDATE: true });
         continue;
       }
       unchangedSkipped++;
@@ -1830,6 +1867,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     logDetail(
       `[enriched sync] [BigQuery insertAll] append-on-change(DEAL_SHEET_ID+PLACEMENT_ID): changedIncluded=${changedIncluded} noBaselineIncluded=${noBaselineIncluded} newRowSkippedByPlacementStatus=${newRowSkippedByPlacementStatus} missingPlacementIdCount=${missingPlacementIdCount} moveRunrateForcedFalse=${moveRunrateForcedFalse} moveRunrateKeptNull=${moveRunrateKeptNull} unchangedSkipped=${unchangedSkipped} remaining=${rowsToInsert.length}`
       + ` isRejectedResetCount=${isRejectedResetCount} manualColumnsCarriedTotal=${manualColumnsCarriedTotal}`
+      + ` contractIdCarriedCount=${contractIdCarriedCount}`
       + ` tentativeFrozenCount=${tentativeFrozenCount}`
       + ` newHireFrozenCount=${newHireFrozenCount}`
       + ` extensionFrozenCount=${extensionFrozenCount}`
@@ -1837,13 +1875,9 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     );
   }
 
-  // Fill PREVIOUS_RECRUITER from the enrichment temp fields (when empty) BEFORE the DEAL hierarchy
-  // fetch below, which sources the chain from PREVIOUS_RECRUITER_EMAIL on a handover.
-  rowsToInsert = applyPreviousRecruiterFillForInsertRows(rowsToInsert);
-
-  // EXTENSION rows: backfill PREVIOUS_RECRUITER from the legacy manual ownership tracker when still
-  // empty (historical recruiter handovers that predate this sync). Freeze-once-set.
-  rowsToInsert = await applyExtensionLegacyPreviousRecruiterForInsertRows(rowsToInsert);
+  // PREVIOUS_RECRUITER_* is no longer written to the deal sheet (the frontend derives it). The
+  // outgoing recruiter still rides along on the in-memory __PREV_RECRUITER_* temp fields, which
+  // buildRecruiterHandoverOwnershipLogRows reads to emit the RECRUITER ownership log.
 
   rowsToInsert = await applyDealRecruiterHierarchyForInsertRows(
     rowsToInsert,
@@ -1882,7 +1916,14 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
     // when Phase A missed due to timing or lookup failure).
     // Lazy require to avoid module-load circular dependency with contractIdResolver.
     const { allocateContractIdsForInsertableRows } = require("./contractIdResolver");
-    await allocateContractIdsForInsertableRows(rowsToInsert, { tableId: options.tableId });
+    // bqOptions carries the dataset/table actually being written. Without it the existing-id
+    // reuse inside the allocator (applyExistingContractIdsByDealSheetId ->
+    // fetchContractIdsByDealSheetIds) fell back to config defaults, so a placement that already
+    // had a CONTRACT_ID in the destination table looked brand new and got a freshly minted id.
+    await allocateContractIdsForInsertableRows(rowsToInsert, {
+      tableId: options.tableId,
+      bqOptions: resolveBqDatasetTable(options),
+    });
   }
 
   // AFTER the run-rate identity rule above, deliberately. That rule matches an EXTENSION against the
@@ -2003,7 +2044,7 @@ async function insertEnrichedDealSheetBatchRouted(combinedRows, insertIdBase, op
   const resolveTableId =
     typeof options.resolveTableId === "function"
       ? options.resolveTableId
-      : (row) => resolveActiveDealSheetTableId(row?.ASSIGNMENT_RECRUITER_EMAIL);
+      : (row) => resolveActiveDealSheetTableIdForRow(row);
   for (const row of combinedRows) {
     const tid = resolveTableId(row);
     if (!groups.has(tid)) groups.set(tid, []);
@@ -2682,9 +2723,9 @@ const ACTIVE_CHANGE_SCAN_COLUMNS = [
   "ASSIGNMENT_RECRUITER",
   "ASSIGNMENT_RECRUITER_EMAIL",
   "RECRUITER_EMP_NO",
+  // PREVIOUS_RECRUITER_EMAIL / _EMP_NO are dropped from the deal-sheet schema; only
+  // PREVIOUS_RECRUITER_NAME remains (legacy values on existing rows, never written on new ones).
   "PREVIOUS_RECRUITER_NAME",
-  "PREVIOUS_RECRUITER_EMAIL",
-  "PREVIOUS_RECRUITER_EMP_NO",
   "ONSITE_AM",
   "ONSITE_AM_EMAIL",
   "LEVEL_2_CSM",
@@ -3068,6 +3109,18 @@ function assignLegacyManualColumns(target, bqRow) {
 }
 
 /**
+ * A Nexus client id (CLIENT_ID / NEXUS_PARENT_CLIENT_ID) as a match-key string, or "" when absent.
+ *
+ * Both the deal sheet and the run-rate table store these as INT64, so the string form is only for
+ * key building — "" means "this row cannot match on id", which pushes it onto the name fallback.
+ */
+function normalizeClientIdKeyPart(value) {
+  if (value == null) return "";
+  const n = Number(String(value).trim());
+  return Number.isFinite(n) && n !== 0 ? String(Math.trunc(n)) : "";
+}
+
+/**
  * Lookup key for a DEAL row against the legacy run-rate table.
  *
  * `spanKey` is the primary key (the data team's own matching rule); `nexusKey` is the fallback.
@@ -3095,6 +3148,10 @@ function buildLegacyContractLookupKey(row) {
     row.FACILITY_NAME == null ? "" : String(row.FACILITY_NAME).trim().toLowerCase();
   const parentClient =
     row.PARENT_CLIENT_NAME == null ? "" : String(row.PARENT_CLIENT_NAME).trim().toLowerCase();
+  // Nexus client ids, preferred over the names above when both sides carry them. Kept as strings so
+  // a blank simply never matches, the same way the name halves behave.
+  const facilityId = normalizeClientIdKeyPart(row.CLIENT_ID);
+  const parentClientId = normalizeClientIdKeyPart(row.NEXUS_PARENT_CLIENT_ID);
 
   // Primary match rule, specified by the data team: candidate (id OR email) + facility + parent
   // client, plus ANY ONE of the deal row's three dates falling inside the run-rate row's window.
@@ -3111,12 +3168,26 @@ function buildLegacyContractLookupKey(row) {
   // Requiring all three dates instead was measured and rejected: it collapses matches from 1,865 to
   // 709, because a BOOKED/STARTED placement has no END_DATE yet. Any-of resolves 1,905 with the same
   // 5 ambiguous rows as before.
+  // The client half is satisfied by EITHER the id pair or the name pair. Ids are preferred inside the
+  // SQL (see the join below); the names stay on the key so a run-rate row carrying no ids at all —
+  // 975 of 21,926 live rows — still has something to match on.
+  const hasClientIds = facilityId !== "" && parentClientId !== "";
+  const hasClientNames = facility !== "" && parentClient !== "";
   const spanKey =
     (candidateId !== "" || email !== "") &&
     (startDate !== "" || endDate !== "" || tentativeEndDate !== "") &&
-    facility !== "" &&
-    parentClient !== ""
-      ? { candidateId, email, startDate, endDate, tentativeEndDate, facility, parentClient }
+    (hasClientIds || hasClientNames)
+      ? {
+          candidateId,
+          email,
+          startDate,
+          endDate,
+          tentativeEndDate,
+          facility,
+          parentClient,
+          facilityId,
+          parentClientId,
+        }
       : null;
 
   if (!spanKey && !nexusKey) return null;
@@ -3133,17 +3204,30 @@ function buildLegacyContractLookupKey(row) {
   return { rowKey, spanKey, nexusKey };
 }
 
-/** Stable string form of a spanKey, used for map lookups on both sides of the SQL round trip. */
+/**
+ * Stable string form of a spanKey, used for map lookups on both sides of the SQL round trip.
+ *
+ * IDENTITY ONLY — candidate + client. The three dates are deliberately NOT part of it even though
+ * they travel in the same struct, because they are join INPUTS (which run-rate window does this row
+ * fall inside?) and not part of who the row is.
+ *
+ * Including them made the key per-ROW instead of per-CONTRACT. The deal sheet is append-only, so one
+ * contract owns several placement-level rows and each carries its OWN START_DATE / END_DATE /
+ * TENTATIVE_END_DATE; two rows of the same contract therefore built two different keys, the SQL
+ * PARTITION BY split them into two independent windows, and each resolved its own CONTRACT_ID. That
+ * is the "one contract, two ids" split — deterministic on rerun, but not consistent across the rows
+ * of a contract. Keying on identity alone collapses them onto one match, and the dates still do
+ * their real job inside the join predicate below.
+ */
 function buildSpanKeyString(spanKey) {
   if (!spanKey) return "";
   return [
     spanKey.candidateId ?? "",
     spanKey.email ?? "",
-    spanKey.startDate ?? "",
-    spanKey.endDate ?? "",
-    spanKey.tentativeEndDate ?? "",
     spanKey.facility ?? "",
     spanKey.parentClient ?? "",
+    spanKey.facilityId ?? "",
+    spanKey.parentClientId ?? "",
   ].join("|");
 }
 
@@ -3175,10 +3259,18 @@ function buildSpanKeyString(spanKey) {
  * Earlier revisions also tried CANDIDATE_EMAIL + exact START_DATE, CANDIDATE_ID + VMS_JOB_ID, and a
  * bare CANDIDATE_ID + span as separate tiers; all three are now subsumed by tier 1 and were removed.
  *
- * A key mapping to more than one CONTRACT_ID (5 of the live DEAL rows under tier 1) resolves to the
- * exact START_DATE match first, then the LATEST START_DATE, then the lowest CONTRACT_ID, then the
- * lowest ID — deterministic across reruns. Latest rather than earliest because the span is inclusive:
- * a re-booking at the same facility also falls inside the window of the contract it replaced.
+ * The key is candidate + client IDENTITY only; the dates travel alongside it as probe values for the
+ * window join but are NOT part of the key. See buildSpanKeyString for why — keying on them made the
+ * key per-row instead of per-contract and split one contract across two ids.
+ *
+ * A key mapping to more than one CONTRACT_ID resolves to an exact probe-date match first, then the
+ * LATEST START_DATE, then the lowest CONTRACT_ID, then the lowest ID — deterministic across reruns.
+ * Latest rather than earliest because the span is inclusive: a re-booking at the same facility also
+ * falls inside the window of the contract it replaced. Tier 2 uses the same LATEST ordering.
+ *
+ * NOTE: this resolves the contract for a placement that has NO id yet. A placement that already has
+ * one keeps it — applyContractIdCarryForward copies the baseline id onto every update-append, so a
+ * re-derivation here can never change an existing placement's contract identity.
  *
  * @param {object[]} rows - DEAL rows needing an id
  * @param {object} [options]
@@ -3203,13 +3295,29 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
 
   const keyed = [];
   const nexusKeys = new Set();
+  // Identity string -> the span key plus the UNION of every date those rows contributed.
+  //
+  // The key is now identity-only, so all the placement-level rows of one contract land on the same
+  // entry. Their dates still differ, and each one is a legitimate probe into the run-rate window —
+  // a BOOKED row has no END_DATE, a re-issued row has a shifted START_DATE — so they are collected
+  // rather than overwritten. Taking just one row's dates ("last wins") would throw away the only
+  // date that lands inside the window and lose the match entirely.
   const spanKeysByString = new Map();
   for (const row of rows) {
     const key = buildLegacyContractLookupKey(row);
     if (!key) continue;
     keyed.push(key);
     if (key.nexusKey) nexusKeys.add(key.nexusKey);
-    if (key.spanKey) spanKeysByString.set(buildSpanKeyString(key.spanKey), key.spanKey);
+    if (!key.spanKey) continue;
+    const keyString = buildSpanKeyString(key.spanKey);
+    let entry = spanKeysByString.get(keyString);
+    if (!entry) {
+      entry = { spanKey: key.spanKey, dates: new Set() };
+      spanKeysByString.set(keyString, entry);
+    }
+    for (const d of [key.spanKey.startDate, key.spanKey.endDate, key.spanKey.tentativeEndDate]) {
+      if (d) entry.dates.add(d);
+    }
   }
   if (keyed.length === 0) return out;
 
@@ -3217,34 +3325,47 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
   const byNexusKey = new Map();
 
   if (spanKeysByString.size > 0) {
-    // A blank date becomes CAST(NULL AS DATE): `NULL BETWEEN a AND b` is NULL, so an absent date
-    // simply never satisfies its arm of the OR — no extra guard needed.
-    const dateLit = (v) =>
-      v == null || v === "" ? "CAST(NULL AS DATE)" : `DATE '${escapeSqlString(v)}'`;
+    // Every date the contract's rows contributed, as an ARRAY. An empty array simply never satisfies
+    // the EXISTS below, which is the same "absent date never matches" behaviour the three nullable
+    // scalar columns had.
+    const dateArrayLit = (dates) => {
+      const lits = [...dates]
+        .sort()
+        .map((d) => `DATE '${escapeSqlString(d)}'`);
+      return lits.length === 0 ? "CAST([] AS ARRAY<DATE>)" : `[${lits.join(", ")}]`;
+    };
     const structs = [...spanKeysByString.values()].map(
-      (k) =>
+      ({ spanKey: k, dates }) =>
         `STRUCT('${escapeSqlString(k.candidateId)}' AS cand, '${escapeSqlString(k.email)}' AS em, ` +
-        `${dateLit(k.startDate)} AS st, ${dateLit(k.endDate)} AS ed, ` +
-        `${dateLit(k.tentativeEndDate)} AS te, '${escapeSqlString(k.facility)}' AS fac, ` +
-        `'${escapeSqlString(k.parentClient)}' AS pc)`
+        `${dateArrayLit(dates)} AS probe_dates, '${escapeSqlString(k.facility)}' AS fac, ` +
+        `'${escapeSqlString(k.parentClient)}' AS pc, ` +
+        `'${escapeSqlString(k.facilityId)}' AS fac_id, ` +
+        `'${escapeSqlString(k.parentClientId)}' AS pc_id)`
     );
     // The candidate half matches on either identifier; a blank one on the deal row simply never
     // matches, since the run-rate side is compared against a non-empty value.
-    // ROW_NUMBER picks the earliest contract per key; CONTRACT_ID then ID break ties so repeated runs
+    // ROW_NUMBER picks one contract per IDENTITY (see the PARTITION BY below); an exact probe-date
+    // hit wins, then the latest START_DATE, then CONTRACT_ID and ID break ties so repeated runs
     // always resolve identically.
     const { cols: manualCols, select: manualSelect } = buildLegacyManualColumnSql("r");
     const manualOut = manualCols.map((c) => c.toLowerCase()).join(", ");
     const sql = `
-      WITH wanted AS (SELECT * FROM UNNEST([${structs.join(", ")}])),
+      WITH wanted_keys AS (SELECT * FROM UNNEST([${structs.join(", ")}])),
+      -- One row per (identity, probe date). A contract whose placement rows contributed four dates
+      -- gets four chances at the run-rate window; the PARTITION BY on identity below then collapses
+      -- however many of them hit back down to a single chosen contract.
+      wanted AS (
+        SELECT k.* EXCEPT(probe_dates), k.probe_dates AS probe_dates, probe
+        FROM wanted_keys k CROSS JOIN UNNEST(k.probe_dates) AS probe
+      ),
       ranked AS (
         SELECT
           w.cand AS cand,
           w.em AS em,
-          CAST(w.st AS STRING) AS st,
-          CAST(w.ed AS STRING) AS ed,
-          CAST(w.te AS STRING) AS te,
           w.fac AS fac,
           w.pc AS pc,
+          w.fac_id AS fac_id,
+          w.pc_id AS pc_id,
           r.CONTRACT_ID AS contract_id,
           r.SKU_NUMBER AS sku_number,
           -- The matched run-rate row is the contract, so its START_DATE is the contract's true
@@ -3254,14 +3375,31 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
           r.START_DATE AS initial_start_date,
           ${manualSelect},
           ROW_NUMBER() OVER (
-            PARTITION BY w.cand, w.em, w.st, w.ed, w.te, w.fac, w.pc
-            -- An exact START_DATE hit wins over a merely-spanning one. The window is inclusive, so a
-            -- re-booking at the same facility sits inside its own predecessor's window too (the
-            -- previous contract runs to 2026-02-28, the new one starts 2026-02-23) and ordering by
-            -- START_DATE alone would hand the row to the contract it just replaced. Preferring the
-            -- exact match keeps the window as what it was meant to be: a fallback for shifted dates.
+            -- Identity only (candidate + client), matching buildSpanKeyString. The dates are join
+            -- inputs, not identity: partitioning by them gave every placement-level row of one
+            -- contract its own window and let each pick a different CONTRACT_ID.
+            PARTITION BY w.cand, w.em, w.fac, w.pc, w.fac_id, w.pc_id
+            -- An exact hit on ANY of the contract's probe dates wins over a merely-spanning one. The
+            -- window is inclusive, so a re-booking at the same facility sits inside its own
+            -- predecessor's window too (the previous contract runs to 2026-02-28, the new one starts
+            -- 2026-02-23) and ordering by START_DATE alone would hand the row to the contract it just
+            -- replaced. Preferring the exact match keeps the window as what it was meant to be: a
+            -- fallback for shifted dates.
+            --
+            -- Then: the run-rate row whose window covers the MOST of the contract's probe dates
+            -- wins. Two rows can share a START_DATE while one is the real contract and the other a
+            -- stub that was opened and closed the same day — live example (CANDIDATE_ID 20118086,
+            -- Aug 2026): CHC20908 runs 2026-01-05..2026-01-31 (tentative 04-04) and carries SKU
+            -- H14319, while CHC20892 runs 2026-01-05..2026-01-05 with no SKU. START_DATE ties, so
+            -- CONTRACT_ID ASC used to break it and handed the placement to the stub. Coverage is the
+            -- discriminator that actually distinguishes them: the real contract spans every one of
+            -- the placement's dates, the stub spans one.
             ORDER BY
-              CASE WHEN r.START_DATE = w.st THEN 0 ELSE 1 END ASC,
+              CASE WHEN r.START_DATE IN UNNEST(w.probe_dates) THEN 0 ELSE 1 END ASC,
+              (
+                SELECT COUNT(1) FROM UNNEST(w.probe_dates) AS pd
+                WHERE pd BETWEEN r.START_DATE AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE)
+              ) DESC,
               r.START_DATE DESC,
               r.CONTRACT_ID ASC,
               r.ID ASC
@@ -3270,31 +3408,46 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
         JOIN wanted w
           ON ( (w.cand != '' AND CAST(r.CANDIDATE_ID AS STRING) = w.cand)
                OR (w.em != '' AND LOWER(TRIM(r.CANDIDATE_EMAIL)) = w.em) )
-         -- ANY ONE of the deal row's three dates inside the run-rate window is enough. A shifted
-         -- re-issue can push START_DATE outside it while END/TENTATIVE_END still land inside.
-         AND ( w.st BETWEEN r.START_DATE AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE)
-            OR w.ed BETWEEN r.START_DATE AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE)
-            OR w.te BETWEEN r.START_DATE AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE) )
-         AND LOWER(TRIM(r.FACILITY_NAME)) = w.fac
-         AND LOWER(TRIM(r.PARENT_CLIENT_NAME)) = w.pc
+         -- ANY ONE of the contract's probe dates inside the run-rate window is enough. A shifted
+         -- re-issue can push START_DATE outside it while END/TENTATIVE_END still land inside, and a
+         -- BOOKED row has no END_DATE at all — so every date from every placement-level row of the
+         -- contract gets a shot at the window.
+         -- The probe column comes from the CROSS JOIN UNNEST in the wanted CTE rather than an EXISTS
+         -- subquery, which BigQuery rejects inside a join predicate. One matching probe date is
+         -- enough, and the PARTITION BY collapses the duplicate rows a multi-probe hit produces.
+         AND probe BETWEEN r.START_DATE AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE)
+         -- Client half: Nexus ids when BOTH sides carry them, else the names. Ids are exact where
+         -- names are not — the two tables spell the same facility differently often enough that
+         -- 749 candidate/client pairs match by id and fail by name, with none matching by name
+         -- alone. The name arm only engages when either side is missing an id, so a genuine id
+         -- mismatch is never papered over by a coincidental name hit.
+         AND ( CASE
+                 WHEN w.fac_id != '' AND w.pc_id != ''
+                  AND r.CLIENT_ID IS NOT NULL AND r.NEXUS_PARENT_CLIENT_ID IS NOT NULL
+                   THEN CAST(r.CLIENT_ID AS STRING) = w.fac_id
+                    AND CAST(r.NEXUS_PARENT_CLIENT_ID AS STRING) = w.pc_id
+                 ELSE LOWER(TRIM(r.FACILITY_NAME)) = w.fac
+                  AND LOWER(TRIM(r.PARENT_CLIENT_NAME)) = w.pc
+               END )
         WHERE r.CONTRACT_ID IS NOT NULL AND TRIM(r.CONTRACT_ID) != ''
           AND r.START_DATE IS NOT NULL
           -- The window needs an end: END_DATE preferred, TENTATIVE_END_DATE when it is absent.
           AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE) IS NOT NULL
       )
-      SELECT cand, em, st, ed, te, fac, pc, contract_id, sku_number, initial_start_date, ${manualOut}
+      SELECT cand, em, fac, pc, fac_id, pc_id, contract_id, sku_number, initial_start_date, ${manualOut}
       FROM ranked WHERE rn = 1
     `;
     const found = await queryObjects(sql, spanKeysByString.size);
     for (const r of found) {
+      // Same identity-only shape as buildSpanKeyString — the dates were join inputs and never
+      // came back out.
       const keyString = [
         r.cand ?? "",
         r.em ?? "",
-        String(r.st ?? "").slice(0, 10),
-        String(r.ed ?? "").slice(0, 10),
-        String(r.te ?? "").slice(0, 10),
         r.fac ?? "",
         r.pc ?? "",
+        r.fac_id ?? "",
+        r.pc_id ?? "",
       ].join("|");
       bySpanKey.set(
         keyString,
@@ -3315,8 +3468,11 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
       const [cand, job] = k.split("|");
       return `STRUCT('${escapeSqlString(cand)}' AS cand, '${escapeSqlString(job)}' AS job)`;
     });
-    // ROW_NUMBER picks the earliest contract per key; CONTRACT_ID then ID break ties so repeated runs
-    // always resolve identically.
+    // ROW_NUMBER picks the LATEST contract per key; CONTRACT_ID then ID break ties so repeated runs
+    // always resolve identically. Latest, not earliest, to match the span tier above: the two tiers
+    // resolve the same candidate's rows (whichever one a given row falls to), so opposite orderings
+    // had them pick contracts from opposite ends of the candidate's history and hand two rows of one
+    // contract two different ids.
     const { cols: manualCols, select: manualSelect } = buildLegacyManualColumnSql("r");
     const manualOut = manualCols.map((c) => c.toLowerCase()).join(", ");
     const sql = `
@@ -3331,7 +3487,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
           ${manualSelect},
           ROW_NUMBER() OVER (
             PARTITION BY CAST(r.CANDIDATE_ID AS STRING), CAST(r.INTERNAL_JOB_ID AS STRING)
-            ORDER BY r.START_DATE ASC, r.CONTRACT_ID ASC, r.ID ASC
+            ORDER BY r.START_DATE DESC, r.CONTRACT_ID ASC, r.ID ASC
           ) AS rn
         FROM ${runrateFqn} r
         JOIN wanted w
@@ -3397,6 +3553,7 @@ const EXTENSION_RUNRATE_HIERARCHY_COLUMNS = [
   "SECONDARY_AM",
   "ASSOCIATE_AM",
   "ASSOCIATE_DELIVERY_DIRECTOR",
+  "DELIVERY_DIRECTOR",
   "AVP",
   "VP",
 ];
@@ -3438,6 +3595,36 @@ const EXTENSION_RUNRATE_MANUAL_COLUMNS = [
   // across the deal sheet simply never has them.
   "BACKOUT_OR_TERMINATION",
   "COMMENTS",
+  // Added Aug 2026: the remaining hand-maintained ops columns. Measured on live data — each is
+  // well populated on the run-rate side and 100% EMPTY on every deal sheet row (e.g. TYPE_OF_CLIENT
+  // 21,926/21,926 vs 0/5,053; ACC_DIR_OR_VERT_HEAD 21,896; the BGC_* and ONB_* groups 12-14k each),
+  // so without carrying them across the deal sheet simply never has them. Nexus supplies none of
+  // them. Same fill-if-empty semantics as everything above: a hand-edit on the deal sheet always
+  // wins.
+  "TYPE_OF_CLIENT",
+  "ACC_DIR_OR_VERT_HEAD",
+  "WEEKLY_WALLET_MONEY",
+  "DIVERSITY_STATUS",
+  "PO_RECEIVED",
+  "PAYLOCITY_ID",
+  // Background-check group: category/amount triplets plus the agency and rolled-up cost.
+  "BGC_CATEGORY1",
+  "BGC_AMOUNT1",
+  "BGC_CATEGORY2",
+  "BGC_AMOUNT2",
+  "BGC_CATEGORY3",
+  "BGC_AMOUNT3",
+  "BGC_TOTAL_BGV_COST",
+  "BGC_AGENCY_NAME",
+  // Onboarding document group. ONB_SUPP_DOC2_EXP_DT is sparse (4 live rows) but belongs with its
+  // sibling — splitting the pair would leave a document with no expiry.
+  "ONB_CAND_DOB",
+  "ONB_I9_RECIEVED",
+  "ONB_E_VERIFY",
+  "ONB_SUPP_DOC1",
+  "ONB_SUPP_DOC1_EXP_DT",
+  "ONB_SUPP_DOC2",
+  "ONB_SUPP_DOC2_EXP_DT",
 ];
 Object.freeze(EXTENSION_RUNRATE_MANUAL_COLUMNS);
 
@@ -3537,6 +3724,39 @@ const EXTENSION_PARENT_DEAL_INHERIT_COLUMNS = [
   "CLIENT_NAME_IN_CONREP",
   "BACKOUT_OR_TERMINATION",
   "COMMENTS",
+  // Added Aug 2026: the remaining hand-maintained ops columns. Measured on live data — each is
+  // well populated on the run-rate side and 100% EMPTY on every deal sheet row (e.g. TYPE_OF_CLIENT
+  // 21,926/21,926 vs 0/5,053; ACC_DIR_OR_VERT_HEAD 21,896; the BGC_* and ONB_* groups 12-14k each),
+  // so without carrying them across the deal sheet simply never has them. Nexus supplies none of
+  // them. Same fill-if-empty semantics as everything above: a hand-edit on the deal sheet always
+  // wins.
+  "TYPE_OF_CLIENT",
+  // ACC_DIR_OR_VERT_HEAD is NOT repeated here — it is already listed above, next to
+  // DELIVERY_POC. Listing it twice put the name twice in the `deals` CTE select list and
+  // BigQuery rejected EVERY insert batch with "Name ACC_DIR_OR_VERT_HEAD is ambiguous inside
+  // d", stalling the entire sync (TIMER_FAIL / checkpoint error_paused, Aug 18 2026).
+  "WEEKLY_WALLET_MONEY",
+  "DIVERSITY_STATUS",
+  "PO_RECEIVED",
+  "PAYLOCITY_ID",
+  // Background-check group: category/amount triplets plus the agency and rolled-up cost.
+  "BGC_CATEGORY1",
+  "BGC_AMOUNT1",
+  "BGC_CATEGORY2",
+  "BGC_AMOUNT2",
+  "BGC_CATEGORY3",
+  "BGC_AMOUNT3",
+  "BGC_TOTAL_BGV_COST",
+  "BGC_AGENCY_NAME",
+  // Onboarding document group. ONB_SUPP_DOC2_EXP_DT is sparse (4 live rows) but belongs with its
+  // sibling — splitting the pair would leave a document with no expiry.
+  "ONB_CAND_DOB",
+  "ONB_I9_RECIEVED",
+  "ONB_E_VERIFY",
+  "ONB_SUPP_DOC1",
+  "ONB_SUPP_DOC1_EXP_DT",
+  "ONB_SUPP_DOC2",
+  "ONB_SUPP_DOC2_EXP_DT",
   "SKU_NUMBER",
 ];
 Object.freeze(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS);
@@ -4052,6 +4272,11 @@ async function fetchExtensionRunrateBackfillByPlacementId(rows, options = {}) {
       const facility = escapeSqlString(
         row.FACILITY_NAME == null ? "" : String(row.FACILITY_NAME).trim()
       );
+      // Nexus client ids for the id-first tiers below; "" falls back to the name comparison.
+      const facilityId = escapeSqlString(normalizeClientIdKeyPart(row.CLIENT_ID));
+      const parentClientId = escapeSqlString(
+        normalizeClientIdKeyPart(row.NEXUS_PARENT_CLIENT_ID)
+      );
       const vmsJobId = escapeSqlString(
         row.VMS_JOB_ID == null ? "" : String(row.VMS_JOB_ID).trim()
       );
@@ -4068,7 +4293,8 @@ async function fetchExtensionRunrateBackfillByPlacementId(rows, options = {}) {
         `STRUCT(${Math.trunc(pid)} AS placement_id, ${Math.trunc(cand)} AS candidate_nexus_id, `
         + `'${email}' AS candidate_email, '${parentClient}' AS deal_parent_client, `
         + `'${facility}' AS deal_facility, ${startDateSql} AS extension_start_date, `
-        + `${tentativeDateSql} AS extension_tentative_date, '${vmsJobId}' AS deal_vms_job_id)`
+        + `${tentativeDateSql} AS extension_tentative_date, '${vmsJobId}' AS deal_vms_job_id, `
+        + `'${facilityId}' AS deal_facility_id, '${parentClientId}' AS deal_parent_client_id)`
       );
     }
 
@@ -4095,6 +4321,8 @@ async function fetchExtensionRunrateBackfillByPlacementId(rows, options = {}) {
           TRIM(CAST(VMS_JOB_ID AS STRING)) AS vms_job_id,
           PARENT_CLIENT_NAME AS runrate_parent_client,
           FACILITY_NAME AS runrate_facility,
+          CLIENT_ID AS runrate_client_id,
+          NEXUS_PARENT_CLIENT_ID AS runrate_parent_client_id,
           START_DATE AS runrate_start_date,
           TENTATIVE_END_DATE AS runrate_tentative_date,
           SKU_NUMBER AS runrate_sku,
@@ -4105,19 +4333,31 @@ ${runrateSelectHierarchy}
         WHERE START_DATE < DATE '2026-05-01'
           AND ${placementStatusPredicate}
       ),
+      -- Keyed on the parent client id where the run-rate row has one, falling back to the lowered
+      -- name otherwise, so this "candidate's first assignment at this client" fallback groups the
+      -- same way the match tiers above do. The join below builds its probe key identically.
       client_first_assignment AS (
         SELECT
           CANDIDATE_ID,
-          LOWER(TRIM(PARENT_CLIENT_NAME)) AS parent_client_key,
+          COALESCE(
+            CAST(NEXUS_PARENT_CLIENT_ID AS STRING),
+            LOWER(TRIM(PARENT_CLIENT_NAME))
+          ) AS parent_client_key,
           START_DATE AS client_original_start_date,
           NEW_HIRE_DATE AS client_new_hire_date,
           ROW_NUMBER() OVER (
-            PARTITION BY CANDIDATE_ID, LOWER(TRIM(PARENT_CLIENT_NAME))
+            PARTITION BY CANDIDATE_ID, COALESCE(
+              CAST(NEXUS_PARENT_CLIENT_ID AS STRING),
+              LOWER(TRIM(PARENT_CLIENT_NAME))
+            )
             ORDER BY START_DATE ASC, PLACEMENT_ID ASC, ID
           ) AS rn
         FROM ${runrateFqn}
         WHERE CANDIDATE_ID IS NOT NULL
-          AND TRIM(IFNULL(PARENT_CLIENT_NAME, '')) != ''
+          AND (
+            NEXUS_PARENT_CLIENT_ID IS NOT NULL
+            OR TRIM(IFNULL(PARENT_CLIENT_NAME, '')) != ''
+          )
           AND START_DATE IS NOT NULL
           AND ${placementStatusPredicate}
       ),
@@ -4139,6 +4379,19 @@ ${runrateSelectHierarchy}
             WHEN e.candidate_nexus_id = r.nexus_id
              AND e.extension_tentative_date = r.runrate_tentative_date
               THEN 'EXACT_NEXUS_TENTATIVE'
+            -- Id-based client tiers come FIRST: CLIENT_ID / NEXUS_PARENT_CLIENT_ID are exact where
+            -- the names are not (the same facility is spelled differently across the two tables).
+            -- Each id tier is immediately followed by its name-based twin, so a row whose ids are
+            -- missing on either side still resolves exactly as it did before.
+            WHEN e.candidate_nexus_id = r.nexus_id
+             AND NULLIF(e.deal_parent_client_id, '') IS NOT NULL
+             AND r.runrate_parent_client_id IS NOT NULL
+             AND CAST(r.runrate_parent_client_id AS STRING) = e.deal_parent_client_id
+             AND NULLIF(e.deal_facility_id, '') IS NOT NULL
+             AND r.runrate_client_id IS NOT NULL
+             AND CAST(r.runrate_client_id AS STRING) = e.deal_facility_id
+             AND (e.extension_start_date IS NULL OR r.runrate_start_date < e.extension_start_date)
+              THEN 'NEXUS_PARENT_FACILITY_ID'
             WHEN e.candidate_nexus_id = r.nexus_id
              AND LOWER(IFNULL(e.deal_parent_client, '')) = LOWER(IFNULL(r.runrate_parent_client, ''))
              AND (
@@ -4148,6 +4401,12 @@ ${runrateSelectHierarchy}
              )
              AND (e.extension_start_date IS NULL OR r.runrate_start_date < e.extension_start_date)
               THEN 'NEXUS_PARENT_FACILITY'
+            WHEN e.candidate_nexus_id = r.nexus_id
+             AND NULLIF(e.deal_parent_client_id, '') IS NOT NULL
+             AND r.runrate_parent_client_id IS NOT NULL
+             AND CAST(r.runrate_parent_client_id AS STRING) = e.deal_parent_client_id
+             AND (e.extension_start_date IS NULL OR r.runrate_start_date < e.extension_start_date)
+              THEN 'NEXUS_PARENT_CLIENT_ID'
             WHEN e.candidate_nexus_id = r.nexus_id
              AND LOWER(IFNULL(e.deal_parent_client, '')) = LOWER(IFNULL(r.runrate_parent_client, ''))
              AND (e.extension_start_date IS NULL OR r.runrate_start_date < e.extension_start_date)
@@ -4177,10 +4436,12 @@ ${runrateSelectHierarchy}
           j.*,
           CASE j.match_method
             WHEN 'EXACT_NEXUS_TENTATIVE' THEN 1
-            WHEN 'NEXUS_PARENT_FACILITY' THEN 2
-            WHEN 'NEXUS_PARENT_CLIENT' THEN 3
-            WHEN 'EMAIL_VMS_JOB_ID' THEN 4
-            WHEN 'NEXUS_LATEST_BEFORE_EXT' THEN 5
+            WHEN 'NEXUS_PARENT_FACILITY_ID' THEN 2
+            WHEN 'NEXUS_PARENT_FACILITY' THEN 3
+            WHEN 'NEXUS_PARENT_CLIENT_ID' THEN 4
+            WHEN 'NEXUS_PARENT_CLIENT' THEN 5
+            WHEN 'EMAIL_VMS_JOB_ID' THEN 6
+            WHEN 'NEXUS_LATEST_BEFORE_EXT' THEN 7
             ELSE 99
           END AS match_priority,
           ROW_NUMBER() OVER (
@@ -4188,10 +4449,12 @@ ${runrateSelectHierarchy}
             ORDER BY
               CASE j.match_method
                 WHEN 'EXACT_NEXUS_TENTATIVE' THEN 1
-                WHEN 'NEXUS_PARENT_FACILITY' THEN 2
-                WHEN 'NEXUS_PARENT_CLIENT' THEN 3
-                WHEN 'EMAIL_VMS_JOB_ID' THEN 4
-                WHEN 'NEXUS_LATEST_BEFORE_EXT' THEN 5
+                WHEN 'NEXUS_PARENT_FACILITY_ID' THEN 2
+                WHEN 'NEXUS_PARENT_FACILITY' THEN 3
+                WHEN 'NEXUS_PARENT_CLIENT_ID' THEN 4
+                WHEN 'NEXUS_PARENT_CLIENT' THEN 5
+                WHEN 'EMAIL_VMS_JOB_ID' THEN 6
+                WHEN 'NEXUS_LATEST_BEFORE_EXT' THEN 7
                 ELSE 99
               END,
               j.runrate_start_date DESC NULLS LAST,
@@ -4222,7 +4485,10 @@ ${bestMatchHierarchySelect}
       JOIN best_match b ON e.placement_id = b.placement_id
       LEFT JOIN client_first_assignment c
         ON e.candidate_nexus_id = c.CANDIDATE_ID
-       AND LOWER(TRIM(IFNULL(e.deal_parent_client, ''))) = c.parent_client_key
+       AND COALESCE(
+             NULLIF(e.deal_parent_client_id, ''),
+             LOWER(TRIM(IFNULL(e.deal_parent_client, '')))
+           ) = c.parent_client_key
        AND c.rn = 1
       LEFT JOIN sku_first_assignment s
         ON NULLIF(TRIM(b.runrate_sku), '') = s.sku_key
@@ -4414,6 +4680,7 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
   let priorExtensionBackfilledCount = 0;
   let runrateBackfilledCount = 0;
   let skuClearedCount = 0;
+  let selfReferenceVacatedCount = 0;
 
   const out = rows.map((row) => {
     const key = String(row.PLACEMENT_ID).trim();
@@ -4478,6 +4745,24 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
       }
     }
 
+    // One person cannot hold two roles on one placement. Applied after all three inherit tiers for
+    // the same reason the SKU clearing above is: any of them can introduce the collision.
+    //
+    // How it happens: the recruiter gets promoted into the slot that used to be their own manager's.
+    // The parent DEAL rows still record the pre-promotion truth, and hierarchy is OVERWRITTEN from
+    // the parent (not fill-if-empty), so the extension inherits the recruiter's own name into a
+    // manager column — live example (CANDIDATE_ID 30947933, Aug 2026): Srijana Chhetri was ATL over
+    // recruiter Yuvraj Gupta on placements 1445680 / 1452652, then took over as recruiter on
+    // extension 1465994 and inherited ATL='Srijana Chhetri' from those parents, becoming her own ATL.
+    // Run-rate and the prior extension both carried the correct 'NA' but are fill-if-empty, so
+    // neither could correct it.
+    const vacated = vacateSelfReferencedHierarchyRoles(current);
+    if (vacated.changed) {
+      current = vacated.row;
+      rowChanged = true;
+      selfReferenceVacatedCount += vacated.vacatedColumns.length;
+    }
+
     return rowChanged ? current : row;
   });
 
@@ -4501,6 +4786,11 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
       `[enriched sync] [BigQuery insertAll] EXTENSION SKU_NUMBER cleared on DID NOT START / DID NOT ACCEPT: ${skuClearedCount}`
     );
   }
+  if (selfReferenceVacatedCount > 0) {
+    logDetail(
+      `[enriched sync] [BigQuery insertAll] EXTENSION hierarchy roles vacated to NA (held by the row's own recruiter): ${selfReferenceVacatedCount}`
+    );
+  }
 
   return out;
 }
@@ -4514,6 +4804,76 @@ async function applyExtensionRunrateBackfillForInsertRows(rows, options = {}, de
 const DEAL_RECRUITER_HIERARCHY_FIELDS = DEAL_RECRUITER_HIERARCHY_TARGETS.flatMap(
   ({ column, empNoColumn }) => [column, empNoColumn]
 );
+
+/** The placeholder the business uses for a hierarchy role nobody holds. */
+const HIERARCHY_ROLE_VACANT = "NA";
+
+/**
+ * Recruiter name as a comparison key. The deal sheet stores ASSIGNMENT_RECRUITER with a cluster-code
+ * suffix ("Srijana Chhetri (R1N)") while the manager columns hold the bare name ("Srijana Chhetri"),
+ * so the suffix has to come off before the two can be compared.
+ */
+function normalizeHierarchyPersonName(value) {
+  if (value == null) return "";
+  return String(value)
+    .replace(/\s*\([^)]*\)\s*$/, "")
+    .trim()
+    .toLowerCase();
+}
+
+/** Emp-no as a comparison key; "" when absent. */
+function normalizeHierarchyEmpNo(value) {
+  if (value == null) return "";
+  return String(value).trim().toUpperCase();
+}
+
+/**
+ * Set to NA any hierarchy role held by the row's own ASSIGNMENT_RECRUITER.
+ *
+ * A placement's recruiter cannot also be their own manager: one person, one role per placement. When
+ * a recruiter is promoted into the slot their manager used to hold, inherited hierarchy can put their
+ * name in both places (see the caller for the live case). The role is vacated to NA — the same
+ * placeholder the business uses elsewhere — rather than nulled, so it reads as "nobody holds this"
+ * instead of "not yet resolved", and the emp-no companion is cleared with it.
+ *
+ * Matching prefers RECRUITER_EMP_NO over the name: emp numbers are exact, whereas the name columns
+ * differ in formatting (see normalizeHierarchyPersonName). ASSIGNMENT_RECRUITER itself is never
+ * touched — the Nexus assignment is the authority on who the recruiter is.
+ *
+ * @returns {{row: object, changed: boolean, vacatedColumns: string[]}}
+ */
+function vacateSelfReferencedHierarchyRoles(row) {
+  const vacatedColumns = [];
+  if (!row || typeof row !== "object") return { row, changed: false, vacatedColumns };
+
+  const recruiterEmpNo = normalizeHierarchyEmpNo(row.RECRUITER_EMP_NO);
+  const recruiterName = normalizeHierarchyPersonName(row.ASSIGNMENT_RECRUITER);
+  if (recruiterEmpNo === "" && recruiterName === "") {
+    return { row, changed: false, vacatedColumns };
+  }
+
+  let next = row;
+  for (const { column, empNoColumn } of DEAL_RECRUITER_HIERARCHY_TARGETS) {
+    const heldName = normalizeHierarchyPersonName(next[column]);
+    if (heldName === "" || heldName === HIERARCHY_ROLE_VACANT.toLowerCase()) continue;
+
+    const heldEmpNo = normalizeHierarchyEmpNo(next[empNoColumn]);
+    // Emp-no is the reliable signal; fall back to the name only when one side has no emp-no, so two
+    // different people who share a name are not merged on the strength of the name alone.
+    const isSelf =
+      recruiterEmpNo !== "" && heldEmpNo !== ""
+        ? heldEmpNo === recruiterEmpNo
+        : recruiterName !== "" && heldName === recruiterName;
+    if (!isSelf) continue;
+
+    if (next === row) next = { ...row };
+    next[column] = HIERARCHY_ROLE_VACANT;
+    next[empNoColumn] = null;
+    vacatedColumns.push(column);
+  }
+
+  return { row: next, changed: vacatedColumns.length > 0, vacatedColumns };
+}
 
 /**
  * True for brand-new DEAL rows eligible for insert-time recruiter-hierarchy backfill from the
@@ -4781,429 +5141,6 @@ async function fetchDealRecruiterHierarchyByPlacementId(rows, options = {}, deps
  * hierarchy columns were already carried forward from a baseline (an update-append, not a
  * first insert) is left untouched, and a manual BigQuery edit is never overwritten.
  */
-/**
- * Fill PREVIOUS_RECRUITER_* from the enrichment temp fields (__PREV_RECRUITER_*) when the row's
- * PREVIOUS_RECRUITER is currently empty. Runs AFTER manual-column carry-forward (which would have
- * overwritten the enriched value with the baseline's) and BEFORE the DEAL hierarchy fetch (which
- * reads PREVIOUS_RECRUITER_EMAIL to source the chain). Freeze-once-set: a row that already carries a
- * previous recruiter from baseline is left untouched.
- */
-function applyPreviousRecruiterFillForInsertRows(rows) {
-  if (!rows || rows.length === 0) return rows;
-  return rows.map((row) => {
-    if (!row || typeof row !== "object") return row;
-    const tempEmail = row.__PREV_RECRUITER_EMAIL;
-    if (tempEmail == null || String(tempEmail).trim() === "") return row;
-    if (!isEmptyDateFieldValue(row.PREVIOUS_RECRUITER_EMAIL)) return row;
-    return {
-      ...row,
-      PREVIOUS_RECRUITER_NAME: row.__PREV_RECRUITER_NAME ?? null,
-      PREVIOUS_RECRUITER_EMAIL: tempEmail,
-      PREVIOUS_RECRUITER_EMP_NO: row.__PREV_RECRUITER_EMP_NO ?? null,
-      // Handover = a recruiter change; stamp OWNERSHIP_EFFECTIVE_DATE = TENTATIVE_END_DATE + 1 (only when empty),
-      // same as the across-append recruiter change and the ownership log.
-      OWNERSHIP_EFFECTIVE_DATE: isEmptyDateFieldValue(row.OWNERSHIP_EFFECTIVE_DATE)
-        ? addOneDayToDateOnly(row.TENTATIVE_END_DATE)
-        : row.OWNERSHIP_EFFECTIVE_DATE,
-    };
-  });
-}
-
-/** Legacy manual ownership tracker (recruiter/AM handovers logged before this sync existed). */
-const LEGACY_OWNERSHIP_DATASET =
-  process.env.LEGACY_OWNERSHIP_DATASET && process.env.LEGACY_OWNERSHIP_DATASET.trim() !== ""
-    ? process.env.LEGACY_OWNERSHIP_DATASET.trim()
-    : "Cluster_Data";
-const LEGACY_OWNERSHIP_TABLE =
-  process.env.LEGACY_OWNERSHIP_TABLE && process.env.LEGACY_OWNERSHIP_TABLE.trim() !== ""
-    ? process.env.LEGACY_OWNERSHIP_TABLE.trim()
-    : "ownership_data";
-
-/** EXTENSION row with no PREVIOUS_RECRUITER yet and a SKU to match against the legacy tracker. */
-function rowNeedsExtensionLegacyPreviousRecruiter(row) {
-  if (!row || typeof row !== "object") return false;
-  if (normalizeDealTypeKey(row.DEAL_TYPE) !== "EXTENSION") return false;
-  // Freeze-once-set: only fill when PREVIOUS_RECRUITER is currently empty (name + email both blank).
-  if (!isEmptyDateFieldValue(row.PREVIOUS_RECRUITER_NAME)) return false;
-  if (!isEmptyDateFieldValue(row.PREVIOUS_RECRUITER_EMAIL)) return false;
-  if (row.SKU_NUMBER == null || String(row.SKU_NUMBER).trim() === "") return false;
-  return true;
-}
-
-/**
- * Read a BigQuery cell as a trimmed string. Handles `{ value }`, Date, and casing-insensitive
- * field names (BQ clients sometimes return SKU vs sku).
- */
-function bqCellString(row, ...fieldNames) {
-  if (!row || typeof row !== "object") return "";
-  let raw;
-  for (const name of fieldNames) {
-    if (name == null) continue;
-    if (Object.prototype.hasOwnProperty.call(row, name) && row[name] != null) {
-      raw = row[name];
-      break;
-    }
-    const want = String(name).toLowerCase();
-    const hit = Object.keys(row).find((k) => k.toLowerCase() === want);
-    if (hit != null && row[hit] != null) {
-      raw = row[hit];
-      break;
-    }
-  }
-  if (raw == null) return "";
-  if (typeof raw === "object") {
-    if (raw.value != null) return String(raw.value).trim();
-    if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
-      return raw.toISOString().slice(0, 10);
-    }
-    return "";
-  }
-  return String(raw).trim();
-}
-
-/** Normalize emp codes for comparison (trim + upper). */
-function normalizeEmpCodeKey(value) {
-  if (value == null) return "";
-  return String(value).trim().toUpperCase();
-}
-
-/** Coerce OWNERSHIP_EFFECTIVE_DATE-ish values to YYYY-MM-DD for sorting (falls back to raw string). */
-function normalizeOwnershipEffectiveDateForSort(value) {
-  const s = bqCellString({ v: value }, "v");
-  if (!s) return "";
-  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
-  const ms = Date.parse(s);
-  if (Number.isFinite(ms)) return new Date(ms).toISOString().slice(0, 10);
-  return s;
-}
-
-/**
- * Pick previous recruiter from ownership_data Recruiter entries for one SKU.
- * Prefer the change that installed the current recruiter (NEW_EMP = currentEmp, case-insensitive),
- * including future OWNERSHIP_EFFECTIVE_DATE rows; else latest OWNERSHIP_EFFECTIVE_DATE.
- * Accepts camelCase ({newEmp,oldEmp,oldName,eff}) or snake_case ({new_emp,old_emp,old_name,eff}).
- * @param {Array<object>} entries
- * @param {string|null|undefined} currentEmpNo
- * @returns {{name: string|null, emp: string}|null}
- */
-function chooseLegacyPreviousRecruiter(entries, currentEmpNo) {
-  if (!entries || entries.length === 0) return null;
-  const readEmp = (e) => e?.oldEmp ?? e?.old_emp ?? "";
-  const readNew = (e) => e?.newEmp ?? e?.new_emp ?? "";
-  const readName = (e) => e?.oldName ?? e?.old_name ?? null;
-  const readEff = (e) => e?.eff ?? e?.effective_date ?? e?.OWNERSHIP_EFFECTIVE_DATE ?? "";
-  const isValidOld = (e) => {
-    const emp = normalizeEmpCodeKey(readEmp(e));
-    return emp !== "" && emp !== "NA";
-  };
-  const list = entries.filter(isValidOld).map((e) => {
-    const oldNameRaw = readName(e);
-    return {
-      newEmp: normalizeEmpCodeKey(readNew(e)),
-      oldName:
-        oldNameRaw == null || String(oldNameRaw).trim() === "" ? null : String(oldNameRaw).trim(),
-      oldEmp: String(readEmp(e)).trim(),
-      eff: normalizeOwnershipEffectiveDateForSort(readEff(e)),
-    };
-  });
-  if (list.length === 0) return null;
-  const curEmp = normalizeEmpCodeKey(currentEmpNo);
-  const matches = curEmp ? list.filter((e) => e.newEmp && e.newEmp === curEmp) : [];
-  const pool = matches.length > 0 ? matches : list;
-  pool.sort((a, b) => (a.eff < b.eff ? 1 : a.eff > b.eff ? -1 : 0));
-  const chosen = pool[0];
-  if (!chosen) return null;
-  return { name: chosen.oldName, emp: chosen.oldEmp };
-}
-
-/**
- * Fetch Recruiter ownership changes from Cluster_Data.ownership_data keyed by SKU.
- * @returns {Promise<Map<string, Array<{newEmp, oldName, oldEmp, eff}>>>}
- */
-async function fetchLegacyOwnershipRecruiterEntriesBySku(skuList, deps = {}) {
-  const bySku = new Map();
-  if (!skuList || skuList.length === 0) return bySku;
-  const queryFn = deps.queryObjectsFn ?? queryObjects;
-  const fqn = `\`${config.projectId}.${LEGACY_OWNERSHIP_DATASET}.${LEGACY_OWNERSHIP_TABLE}\``;
-
-  for (let i = 0; i < skuList.length; i += 500) {
-    const chunk = skuList.slice(i, i + 500);
-    const inList = chunk.map((v) => `'${escapeSqlString(v)}'`).join(", ");
-    const sql = `
-      SELECT
-        TRIM(CAST(SKU_NO AS STRING)) AS sku,
-        TRIM(CAST(NEW_EMP_CODE AS STRING)) AS new_emp,
-        OLD_ONE AS old_name,
-        TRIM(CAST(OLD_EMP_CODE AS STRING)) AS old_emp,
-        -- The legacy tracker calls it EFFECTIVE_DATE; only the deal sheet uses the
-        -- OWNERSHIP_EFFECTIVE_DATE spelling.
-        CAST(EFFECTIVE_DATE AS STRING) AS eff
-      FROM ${fqn}
-      WHERE UPPER(TRIM(CAST(OWNERSHIP_UPDATE AS STRING))) = 'RECRUITER'
-        AND TRIM(CAST(SKU_NO AS STRING)) IN (${inList})`;
-    const maxResults = Math.max(500, chunk.length * 50);
-    const bqRows = await queryFn(sql, maxResults);
-    for (const r of bqRows || []) {
-      const sku = bqCellString(r, "sku", "SKU", "SKU_NO");
-      if (!sku) continue;
-      if (!bySku.has(sku)) bySku.set(sku, []);
-      bySku.get(sku).push({
-        newEmp: bqCellString(r, "new_emp", "NEW_EMP", "NEW_EMP_CODE"),
-        oldName: normalizeExtensionRunrateBackfillValue(bqCellString(r, "old_name", "OLD_ONE", "OLD_NAME") || null),
-        oldEmp: bqCellString(r, "old_emp", "OLD_EMP", "OLD_EMP_CODE"),
-        eff: bqCellString(r, "eff", "EFFECTIVE_DATE"),
-      });
-    }
-  }
-  return bySku;
-}
-
-/**
- * Backfill PREVIOUS_RECRUITER for EXTENSION rows from the legacy manual ownership tracker
- * (Cluster_Data.ownership_data), matched by SKU_NUMBER + OWNERSHIP_UPDATE='Recruiter'. Prefer the
- * change whose NEW_EMP_CODE equals the row's current RECRUITER_EMP_NO (incl. future OWNERSHIP_EFFECTIVE_DATE);
- * fall back to latest OWNERSHIP_EFFECTIVE_DATE. Email resolved from directory. Freeze-once-set.
- */
-async function applyExtensionLegacyPreviousRecruiterForInsertRows(rows, deps = {}) {
-  if (!rows || rows.length === 0) return rows;
-  const eligible = rows.filter(rowNeedsExtensionLegacyPreviousRecruiter);
-  if (eligible.length === 0) return rows;
-
-  const skuList = [...new Set(eligible.map((r) => String(r.SKU_NUMBER).trim()).filter(Boolean))];
-  if (skuList.length === 0) return rows;
-
-  const emailFetchFn = deps.emailFetchFn ?? fetchDeliveryPocEmails;
-
-  let bySku;
-  try {
-    bySku = await fetchLegacyOwnershipRecruiterEntriesBySku(skuList, deps);
-  } catch (err) {
-    logLine(
-      `[enriched sync] extension legacy previous-recruiter ownership query FAILED (non-fatal): ${String(err?.message || err).slice(0, 240)}`
-    );
-    return rows;
-  }
-
-  let ownershipRowCount = 0;
-  for (const list of bySku.values()) ownershipRowCount += list.length;
-  if (bySku.size === 0) {
-    logLine(
-      `[enriched sync] extension legacy previous-recruiter: eligible=${eligible.length} skus=${skuList.length} ownershipRows=0 filled=0 (no Cluster_Data.ownership_data match)`
-    );
-    return rows;
-  }
-
-  const chosenByRow = new Map();
-  const oldEmps = new Set();
-  const oldNames = new Set();
-  const unmatchedSkus = new Set();
-  for (const row of eligible) {
-    const sku = String(row.SKU_NUMBER).trim();
-    const chosen = chooseLegacyPreviousRecruiter(bySku.get(sku) || [], row.RECRUITER_EMP_NO);
-    if (!chosen) {
-      unmatchedSkus.add(sku);
-      continue;
-    }
-    chosenByRow.set(row, chosen);
-    if (chosen.emp) oldEmps.add(chosen.emp);
-    if (chosen.name) oldNames.add(chosen.name);
-  }
-  if (chosenByRow.size === 0) {
-    logLine(
-      `[enriched sync] extension legacy previous-recruiter: eligible=${eligible.length} skus=${skuList.length} ownershipRows=${ownershipRowCount} filled=0 unmatchedSkus=${[...unmatchedSkus].slice(0, 20).join(",")}`
-    );
-    return rows;
-  }
-
-  let byEmp = new Map();
-  let byName = new Map();
-  try {
-    const emails = await emailFetchFn([...oldEmps], [...oldNames]);
-    byEmp = emails?.byEmp instanceof Map ? emails.byEmp : new Map();
-    byName = emails?.byName instanceof Map ? emails.byName : new Map();
-  } catch (err) {
-    logLine(
-      `[enriched sync] extension legacy previous-recruiter email resolve FAILED (non-fatal, filling name/emp without email): ${String(err?.message || err).slice(0, 240)}`
-    );
-  }
-
-  let filled = 0;
-  const out = rows.map((row) => {
-    const chosen = chosenByRow.get(row);
-    if (!chosen) return row;
-    const email =
-      (chosen.emp && byEmp.get(chosen.emp)) ||
-      (chosen.emp && byEmp.get(normalizeEmpCodeKey(chosen.emp))) ||
-      (chosen.name && byName.get(String(chosen.name).trim().toLowerCase())) ||
-      null;
-    filled++;
-    return {
-      ...row,
-      PREVIOUS_RECRUITER_NAME: chosen.name ?? null,
-      PREVIOUS_RECRUITER_EMP_NO: chosen.emp || null,
-      PREVIOUS_RECRUITER_EMAIL: email,
-    };
-  });
-  logLine(
-    `[enriched sync] extension legacy previous-recruiter: eligible=${eligible.length} skus=${skuList.length} ownershipRows=${ownershipRowCount} filled=${filled} unmatchedSkus=${unmatchedSkus.size ? [...unmatchedSkus].slice(0, 20).join(",") : "none"}`
-  );
-  return out;
-}
-
-/**
- * Backfill PREVIOUS_RECRUITER on existing active EXTENSION latest rows where it is still empty,
- * using Cluster_Data.ownership_data (same chooser as insert path).
- * @param {object} [options] - { datasetId }
- * @param {object} [deps]
- * @returns {Promise<{updated:number, candidates:number}>}
- */
-async function backfillExtensionLegacyPreviousRecruiterForActive(options = {}, deps = {}) {
-  const datasetId =
-    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
-      ? options.datasetId.trim()
-      : config.datasetId;
-  const emailFetchFn = deps.emailFetchFn ?? fetchDeliveryPocEmails;
-  const queryFn = deps.queryObjectsFn ?? queryObjects;
-
-  const candidates = [];
-  for (const tableId of ACTIVE_DEAL_SHEET_TABLE_IDS) {
-    const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
-    const sql = `
-      SELECT
-        ID,
-        CAST(DEAL_SHEET_ID AS STRING) AS deal_sheet_id,
-        CAST(SKU_NUMBER AS STRING) AS sku_number,
-        CAST(RECRUITER_EMP_NO AS STRING) AS recruiter_emp_no
-      FROM (
-        SELECT
-          ID,
-          DEAL_SHEET_ID,
-          SKU_NUMBER,
-          RECRUITER_EMP_NO,
-          PREVIOUS_RECRUITER_NAME,
-          PREVIOUS_RECRUITER_EMAIL,
-          DEAL_TYPE,
-          ROW_NUMBER() OVER (
-            PARTITION BY CAST(DEAL_SHEET_ID AS STRING)
-            ORDER BY LAST_UPDATED DESC NULLS LAST
-          ) AS _rn
-        FROM ${fqn}
-        WHERE DEAL_SHEET_ID IS NOT NULL
-          AND UPPER(TRIM(CAST(DEAL_TYPE AS STRING))) = 'EXTENSION'
-      )
-      WHERE _rn = 1
-        AND (PREVIOUS_RECRUITER_NAME IS NULL OR TRIM(CAST(PREVIOUS_RECRUITER_NAME AS STRING)) = '')
-        AND (PREVIOUS_RECRUITER_EMAIL IS NULL OR TRIM(CAST(PREVIOUS_RECRUITER_EMAIL AS STRING)) = '')
-        AND SKU_NUMBER IS NOT NULL AND TRIM(CAST(SKU_NUMBER AS STRING)) != ''
-    `;
-    const rows = await queryFn(sql, 500000);
-    for (const r of rows || []) {
-      const id = r?.ID == null ? (r?.id == null ? "" : String(r.id).trim()) : String(r.ID).trim();
-      const sku = bqCellString(r, "sku_number", "SKU_NUMBER");
-      if (!id || !sku) continue;
-      candidates.push({
-        tableId,
-        id,
-        sku,
-        recruiterEmpNo: bqCellString(r, "recruiter_emp_no", "RECRUITER_EMP_NO"),
-      });
-    }
-  }
-
-  if (candidates.length === 0) {
-    logLine(`[deal sheet] extension legacy previous-recruiter backfill: candidates=0 updated=0`);
-    return { updated: 0, candidates: 0 };
-  }
-
-  const skuList = [...new Set(candidates.map((c) => c.sku))];
-  let bySku;
-  try {
-    bySku = await fetchLegacyOwnershipRecruiterEntriesBySku(skuList, deps);
-  } catch (err) {
-    logLine(
-      `[deal sheet] extension legacy previous-recruiter backfill ownership query FAILED: ${String(err?.message || err).slice(0, 240)}`
-    );
-    return { updated: 0, candidates: candidates.length };
-  }
-
-  const updates = [];
-  const oldEmps = new Set();
-  const oldNames = new Set();
-  for (const c of candidates) {
-    const chosen = chooseLegacyPreviousRecruiter(bySku.get(c.sku) || [], c.recruiterEmpNo);
-    if (!chosen) continue;
-    updates.push({ ...c, chosen });
-    if (chosen.emp) oldEmps.add(chosen.emp);
-    if (chosen.name) oldNames.add(chosen.name);
-  }
-  if (updates.length === 0) {
-    logLine(
-      `[deal sheet] extension legacy previous-recruiter backfill: candidates=${candidates.length} updated=0 (no ownership match)`
-    );
-    return { updated: 0, candidates: candidates.length };
-  }
-
-  let byEmp = new Map();
-  let byName = new Map();
-  try {
-    const emails = await emailFetchFn([...oldEmps], [...oldNames]);
-    byEmp = emails?.byEmp instanceof Map ? emails.byEmp : new Map();
-    byName = emails?.byName instanceof Map ? emails.byName : new Map();
-  } catch (err) {
-    logLine(
-      `[deal sheet] extension legacy previous-recruiter backfill email resolve FAILED (continuing without email): ${String(err?.message || err).slice(0, 240)}`
-    );
-  }
-
-  let totalUpdated = 0;
-  const byTable = new Map();
-  for (const u of updates) {
-    if (!byTable.has(u.tableId)) byTable.set(u.tableId, []);
-    byTable.get(u.tableId).push(u);
-  }
-
-  for (const [tableId, list] of byTable) {
-    const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
-    const chunkSize = 200;
-    for (let i = 0; i < list.length; i += chunkSize) {
-      const chunk = list.slice(i, i + chunkSize);
-      const structs = chunk
-        .map((u) => {
-          const email =
-            (u.chosen.emp && byEmp.get(u.chosen.emp)) ||
-            (u.chosen.emp && byEmp.get(normalizeEmpCodeKey(u.chosen.emp))) ||
-            (u.chosen.name && byName.get(String(u.chosen.name).trim().toLowerCase())) ||
-            null;
-          const nameLit =
-            u.chosen.name == null ? "CAST(NULL AS STRING)" : `'${escapeSqlString(u.chosen.name)}'`;
-          const empLit = `'${escapeSqlString(u.chosen.emp)}'`;
-          const emailLit = email == null ? "CAST(NULL AS STRING)" : `'${escapeSqlString(email)}'`;
-          return `STRUCT('${escapeSqlString(u.id)}' AS id, ${nameLit} AS prev_name, ${empLit} AS prev_emp, ${emailLit} AS prev_email)`;
-        })
-        .join(",\n          ");
-      const sql = `
-        UPDATE ${fqn} AS t
-        SET
-          PREVIOUS_RECRUITER_NAME = s.prev_name,
-          PREVIOUS_RECRUITER_EMP_NO = s.prev_emp,
-          PREVIOUS_RECRUITER_EMAIL = s.prev_email
-        FROM UNNEST([${structs}]) AS s
-        WHERE CAST(t.ID AS STRING) = s.id
-          AND (t.PREVIOUS_RECRUITER_NAME IS NULL OR TRIM(CAST(t.PREVIOUS_RECRUITER_NAME AS STRING)) = '')
-          AND (t.PREVIOUS_RECRUITER_EMAIL IS NULL OR TRIM(CAST(t.PREVIOUS_RECRUITER_EMAIL AS STRING)) = '')
-      `;
-      const [job] = await bigquery.createQueryJob({ query: sql });
-      await job.getQueryResults();
-      totalUpdated += Number(job.metadata?.statistics?.query?.dmlStats?.updatedRowCount ?? 0);
-    }
-  }
-
-  logLine(
-    `[deal sheet] extension legacy previous-recruiter backfill: candidates=${candidates.length} matched=${updates.length} updated=${totalUpdated}`
-  );
-  return { updated: totalUpdated, candidates: candidates.length };
-}
-
 async function applyDealRecruiterHierarchyForInsertRows(rows, options = {}, deps = {}) {
   if (!rows || rows.length === 0) return rows;
 
@@ -5215,6 +5152,7 @@ async function applyDealRecruiterHierarchyForInsertRows(rows, options = {}, deps
 
   const eligibleSet = new Set(eligible.map((row) => String(row.PLACEMENT_ID).trim()));
   let backfilledCount = 0;
+  let selfReferenceVacatedCount = 0;
 
   const out = rows.map((row) => {
     const key = String(row.PLACEMENT_ID).trim();
@@ -5226,12 +5164,24 @@ async function applyDealRecruiterHierarchyForInsertRows(rows, options = {}, deps
       DEAL_RECRUITER_HIERARCHY_FIELDS
     );
     if (merged.changed) backfilledCount++;
-    return merged.row;
+
+    // Same one-person-one-role rule the EXTENSION path applies. The directory snapshot is anchored on
+    // NEW_HIRE_DATE, so a recruiter promoted since then can still be listed as their own manager in
+    // it; that has to be vacated here rather than stored.
+    const vacated = vacateSelfReferencedHierarchyRoles(merged.row);
+    if (!vacated.changed) return merged.row;
+    selfReferenceVacatedCount += vacated.vacatedColumns.length;
+    return vacated.row;
   });
 
   if (hierarchyByPlacementId.size > 0) {
     logDetail(
       `[enriched sync] [BigQuery insertAll] DEAL recruiter-hierarchy backfill: eligible=${eligible.length} matched=${hierarchyByPlacementId.size} backfilled=${backfilledCount}`
+    );
+  }
+  if (selfReferenceVacatedCount > 0) {
+    logDetail(
+      `[enriched sync] [BigQuery insertAll] DEAL hierarchy roles vacated to NA (held by the row's own recruiter): ${selfReferenceVacatedCount}`
     );
   }
 
@@ -7120,53 +7070,24 @@ function buildContractOwnershipChangeLogRows(latestRow, previousRow) {
 }
 
 /**
- * Recruiter-handover ownership logs (single row, not a latest-vs-previous pair): on a DEAL_TYPE=DEAL
- * whose PREVIOUS_RECRUITER_EMAIL (the job-submittal recruiter) differs from ASSIGNMENT_RECRUITER_EMAIL
- * (the deal-sheet recruiter), build:
+ * Build the recruiter-handover ownership log rows for an explicit set of deal rows (each a
+ * DEAL_TYPE=DEAL carrying the in-memory __PREV_RECRUITER_EMAIL captured by
+ * applyPreviousRecruiterOnRecruiterChange, differing from ASSIGNMENT_RECRUITER_EMAIL). Builds:
  *   (1) OWNERSHIP_ROLE=RECRUITER — PREVIOUS_OWNER = previous recruiter, NEW_OWNER = current recruiter.
  *   (2) the vacated hierarchy role — if the CURRENT recruiter used to sit in the PREVIOUS recruiter's
  *       manager chain (matched by emp-no), PREVIOUS_OWNER = current recruiter, NEW_OWNER = 'NA'.
  * OWNERSHIP_EFFECTIVE_DATE / END_DATE_PREVIOUS_OWNER come from buildOwnershipChangeLogContext (tentative+1 /
  * tentative), so the extension effective-date overwrite applies here identically.
- */
-async function fetchRecruiterHandoverOwnershipLogRows(options = {}, deps = {}) {
-  const datasetId =
-    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
-      ? options.datasetId.trim()
-      : config.datasetId;
-
-  const unionParts = buildActiveChangeScanUnionParts(datasetId);
-  const sql = `WITH all_rows AS (
-                 ${unionParts.join("\n                 UNION ALL\n                 ")}
-               )
-               SELECT * EXCEPT(rn) FROM (
-                 SELECT *, ROW_NUMBER() OVER (
-                   PARTITION BY CAST(DEAL_SHEET_ID AS STRING), CAST(PLACEMENT_ID AS STRING)
-                   ORDER BY LAST_UPDATED DESC NULLS LAST
-                 ) AS rn
-                 FROM all_rows
-               )
-               WHERE rn = 1
-                 AND UPPER(TRIM(IFNULL(DEAL_TYPE, ''))) = 'DEAL'
-                 AND TRIM(IFNULL(PREVIOUS_RECRUITER_EMAIL, '')) != ''
-                 AND LOWER(TRIM(IFNULL(PREVIOUS_RECRUITER_EMAIL, ''))) != LOWER(TRIM(IFNULL(ASSIGNMENT_RECRUITER_EMAIL, '')))`;
-
-  const rows = await queryObjects(sql, 100000);
-  logDetail(`[ownership handover] latest DEAL rows with a previous recruiter=${rows.length}`);
-  return buildRecruiterHandoverOwnershipLogRows(rows, deps);
-}
-
-/**
- * Build the recruiter-handover ownership log rows for an explicit set of deal rows (each a
- * DEAL_TYPE=DEAL with PREVIOUS_RECRUITER_EMAIL populated and differing from ASSIGNMENT_RECRUITER_EMAIL).
- * Rows not matching that shape are skipped. Used by both the table-wide scan and the single-placement
- * refresh endpoint. See fetchRecruiterHandoverOwnershipLogRows for the two rows produced per deal.
+ *
+ * Source is the in-memory row, NOT a deal-sheet column: PREVIOUS_RECRUITER_* is no longer written to
+ * the deal sheet, so there is no table-wide scan for handovers — a handover is logged when the sync
+ * observes the recruiter change on an update-append (or via the single-placement refresh endpoint).
  */
 async function buildRecruiterHandoverOwnershipLogRows(inputRows, deps = {}) {
   const rows = (inputRows || []).filter((row) => {
     if (!row || typeof row !== "object") return false;
     if (String(row.DEAL_TYPE || "").trim().toUpperCase() !== "DEAL") return false;
-    const prev = row.PREVIOUS_RECRUITER_EMAIL == null ? "" : String(row.PREVIOUS_RECRUITER_EMAIL).trim();
+    const prev = row.__PREV_RECRUITER_EMAIL == null ? "" : String(row.__PREV_RECRUITER_EMAIL).trim();
     const cur = row.ASSIGNMENT_RECRUITER_EMAIL == null ? "" : String(row.ASSIGNMENT_RECRUITER_EMAIL).trim();
     return prev !== "" && prev.toLowerCase() !== cur.toLowerCase();
   });
@@ -7180,7 +7101,7 @@ async function buildRecruiterHandoverOwnershipLogRows(inputRows, deps = {}) {
   const emails = [];
   const emailSeen = new Set();
   for (const row of rows) {
-    const norm = String(row.PREVIOUS_RECRUITER_EMAIL).trim().toLowerCase();
+    const norm = String(row.__PREV_RECRUITER_EMAIL).trim().toLowerCase();
     if (!norm || emailSeen.has(norm)) continue;
     emailSeen.add(norm);
     emails.push(norm);
@@ -7189,7 +7110,7 @@ async function buildRecruiterHandoverOwnershipLogRows(inputRows, deps = {}) {
 
   const targets = [];
   rows.forEach((row, index) => {
-    const norm = String(row.PREVIOUS_RECRUITER_EMAIL).trim().toLowerCase();
+    const norm = String(row.__PREV_RECRUITER_EMAIL).trim().toLowerCase();
     const externalId = directoryByEmail.get(norm)?.externalId;
     if (!externalId) return;
     targets.push({ key: String(index), externalId, anchorDate: row?.NEW_HIRE_DATE ?? null });
@@ -7208,8 +7129,8 @@ async function buildRecruiterHandoverOwnershipLogRows(inputRows, deps = {}) {
       OWNERSHIP_ROLE: "RECRUITER",
       NEW_OWNER_NAME: ownershipDisplayValueOrNull(row.ASSIGNMENT_RECRUITER),
       NEW_OWNER_EMP_NO: ownershipDisplayValueOrNull(row.RECRUITER_EMP_NO),
-      PREVIOUS_OWNER_NAME: ownershipDisplayValueOrNull(row.PREVIOUS_RECRUITER_NAME),
-      PREVIOUS_OWNER_EMP_NO: ownershipDisplayValueOrNull(row.PREVIOUS_RECRUITER_EMP_NO),
+      PREVIOUS_OWNER_NAME: ownershipDisplayValueOrNull(row.__PREV_RECRUITER_NAME),
+      PREVIOUS_OWNER_EMP_NO: ownershipDisplayValueOrNull(row.__PREV_RECRUITER_EMP_NO),
     });
 
     // (2) vacated role — where the current recruiter (by emp-no) sat in the previous chain
@@ -7886,8 +7807,6 @@ async function finalizeDealSheetRowForResponse(row, baseline, options = {}) {
     current = { ...current, __CARRIED_FORWARD_UPDATE: true };
   }
   let arr = [current];
-  arr = applyPreviousRecruiterFillForInsertRows(arr);
-  arr = await applyExtensionLegacyPreviousRecruiterForInsertRows(arr);
   arr = await applyExtensionInheritForInsertRows(arr, options);
   arr = await applyDealRecruiterHierarchyForInsertRows(arr, options);
   arr = applyExtensionStartDatesForInsertRows(arr);
@@ -7948,6 +7867,9 @@ module.exports = {
   normalizeMoveRunrate,
   applyMoveRunrateAppendOverride,
   applyIsRejectedResetForChangedUpdate,
+  applyContractIdCarryForward,
+  vacateSelfReferencedHierarchyRoles,
+  normalizeHierarchyPersonName,
   applyManualColumnsCarryForward,
   applyTentativeDateFreeze,
   applyNewHireDateFreeze,
@@ -7967,6 +7889,7 @@ module.exports = {
   fetchContractIdsForExtensions,
   fetchLegacyContractIdentityForDealRows,
   buildLegacyContractLookupKey,
+  normalizeClientIdKeyPart,
   skuAllowedForPlacementStatus,
   legacyDealManualColumns,
   fetchEmployeeDirectoryByEmails,
@@ -7993,12 +7916,6 @@ module.exports = {
   rowNeedsDealRecruiterHierarchyBackfill,
   fetchDealRecruiterHierarchyByPlacementId,
   applyDealRecruiterHierarchyForInsertRows,
-  applyPreviousRecruiterFillForInsertRows,
-  applyExtensionLegacyPreviousRecruiterForInsertRows,
-  rowNeedsExtensionLegacyPreviousRecruiter,
-  chooseLegacyPreviousRecruiter,
-  backfillExtensionLegacyPreviousRecruiterForActive,
-  bqCellString,
   fetchHierarchyLevelChainsByKey,
   fetchDealSheetRecruiterChangePairsFromActive,
   buildInorganicHierarchyLogCandidate,
@@ -8024,7 +7941,6 @@ module.exports = {
   fetchDealSheetOwnershipChangePairsFromActive,
   fetchContractOwnershipChangePairsFromActive,
   fetchContractSegmentRateChangePairsFromActive,
-  fetchRecruiterHandoverOwnershipLogRows,
   buildRecruiterHandoverOwnershipLogRows,
   buildOwnershipChangeLogRows,
   buildContractOwnershipChangeLogRows,

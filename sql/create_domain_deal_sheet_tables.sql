@@ -219,8 +219,6 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_deal_shee
   -- Recruiter handover snapshot: who owned the placement before the current ASSIGNMENT_RECRUITER.
   -- Written by the enrich pipeline on a recruiter change; also the source for ownership_change_logs.
   PREVIOUS_RECRUITER_NAME STRING,
-  PREVIOUS_RECRUITER_EMAIL STRING,
-  PREVIOUS_RECRUITER_EMP_NO STRING,
   -- Extension / ownership state flags maintained outside this sync pipeline (frontend + ownership
   -- tooling). Declared here so the table shape matches; nothing in functions/src writes them.
   OWNERSHIP_DELETED BOOL,

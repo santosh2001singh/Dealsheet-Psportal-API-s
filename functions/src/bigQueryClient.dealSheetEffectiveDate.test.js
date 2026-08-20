@@ -39,6 +39,8 @@ test("applyPreviousRecruiterOnRecruiterChange: stamps OWNERSHIP_EFFECTIVE_DATE =
     }
   );
   assert.equal(changed, true);
-  assert.equal(row.PREVIOUS_RECRUITER_EMAIL, "kumkum.b@cynethealth.com");
+  // Captured in memory for the ownership log; not written to the deal sheet.
+  assert.equal(row.__PREV_RECRUITER_EMAIL, "kumkum.b@cynethealth.com");
+  assert.equal(row.PREVIOUS_RECRUITER_EMAIL, undefined);
   assert.equal(row.OWNERSHIP_EFFECTIVE_DATE, "2026-10-18");
 });

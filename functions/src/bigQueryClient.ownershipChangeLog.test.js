@@ -139,7 +139,7 @@ test("buildOwnershipChangeLogDedupeKey combines placement+role+owners; empty wit
   assert.equal(buildOwnershipChangeLogDedupeKey({ PLACEMENT_ID: 100 }), "");
 });
 
-test("applyPreviousRecruiterOnRecruiterChange: stamps outgoing recruiter when email changed", () => {
+test("applyPreviousRecruiterOnRecruiterChange: captures outgoing recruiter on temp fields when email changed", () => {
   const incoming = { ASSIGNMENT_RECRUITER_EMAIL: "new@cynethealth.com" };
   const baseline = {
     ASSIGNMENT_RECRUITER: "Old Rec",
@@ -148,9 +148,12 @@ test("applyPreviousRecruiterOnRecruiterChange: stamps outgoing recruiter when em
   };
   const { row, changed } = applyPreviousRecruiterOnRecruiterChange(incoming, baseline);
   assert.equal(changed, true);
-  assert.equal(row.PREVIOUS_RECRUITER_NAME, "Old Rec");
-  assert.equal(row.PREVIOUS_RECRUITER_EMAIL, "old@cynethealth.com");
-  assert.equal(row.PREVIOUS_RECRUITER_EMP_NO, "CY100");
+  // In-memory only — PREVIOUS_RECRUITER_* is no longer written to the deal sheet.
+  assert.equal(row.__PREV_RECRUITER_NAME, "Old Rec");
+  assert.equal(row.__PREV_RECRUITER_EMAIL, "old@cynethealth.com");
+  assert.equal(row.__PREV_RECRUITER_EMP_NO, "CY100");
+  assert.equal(row.PREVIOUS_RECRUITER_NAME, undefined);
+  assert.equal(row.PREVIOUS_RECRUITER_EMAIL, undefined);
 });
 
 test("applyPreviousRecruiterOnRecruiterChange: no-op when recruiter unchanged (case-insensitive)", () => {
@@ -158,7 +161,7 @@ test("applyPreviousRecruiterOnRecruiterChange: no-op when recruiter unchanged (c
   const baseline = { ASSIGNMENT_RECRUITER_EMAIL: "same@cynethealth.com", ASSIGNMENT_RECRUITER: "Same Rec" };
   const { row, changed } = applyPreviousRecruiterOnRecruiterChange(incoming, baseline);
   assert.equal(changed, false);
-  assert.equal(row.PREVIOUS_RECRUITER_NAME, undefined);
+  assert.equal(row.__PREV_RECRUITER_NAME, undefined);
 });
 
 test("applyPreviousRecruiterOnRecruiterChange: no-op when baseline recruiter email is blank", () => {
@@ -192,9 +195,9 @@ test("applyPreviousRecruiterOnRecruiterChange: vacates the hierarchy role the NE
   };
   const { row, changed } = applyPreviousRecruiterOnRecruiterChange(incoming, baseline);
   assert.equal(changed, true);
-  // Recruiter handover fields (existing behavior)
-  assert.equal(row.PREVIOUS_RECRUITER_NAME, "XYZ");
-  assert.equal(row.PREVIOUS_RECRUITER_EMP_NO, "CY100");
+  // Recruiter handover captured in memory (feeds the ownership log, not the deal sheet)
+  assert.equal(row.__PREV_RECRUITER_NAME, "XYZ");
+  assert.equal(row.__PREV_RECRUITER_EMP_NO, "CY100");
   assert.equal(row.OWNERSHIP_EFFECTIVE_DATE, "2026-05-16"); // tentative + 1
   // TEAM_LEAD vacated because Rohit (CY777) is now the recruiter
   assert.equal(row.TEAM_LEAD, "NA");
