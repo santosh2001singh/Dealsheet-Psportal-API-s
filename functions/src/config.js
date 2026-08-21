@@ -13,7 +13,14 @@ const config = {
    * on brand-new EXTENSION rows, one per domain (see recruiterDomainTables.resolveRunrateTableIdForDealSheetTable).
    */
   runrateTableId: process.env.RUNRATE_TABLE_ID || "all_CH_data_runrate",
-  runrateCanadaTableId: process.env.RUNRATE_CANADA_TABLE_ID || "all_Health_Canada_data_Runrate",
+  /**
+   * Canada's legacy source. NOTE: this was "all_Health_Canada_data_Runrate" until Aug 2026, a table
+   * that does not exist in rr_project_data — every Canada legacy lookup failed on it, so no Canada
+   * row ever recovered its CONTRACT_ID / SKU_NUMBER / manual ops columns. The real table is
+   * all_Health_Canada_Deal_sheet_data (618 rows).
+   */
+  runrateCanadaTableId:
+    process.env.RUNRATE_CANADA_TABLE_ID || "all_Health_Canada_Deal_sheet_data",
   runrateLocumsTableId: process.env.RUNRATE_LOCUMS_TABLE_ID || "all_locums_runrate",
   rateChangeLogDatasetId: process.env.BQ_RATE_CHANGE_LOG_DATASET || "rr_project_data",
   rateChangeLogTableId: process.env.BQ_RATE_CHANGE_LOG_TABLE || "ch_rate_change_logs",

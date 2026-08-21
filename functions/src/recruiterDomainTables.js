@@ -3,6 +3,7 @@
  */
 
 const config = require("./config");
+const { isCanadaProvince } = require("./canadaDerivedPlacementFields");
 
 const TABLE_CYNET_HEALTH = "cynet_health_deal_sheet";
 const TABLE_CYNET_HEALTH_CANADA = "cynet_health_canada_deal_sheet";
@@ -66,7 +67,17 @@ function isLocumsOffering(row) {
  * @returns {string} BigQuery table id for rr_project_data
  */
 function resolveActiveDealSheetTableIdForRow(row) {
+  // CLIENT_STATE wins for Canada: a Canadian province means Canadian business and a Canadian legal
+  // entity, whichever desk recruited it. This is the authority the recruiter domain used to be.
+  if (isCanadaProvince(row?.CLIENT_STATE)) return TABLE_CYNET_HEALTH_CANADA;
+
   const byEmail = resolveActiveDealSheetTableId(row?.ASSIGNMENT_RECRUITER_EMAIL);
+  // A @cynethealth.ca recruiter placing outside the nine provinces is not Canada business, so the
+  // row must not sit in the Canada table (its schema has no US rate family). Route it to health,
+  // still honouring the OFFERING=LOCUMS override below.
+  if (byEmail === TABLE_CYNET_HEALTH_CANADA) {
+    return isLocumsOffering(row) ? TABLE_CYNET_LOCUMS : TABLE_CYNET_HEALTH;
+  }
   if (byEmail === TABLE_CYNET_HEALTH && isLocumsOffering(row)) return TABLE_CYNET_LOCUMS;
   return byEmail;
 }
@@ -117,7 +128,14 @@ function resolveEndedDealSheetTableId(email) {
  * @returns {string} BigQuery ended deal sheet table id
  */
 function resolveEndedDealSheetTableIdForRow(row) {
+  // Same CLIENT_STATE-first rule as the active twin, so a placement does not change domain when it
+  // moves from the active table to the ended one.
+  if (isCanadaProvince(row?.CLIENT_STATE)) return TABLE_ENDED_CYNET_HEALTH_CANADA;
+
   const byEmail = resolveEndedDealSheetTableId(row?.ASSIGNMENT_RECRUITER_EMAIL);
+  if (byEmail === TABLE_ENDED_CYNET_HEALTH_CANADA) {
+    return isLocumsOffering(row) ? TABLE_ENDED_CYNET_LOCUMS : TABLE_ENDED_CYNET_HEALTH;
+  }
   if (byEmail === TABLE_ENDED_CYNET_HEALTH && isLocumsOffering(row)) return TABLE_ENDED_CYNET_LOCUMS;
   return byEmail;
 }

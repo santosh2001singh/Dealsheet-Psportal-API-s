@@ -77,6 +77,26 @@ function filterEnrichedRowsByDealSheetMinStartDate(rows) {
   );
 }
 
+/**
+ * Sync domains exempt from the START_DATE >= 2026-01-01 lower bound.
+ *
+ * Cynet Health Canada is being loaded from scratch and needs its FULL Nexus history — every deal and
+ * placement, however old — so all three layers of the date filter are switched off for it:
+ *   1. submittal_start_date_from  (the Nexus list's server-side lower bound)
+ *   2. transform_rows_fn          (the post-enrich row filter)
+ *   3. min_start_date_ms          (the final gate inside the insert pipeline)
+ *
+ * cynet health and locums keep the 2026-01-01 bound exactly as before — the constants above are
+ * untouched, only Canada reads them as absent.
+ */
+const SYNC_DOMAINS_WITHOUT_MIN_START_DATE = new Set(["canada"]);
+
+/** True when `domain` should apply the START_DATE lower bound. */
+function domainUsesDealSheetMinStartDate(domain) {
+  const key = domain == null ? "" : String(domain).trim().toLowerCase();
+  return !SYNC_DOMAINS_WITHOUT_MIN_START_DATE.has(key);
+}
+
 /** Max placement composites refreshed per `dealSheetSyncUpdateTrigger` invocation (env override). */
 function resolveDealSheetUpdateTriggerMaxPairs() {
   const raw = process.env.DEAL_SHEET_UPDATE_TRIGGER_MAX_PAIRS;
@@ -603,9 +623,10 @@ async function runDealSheetInsertSyncForDomain(domain, label) {
   const firstInsertPlacementStatuses = ACTIVE_BOOTSTRAP_FIRST_INSERT_PLACEMENT_STATUSES;
   const insertMaxPages = resolveDealSheetInsertTriggerMaxPages();
   const checkpointKey = `${ACTIVE_INSERT_SYNC_CHECKPOINT_KEY}-${domain}`;
+  const useMinStartDate = domainUsesDealSheetMinStartDate(domain);
 
   logLine(
-    `[${label}] Scheduled insert-only domain=${domain}: ${organizationSubmittalCodes} -> cynetdatabase.${bqDataset}; skip if DEAL_SHEET_ID or PLACEMENT_ID exists in BQ; START_DATE>=${DEAL_SHEET_MIN_START_DATE_ISO}; first_insert_allowlist=${firstInsertPlacementStatuses}; no append-on-change; checkpoint_key=${checkpointKey} (resume-on-error/timeout by submittal page, clear-on-complete); max_pages_per_run=${insertMaxPages || "none"}`
+    `[${label}] Scheduled insert-only domain=${domain}: ${organizationSubmittalCodes} -> cynetdatabase.${bqDataset}; skip if DEAL_SHEET_ID or PLACEMENT_ID exists in BQ; START_DATE${useMinStartDate ? `>=${DEAL_SHEET_MIN_START_DATE_ISO}` : "=no filter (full history)"}; first_insert_allowlist=${firstInsertPlacementStatuses}; no append-on-change; checkpoint_key=${checkpointKey} (resume-on-error/timeout by submittal page, clear-on-complete); max_pages_per_run=${insertMaxPages || "none"}`
   );
   logLine(`[${label}] Invoking syncEnrichedDealSheetCandidatesToBigQuery`);
 
@@ -627,11 +648,18 @@ async function runDealSheetInsertSyncForDomain(domain, label) {
     // ~1k relevant submittals instead of scanning every page (~3k+) and discarding old ones —
     // this is the real cut to the socket-hangup / timeout load. No upper bound (future starts).
     // filterEnrichedRowsByDealSheetMinStartDate stays below as the in-code safety net.
-    submittal_start_date_from: DEAL_SHEET_MIN_START_DATE_ISO,
-    transform_rows_fn: filterEnrichedRowsByDealSheetMinStartDate,
-    // Final gate inside the insert pipeline, against the FINAL START_DATE (the offer-rejected /
-    // extension steps rewrite it from a prior ended assignment after transform_rows_fn ran).
-    min_start_date_ms: DEAL_SHEET_MIN_START_DATE_MS,
+    //
+    // Canada is exempt (see SYNC_DOMAINS_WITHOUT_MIN_START_DATE): it needs its full Nexus history,
+    // so all three layers are omitted and the scan covers every submittal page.
+    ...(useMinStartDate
+      ? {
+        submittal_start_date_from: DEAL_SHEET_MIN_START_DATE_ISO,
+        transform_rows_fn: filterEnrichedRowsByDealSheetMinStartDate,
+        // Final gate inside the insert pipeline, against the FINAL START_DATE (the offer-rejected /
+        // extension steps rewrite it from a prior ended assignment after transform_rows_fn ran).
+        min_start_date_ms: DEAL_SHEET_MIN_START_DATE_MS,
+      }
+      : {}),
     // Page-level Firestore checkpoint: on a thrown socket-hangup (ECONNRESET after retries) the
     // failed submittal page is saved and the next run resumes from it; on a fully-successful pass
     // the doc is deleted so the next run rescans from page 1 to pick up newly-added deal sheets.
@@ -788,9 +816,10 @@ async function runDealSheetUpdateSyncForDomain(domain, label) {
   const bqDataset = "rr_project_data";
   const maxPairsPerRun = resolveDealSheetUpdateTriggerMaxPairs();
   const checkpointKey = `${ACTIVE_UPDATE_SYNC_CHECKPOINT_KEY}-${domain}`;
+  const useMinStartDate = domainUsesDealSheetMinStartDate(domain);
 
   logLine(
-    `[${label}] Scheduled update domain=${domain}: cynetdatabase.${bqDataset}; BQ deal_sheet targets -> Nexus refresh; baseline=deal_sheet_id; priority=STARTED,BOOKED,ACTIVE (all each run); batch=ENDED,ENDED<30,DID NOT START,DID NOT ACCEPT+unknown; max_pairs_per_run=${maxPairsPerRun} (batch only); terminal_stale_cutoff_days=20 (ENDED/ENDED<30/DID NOT START/DID NOT ACCEPT, latest LAST_UPDATED older than cutoff dropped); checkpoint_key=${checkpointKey}; START_DATE>=${DEAL_SHEET_MIN_START_DATE_ISO}`
+    `[${label}] Scheduled update domain=${domain}: cynetdatabase.${bqDataset}; BQ deal_sheet targets -> Nexus refresh; baseline=deal_sheet_id; priority=STARTED,BOOKED,ACTIVE (all each run); batch=ENDED,ENDED<30,DID NOT START,DID NOT ACCEPT+unknown; max_pairs_per_run=${maxPairsPerRun} (batch only); terminal_stale_cutoff_days=20 (ENDED/ENDED<30/DID NOT START/DID NOT ACCEPT, latest LAST_UPDATED older than cutoff dropped); checkpoint_key=${checkpointKey}; START_DATE${useMinStartDate ? `>=${DEAL_SHEET_MIN_START_DATE_ISO}` : "=no filter (full history)"}`
   );
   logLine(`[${label}] Invoking syncExistingActiveDealSheetUpdatesFromBigQuery`);
 
@@ -801,7 +830,8 @@ async function runDealSheetUpdateSyncForDomain(domain, label) {
         checkpoint_key: checkpointKey,
         clear_checkpoint_on_complete: true,
         max_pairs_per_run: maxPairsPerRun,
-        min_start_date_ms: DEAL_SHEET_MIN_START_DATE_MS,
+        // Canada is exempt from the 2026-01-01 lower bound (full history); health/locums keep it.
+        ...(useMinStartDate ? { min_start_date_ms: DEAL_SHEET_MIN_START_DATE_MS } : {}),
         generated_uuid_field: "ID",
         compare_ignore_fields: ["ID", "LAST_UPDATED", "IS_REJECTED"],
   });

@@ -5,7 +5,7 @@
 
 const { normalizeNexusResourceId } = require("./nexusClient");
 const {
-  isCynetHealthCanadaRecruiter,
+  isCanadaDealSheetRow,
   computeCanadaDerivedPlacementFields,
 } = require("./canadaDerivedPlacementFields");
 const {
@@ -675,10 +675,11 @@ function mapDealSheetHoursDetailsToBq(hoursRow, clientState) {
  */
 function mapDealSheetRevenueDetailsToBq(revenueRow) {
   if (!revenueRow) return {};
-  const grossMargin = toNumberOrNull(revenueRow.hourly_revenue);
+  // MARGIN is the deal sheet's hourly revenue straight from the API — not a computed margin.
+  // (Canada relies on this: its derived step fills CALCULATED_MARGIN and leaves MARGIN alone.)
   return {
     GP_PERCENTAGE: toNumberOrNull(revenueRow.gross_margin_percentage),
-    MARGIN: grossMargin,
+    MARGIN: toNumberOrNull(revenueRow.hourly_revenue),
   };
 }
 
@@ -1102,7 +1103,8 @@ const DAYS_WORKED_ELIGIBLE_STATUSES = new Set([
  * Compute derived placement metrics for active sync rows
  */
 function computeDerivedPlacementFields(row) {
-  if (isCynetHealthCanadaRecruiter(row?.ASSIGNMENT_RECRUITER_EMAIL)) {
+  // Canada is decided by CLIENT_STATE (province), not by the recruiter's email domain.
+  if (isCanadaDealSheetRow(row)) {
     return computeCanadaDerivedPlacementFields(row);
   }
   if (isCynetLocumsRecruiter(row?.ASSIGNMENT_RECRUITER_EMAIL)) {
@@ -1784,6 +1786,12 @@ const MANUAL_COLUMNS = new Set([
   "BGC_TOTAL_BGV_COST",
   "BOOKING_DATE",
   "CANDIDATE_PAYMENT_TERMS",
+  // Canada sheet columns with no API source — hand-edited in BigQuery and frozen on every sync.
+  // Present on the canada tables only (see sql/migrate_canada_deal_sheet_schema.sql); harmless to
+  // list here because a column the target table does not have is never written.
+  "CLIENT_AVERAGING_AGREEMENT",
+  "CANDIDATE_AVERAGING_AGREEMENT",
+  "NO_OF_TIME_EXTENSION_RECEIVED",
   // Client-side counterpart of RECRUITER_CLUSTER_REGION (was PLACEMENT_CLUSTER). Hand-edited only.
   "CLIENT_CLUSTER_REGION",
   "CLIENT_CREATED_DATE",

@@ -53,7 +53,7 @@ const {
 const { computeBonusTotals } = require("../bonusTotals");
 const { computeWeekSplit } = require("../weekSplit");
 const { computeNewRateFamily } = require("../w2PayRateNew");
-const { sanitizeCanadaDealSheetRow, isCynetHealthCanadaRecruiter, pickCanadaDealSheetHoursPart } = require("../canadaDerivedPlacementFields");
+const { sanitizeCanadaDealSheetRow, isCanadaDealSheetRow, pickCanadaDealSheetHoursPart } = require("../canadaDerivedPlacementFields");
 const {
   sanitizeLocumsDealSheetRow,
   isCynetLocumsRecruiter,
@@ -989,7 +989,8 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       ? null : userById.get(String(salesRepId)) ?? null;
     const userPart = mapDealSheetUsersToBq(detail, recruiterUser, salesRepUser, submittalRow);
 
-    const isCanadaRecruiter = isCynetHealthCanadaRecruiter(userPart?.ASSIGNMENT_RECRUITER_EMAIL);
+    // Canada is decided by the placement's province (CLIENT_STATE), not the recruiter's email.
+    const isCanadaRecruiter = isCanadaDealSheetRow({ CLIENT_STATE: clientStateNorm });
     const isLocumsRecruiter = isCynetLocumsRecruiter(userPart?.ASSIGNMENT_RECRUITER_EMAIL);
     const hoursPartForRow = isCanadaRecruiter ? pickCanadaDealSheetHoursPart(hoursPart) : hoursPart;
     const bonusTotalsPart = isCanadaRecruiter

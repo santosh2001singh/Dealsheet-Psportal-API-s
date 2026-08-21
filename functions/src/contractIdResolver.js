@@ -36,7 +36,9 @@ const {
 const {
   resolveActiveDealSheetTableId,
   resolveActiveDealSheetTableIdForRow,
+  resolveRunrateTableIdForDealSheetTable,
 } = require("./recruiterDomainTables");
+const { applyCanadaDefaultEntity } = require("./canadaDerivedPlacementFields");
 
 function toInt64OrNull(value) {
   if (value == null || value === "") return null;
@@ -415,6 +417,9 @@ async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
   const fetchLegacyContractIdentityFn =
     deps.fetchLegacyContractIdentityFn ?? fetchLegacyContractIdentityForDealRows;
   const tableId = deps.tableId == null ? "" : String(deps.tableId).trim();
+  // Which run-rate table this domain reads decides the manual-column list: Canada carries five
+  // columns health does not have (see RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE).
+  const runrateTableId = resolveRunrateTableIdForDealSheetTable(tableId || undefined);
 
   let identityByRowKey;
   try {
@@ -488,13 +493,18 @@ async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
     // what EXTENSION rows already inherit. Not gated on PLACEMENT_STATUS: only the SKU above is
     // withheld from DID NOT START / DID NOT ACCEPT rows, since these describe the contract rather
     // than an assignment that ran.
-    for (const col of legacyDealManualColumns()) {
+    for (const col of legacyDealManualColumns(runrateTableId)) {
       const legacyValue = identity?.[col];
       if (legacyValue == null || String(legacyValue).trim() === "") continue;
       if (row[col] != null && String(row[col]).trim() !== "") continue;
       row[col] = typeof legacyValue === "string" ? legacyValue.trim() : legacyValue;
       manualFilled++;
     }
+
+    // Canada's ENTITY default, applied only once the legacy carry-forward above has had its say, so
+    // a value the run-rate row supplied always wins over the default.
+    const withEntity = applyCanadaDefaultEntity(row);
+    if (withEntity !== row && withEntity?.ENTITY != null) row.ENTITY = withEntity.ENTITY;
   }
 
   if (reused > 0) {

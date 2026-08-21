@@ -24,7 +24,7 @@ const {
   startDateOnOrAfterUtcMin,
   effectiveMinFilterDate,
 } = require("./columnMappings");
-const { isCynetHealthCanadaRecruiter, sanitizeCanadaDealSheetRow, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
+const { isCynetHealthCanadaRecruiter, isCanadaDealSheetRow, sanitizeCanadaDealSheetRow, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
 const { isCynetLocumsRecruiter, sanitizeLocumsDealSheetRow, LOCUMS_EXCLUDED_API_OWNED_COLUMNS } = require("./locumsDerivedPlacementFields");
 // CONTRACT_ID allocation lives entirely in contractIdResolver.js (DEAL rows only) — this module
 // only ever reuses an existing id, so it needs neither the sequence nor its options builder.
@@ -775,8 +775,13 @@ function normalizeForCompare(value) {
   return String(sanitized);
 }
 
-function shouldSkipDomainExcludedApiOwnedColumn(email, key) {
-  if (isCynetHealthCanadaRecruiter(email) && CANADA_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
+/**
+ * True when a column must be ignored for this row's domain, because the domain's table has no such
+ * column. Canada is keyed on the row (CLIENT_STATE province); locums still on the recruiter email.
+ */
+function shouldSkipDomainExcludedApiOwnedColumn(row, key) {
+  if (isCanadaDealSheetRow(row) && CANADA_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
+  const email = row?.ASSIGNMENT_RECRUITER_EMAIL;
   if (isCynetLocumsRecruiter(email) && LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
   return false;
 }
@@ -784,7 +789,7 @@ function shouldSkipDomainExcludedApiOwnedColumn(email, key) {
 function hasBusinessColumnChanges(incomingRow, existingRow, ignoreFieldsSet) {
   if (!existingRow) return true;
   const email = incomingRow?.ASSIGNMENT_RECRUITER_EMAIL;
-  const isDomainTypeDerived = isCynetHealthCanadaRecruiter(email) || isCynetLocumsRecruiter(email);
+  const isDomainTypeDerived = isCanadaDealSheetRow(incomingRow) || isCynetLocumsRecruiter(email);
   if (isDomainTypeDerived) {
     if (normalizeForCompare(incomingRow?.PAYMENT_TYPE) !== normalizeForCompare(existingRow?.PAYMENT_TYPE)) {
       return true;
@@ -792,7 +797,7 @@ function hasBusinessColumnChanges(incomingRow, existingRow, ignoreFieldsSet) {
   }
   for (const key of API_OWNED_COLUMNS) {
     if (ignoreFieldsSet && ignoreFieldsSet.has(key)) continue;
-    if (shouldSkipDomainExcludedApiOwnedColumn(email, key)) continue;
+    if (shouldSkipDomainExcludedApiOwnedColumn(incomingRow, key)) continue;
     const incomingVal = normalizeForCompare(incomingRow?.[key]);
     const existingVal = normalizeForCompare(existingRow?.[key]);
     // CONTRACT_ID is a Cynet-internal identity resolved INSIDE the insert pipeline (reused from the
@@ -941,7 +946,9 @@ function applyManualColumnsCarryForward(incomingRow, baselineRow) {
     return { row: incomingRow, carriedCount: 0 };
   }
   const email = incomingRow?.ASSIGNMENT_RECRUITER_EMAIL;
-  const skipManualType = isCynetHealthCanadaRecruiter(email) || isCynetLocumsRecruiter(email);
+  // PAYMENT_TYPE drives the Canada burden multiplier and the locums rate family, so those domains
+  // must take the API value rather than freezing the manual one. Canada is keyed on the province.
+  const skipManualType = isCanadaDealSheetRow(incomingRow) || isCynetLocumsRecruiter(email);
   const skipManualEntity = isCynetLocumsRecruiter(email);
   const out = { ...incomingRow };
   for (const key of MANUAL_COLUMNS) {
@@ -3080,13 +3087,21 @@ function normalizeLegacyDateOnlyOrNull(value) {
  * Only the SKU (which identifies an assignment that actually ran) is withheld from those rows.
  * @returns {string[]}
  */
-function legacyDealManualColumns() {
-  return EXTENSION_RUNRATE_MANUAL_COLUMNS;
+function legacyDealManualColumns(runrateTableId) {
+  const key = runrateTableId == null ? "" : String(runrateTableId).trim();
+  const extra = RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE.get(key);
+  const missing = RUNRATE_MANUAL_MISSING_COLUMNS_BY_TABLE.get(key);
+  if (!extra && !missing) return EXTENSION_RUNRATE_MANUAL_COLUMNS;
+
+  const base = missing && missing.size > 0
+    ? EXTENSION_RUNRATE_MANUAL_COLUMNS.filter((col) => !missing.has(col))
+    : EXTENSION_RUNRATE_MANUAL_COLUMNS;
+  return extra && extra.length > 0 ? [...base, ...extra] : base;
 }
 
 /** `col AS col_lower` list for the legacy lookup SELECT, plus the alias->column mapping back. */
-function buildLegacyManualColumnSql(prefix = "r") {
-  const cols = legacyDealManualColumns();
+function buildLegacyManualColumnSql(prefix = "r", runrateTableId) {
+  const cols = legacyDealManualColumns(runrateTableId);
   const select = cols.map((c) => `${prefix}.${c} AS ${c.toLowerCase()}`).join(",\n          ");
   return { cols, select };
 }
@@ -3098,8 +3113,8 @@ function buildLegacyManualColumnSql(prefix = "r") {
  * FIFTYTWO_TENURE_RTO_LASTDATE is unwrapped here — the same trap documented on
  * formatTimestampLiteralForSql, where a wrapper reaching date handling silently became null.
  */
-function assignLegacyManualColumns(target, bqRow) {
-  for (const col of legacyDealManualColumns()) {
+function assignLegacyManualColumns(target, bqRow, runrateTableId) {
+  for (const col of legacyDealManualColumns(runrateTableId)) {
     const raw = bqRow?.[col.toLowerCase()];
     const value =
       raw && typeof raw === "object" && !(raw instanceof Date) && "value" in raw ? raw.value : raw;
@@ -3347,7 +3362,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
     // ROW_NUMBER picks one contract per IDENTITY (see the PARTITION BY below); an exact probe-date
     // hit wins, then the latest START_DATE, then CONTRACT_ID and ID break ties so repeated runs
     // always resolve identically.
-    const { cols: manualCols, select: manualSelect } = buildLegacyManualColumnSql("r");
+    const { cols: manualCols, select: manualSelect } = buildLegacyManualColumnSql("r", runrateTableId);
     const manualOut = manualCols.map((c) => c.toLowerCase()).join(", ");
     const sql = `
       WITH wanted_keys AS (SELECT * FROM UNNEST([${structs.join(", ")}])),
@@ -3457,7 +3472,8 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
             SKU_NUMBER: normalizeLegacySkuOrNull(r.sku_number),
             INITIAL_START_DATE: normalizeLegacyDateOnlyOrNull(r.initial_start_date),
           },
-          r
+          r,
+          runrateTableId
         )
       );
     }
@@ -3473,7 +3489,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
     // resolve the same candidate's rows (whichever one a given row falls to), so opposite orderings
     // had them pick contracts from opposite ends of the candidate's history and hand two rows of one
     // contract two different ids.
-    const { cols: manualCols, select: manualSelect } = buildLegacyManualColumnSql("r");
+    const { cols: manualCols, select: manualSelect } = buildLegacyManualColumnSql("r", runrateTableId);
     const manualOut = manualCols.map((c) => c.toLowerCase()).join(", ");
     const sql = `
       WITH wanted AS (SELECT * FROM UNNEST([${pairs.join(", ")}])),
@@ -3507,7 +3523,8 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
             SKU_NUMBER: normalizeLegacySkuOrNull(r.sku_number),
             INITIAL_START_DATE: normalizeLegacyDateOnlyOrNull(r.initial_start_date),
           },
-          r
+          r,
+          runrateTableId
         )
       );
     }
@@ -3637,6 +3654,60 @@ Object.freeze(EXTENSION_RUNRATE_MANUAL_COLUMNS);
  */
 const RUNRATE_HIERARCHY_MISSING_COLUMNS_BY_TABLE = new Map([
   ["all_locums_runrate", new Set(["AVP"])],
+  // Cynet Health Canada has no AVP role — the hierarchy tops out at VP / Sr. VP — so neither the
+  // Canada run-rate table nor the Canada deal sheet tables carry AVP / AVP_EMP_NO. Selecting it
+  // would fail the extension backfill query with "Unrecognized name: AVP".
+  ["all_Health_Canada_Deal_sheet_data", new Set(["AVP"])],
+]);
+
+/**
+ * Extra manual columns to carry, for one run-rate table only.
+ *
+ * The inverse of RUNRATE_HIERARCHY_MISSING_COLUMNS_BY_TABLE: instead of removing a column a table
+ * lacks, this adds columns only a specific domain has. A column can only be carried when BOTH sides
+ * have it, and these five exist on the Canada pair but not on health's or locums' — so putting them
+ * in EXTENSION_RUNRATE_MANUAL_COLUMNS would break the health SELECT with "Unrecognized name".
+ * Keeping them here leaves cynet health's behaviour byte-identical.
+ *
+ * Verified on live data (all_Health_Canada_Deal_sheet_data, 618 rows):
+ *   CLIENT_AVERAGING_AGREEMENT     301 populated
+ *   CANDIDATE_AVERAGING_AGREEMENT  301
+ *   NO_OF_TIME_EXTENSION_RECEIVED  116
+ *   DT_RATE / CLIENT_DT_RATE       612 each
+ *
+ * DT_RATE / CLIENT_DT_RATE do exist on the health tables, but adding them to the shared list would
+ * change what health carries; Canada asked for them, health did not, so they ride here too.
+ */
+const RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE = new Map([
+  [
+    "all_Health_Canada_Deal_sheet_data",
+    Object.freeze([
+      "CLIENT_AVERAGING_AGREEMENT",
+      "CANDIDATE_AVERAGING_AGREEMENT",
+      "NO_OF_TIME_EXTENSION_RECEIVED",
+      "DT_RATE",
+      "CLIENT_DT_RATE",
+    ]),
+  ],
+]);
+
+/**
+ * Manual columns a specific run-rate table does NOT have, so they must be left out of its SELECT.
+ *
+ * Same idea as RUNRATE_HIERARCHY_MISSING_COLUMNS_BY_TABLE but for the manual/ops list. Confirmed
+ * against all_Health_Canada_Deal_sheet_data's schema: these three are the only members of
+ * EXTENSION_RUNRATE_MANUAL_COLUMNS it lacks, and all three are also columns Canada dropped from its
+ * own deal sheet tables, so there is nothing to carry either way.
+ */
+const RUNRATE_MANUAL_MISSING_COLUMNS_BY_TABLE = new Map([
+  [
+    "all_Health_Canada_Deal_sheet_data",
+    new Set([
+      "CLIENT_NAME_IN_CONREP",
+      "FIFTYTWO_TENURE_RTO_LASTDATE",
+      "FIFTYTWO_TENURE_CANDIDATE_STATUS",
+    ]),
+  ],
 ]);
 
 /** Hierarchy columns that actually exist on `runrateTableId`, safe to reference in a SELECT. */
@@ -7898,6 +7969,8 @@ module.exports = {
   EXTENSION_RUNRATE_HIERARCHY_COLUMNS,
   EXTENSION_RUNRATE_MANUAL_COLUMNS,
   RUNRATE_HIERARCHY_MISSING_COLUMNS_BY_TABLE,
+  RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE,
+  RUNRATE_MANUAL_MISSING_COLUMNS_BY_TABLE,
   resolveExtensionRunrateHierarchyColumns,
   EXTENSION_RUNRATE_ELIGIBLE_PLACEMENT_STATUSES,
   isExtensionRunrateEligiblePlacementStatus,

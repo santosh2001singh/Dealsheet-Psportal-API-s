@@ -76,7 +76,7 @@ const { startDateOnOrAfterUtcMin, effectiveMinFilterDate, API_OWNED_COLUMNS } = 
 const { buildEnrichedRowsFromDealSheetCandidates } = require("./api/dealSheetEnricher");
 const { normalizeContractIdOrNull } = require("./contractIdFormat");
 const { getCheckpointRef } = require("./firestoreWorkspace");
-const { isCynetHealthCanadaRecruiter, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
+const { isCanadaDealSheetRow, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
 const { isCynetLocumsRecruiter, LOCUMS_EXCLUDED_API_OWNED_COLUMNS } = require("./locumsDerivedPlacementFields");
 const { computeNewMargin } = require("./w2PayRateNew");
 const {
@@ -706,8 +706,13 @@ function resolvePreferredCandidateRow(candidateRows, preferredCandidateId, prefe
   return candidateRows[0];
 }
 
-function shouldSkipDomainExcludedApiOwnedColumn(email, key) {
-  if (isCynetHealthCanadaRecruiter(email) && CANADA_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
+/**
+ * True when a column must be ignored for this row's domain, because the domain's table has no such
+ * column. Canada is keyed on the row (CLIENT_STATE province); locums still on the recruiter email.
+ */
+function shouldSkipDomainExcludedApiOwnedColumn(row, key) {
+  if (isCanadaDealSheetRow(row) && CANADA_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
+  const email = row?.ASSIGNMENT_RECRUITER_EMAIL;
   if (isCynetLocumsRecruiter(email) && LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
   return false;
 }
@@ -717,7 +722,7 @@ function computeChangedFields(incomingRow, existingRow, ignoreFields) {
   if (!existingRow) return out;
   const ignore = new Set((ignoreFields || []).map((x) => String(x).trim()).filter(Boolean));
   const email = incomingRow?.ASSIGNMENT_RECRUITER_EMAIL;
-  const isDomainTypeDerived = isCynetHealthCanadaRecruiter(email) || isCynetLocumsRecruiter(email);
+  const isDomainTypeDerived = isCanadaDealSheetRow(incomingRow) || isCynetLocumsRecruiter(email);
   if (isDomainTypeDerived) {
     if (normalizeForCompare(incomingRow?.PAYMENT_TYPE) !== normalizeForCompare(existingRow?.PAYMENT_TYPE)) {
       out.push("PAYMENT_TYPE");
@@ -725,7 +730,7 @@ function computeChangedFields(incomingRow, existingRow, ignoreFields) {
   }
   for (const key of API_OWNED_COLUMNS) {
     if (ignore.has(key)) continue;
-    if (shouldSkipDomainExcludedApiOwnedColumn(email, key)) continue;
+    if (shouldSkipDomainExcludedApiOwnedColumn(incomingRow, key)) continue;
     const nextVal = normalizeForCompare(incomingRow?.[key]);
     const prevVal = normalizeForCompare(existingRow?.[key]);
     // Mirror hasBusinessColumnChanges: CONTRACT_ID is resolved inside the insert pipeline (reused
