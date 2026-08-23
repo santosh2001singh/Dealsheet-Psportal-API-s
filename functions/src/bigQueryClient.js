@@ -2027,11 +2027,31 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
   logDetail(
     `[enriched sync] [BigQuery insertAll] ${hasErrors ? "PARTIAL" : "OK"} attempted=${result.attempted} inserted=${result.inserted}`
   );
+
+  // CONTRACT_CHAIN ownership logs for the rows just written, in THIS run. The scheduled scan runs
+  // once at the end of a trigger and would otherwise leave a new extension's handover row missing
+  // until a later run — a visible gap where the deal exists but its ownership log does not. Non-fatal
+  // and idempotent (the log batch dedupes), so the scheduled scan stays as the safety net.
+  let contractChainOwnershipLog = null;
+  if (options.skipInsertTimeContractChainOwnershipLogs !== true && result.inserted > 0) {
+    try {
+      contractChainOwnershipLog = await insertContractChainOwnershipLogsForInsertedRows(rowsToInsert, {
+        dealSheetDatasetId: options.datasetId,
+      });
+    } catch (ownErr) {
+      logError(
+        `[enriched sync] insert-time contract-chain ownership logs FAILED (non-fatal)`,
+        ownErr
+      );
+    }
+  }
+
   return {
     inserted: result.inserted,
     attempted: result.attempted,
     errorBatches: hasErrors ? 1 : 0,
     insertedKeys,
+    contractChainOwnershipLog,
     // Fully-derived rows exactly as written (hierarchy, DELIVERY_POC, CSM, SKU, etc.). Callers
     // that need to echo the final row (e.g. the refresh API response) use this.
     finalRows: rowsToInsert,
@@ -2753,14 +2773,37 @@ const ACTIVE_CHANGE_SCAN_COLUMNS = [
 Object.freeze(ACTIVE_CHANGE_SCAN_COLUMNS);
 
 /**
+ * Columns in ACTIVE_CHANGE_SCAN_COLUMNS that a specific deal sheet table does not have.
+ *
+ * Cynet Health Canada has no AVP role (the chain tops out at VP / Sr. VP), so AVP / AVP_EMP_NO were
+ * dropped from its tables. This scan UNIONs all three domain tables, so naming AVP unconditionally
+ * failed the whole query — including the cynet health trigger that runs it — with
+ * "Unrecognized name: AVP". Such a column is selected as NULL for that table instead of being
+ * omitted, because a UNION ALL needs every branch to have the same shape in the same order.
+ */
+const ACTIVE_CHANGE_SCAN_MISSING_COLUMNS_BY_TABLE = new Map([
+  ["cynet_health_canada_deal_sheet", new Set(["AVP", "AVP_EMP_NO"])],
+  ["cynet_health_canada_ended_deal_sheet", new Set(["AVP", "AVP_EMP_NO"])],
+]);
+
+/** `col` or `CAST(NULL AS STRING) AS col` per table, so every UNION branch lines up. */
+function buildActiveChangeScanColumnList(tableId) {
+  const missing = ACTIVE_CHANGE_SCAN_MISSING_COLUMNS_BY_TABLE.get(tableId);
+  if (!missing || missing.size === 0) return ACTIVE_CHANGE_SCAN_COLUMNS.join(", ");
+  return ACTIVE_CHANGE_SCAN_COLUMNS.map((col) =>
+    missing.has(col) ? `CAST(NULL AS STRING) AS ${col}` : col
+  ).join(", ");
+}
+
+/**
  * Per-table SELECTs (explicit columns) for the change-detection scans, UNION ALL'd. Each row is
  * tagged with `_src` (source table id). Safe across domains with differing full schemas.
  */
 function buildActiveChangeScanUnionParts(datasetId) {
-  const columnList = ACTIVE_CHANGE_SCAN_COLUMNS.join(", ");
   return ACTIVE_DEAL_SHEET_TABLE_IDS.map((tableId) => {
     const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
     const src = escapeSqlString(tableId);
+    const columnList = buildActiveChangeScanColumnList(tableId);
     return `SELECT ${columnList}, '${src}' AS _src FROM ${fqn} WHERE DEAL_SHEET_ID IS NOT NULL AND PLACEMENT_ID IS NOT NULL`;
   });
 }
@@ -4752,6 +4795,7 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
   let runrateBackfilledCount = 0;
   let skuClearedCount = 0;
   let selfReferenceVacatedCount = 0;
+  let duplicatePersonVacatedCount = 0;
 
   const out = rows.map((row) => {
     const key = String(row.PLACEMENT_ID).trim();
@@ -4834,6 +4878,16 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
       selfReferenceVacatedCount += vacated.vacatedColumns.length;
     }
 
+    // Same reason, one step further: the collision above is the recruiter appearing as their own
+    // manager, this one is any ONE person appearing in TWO manager columns because the inherit tiers
+    // disagree about their designation (promoted since the older source was written).
+    const deduped = vacateDuplicatePersonHierarchyRoles(current);
+    if (deduped.changed) {
+      current = deduped.row;
+      rowChanged = true;
+      duplicatePersonVacatedCount += deduped.vacatedColumns.length;
+    }
+
     return rowChanged ? current : row;
   });
 
@@ -4860,6 +4914,11 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
   if (selfReferenceVacatedCount > 0) {
     logDetail(
       `[enriched sync] [BigQuery insertAll] EXTENSION hierarchy roles vacated to NA (held by the row's own recruiter): ${selfReferenceVacatedCount}`
+    );
+  }
+  if (duplicatePersonVacatedCount > 0) {
+    logDetail(
+      `[enriched sync] [BigQuery insertAll] EXTENSION hierarchy roles vacated to NA (same person in a more senior column): ${duplicatePersonVacatedCount}`
     );
   }
 
@@ -4941,6 +5000,95 @@ function vacateSelfReferencedHierarchyRoles(row) {
     next[column] = HIERARCHY_ROLE_VACANT;
     next[empNoColumn] = null;
     vacatedColumns.push(column);
+  }
+
+  return { row: next, changed: vacatedColumns.length > 0, vacatedColumns };
+}
+
+/**
+ * Hierarchy columns ordered least -> most senior, for deciding which of two seats held by one
+ * person is the real one. NOT the same order as DEAL_RECRUITER_HIERARCHY_TARGETS, which groups
+ * related columns rather than ranking them (it lists ASSOCIATE_DELIVERY_DIRECTOR after
+ * DELIVERY_DIRECTOR, and SECONDARY_RECRUITER after ATL).
+ */
+const HIERARCHY_COLUMN_SENIORITY_ORDER = Object.freeze([
+  "SECONDARY_RECRUITER",
+  "ATL",
+  "TEAM_LEAD",
+  "RM",
+  "ASSOCIATE_AM",
+  "SECONDARY_AM",
+  "ACCOUNT_MANAGER",
+  "ASSOCIATE_DELIVERY_DIRECTOR",
+  "DELIVERY_DIRECTOR",
+  "AVP",
+  "VP",
+]);
+const HIERARCHY_COLUMN_SENIORITY_RANK = new Map(
+  HIERARCHY_COLUMN_SENIORITY_ORDER.map((col, index) => [col, index])
+);
+
+/** Seniority rank of a hierarchy column; -1 for anything unranked (never wins a tie). */
+function hierarchySeniorityRank(column) {
+  const rank = HIERARCHY_COLUMN_SENIORITY_RANK.get(column);
+  return rank == null ? -1 : rank;
+}
+
+/**
+ * Set to NA every DUPLICATE hierarchy field held by the same person (matched on emp-no), keeping
+ * only their most senior seat.
+ *
+ * One person, one designation per placement. The insert-time inherit tiers can each supply a
+ * hierarchy field independently, and they disagree whenever somebody was promoted between when the
+ * older source was written and now: the run-rate row still records the pre-promotion designation
+ * while the live directory already has the new one, so the same emp-no lands in BOTH columns.
+ *
+ * Live example (placement 1466750, Aug 2026): Mohit Arora was promoted from Associate Delivery
+ * Director to Delivery Director. Run-rate supplied ASSOCIATE_DELIVERY_DIRECTOR='Mohit Arora' and
+ * the directory supplied DELIVERY_DIRECTOR='Mohit Arora', so the row went in holding one person in
+ * two designations. The scheduled MOVE reconciliation (computeRecruiterHierarchyRoleChanges) later
+ * vacated the stale one, but only hours after the row was already visible — this applies the same
+ * rule at insert time so the row is never stored wrong in the first place.
+ *
+ * Seniority (HIERARCHY_COLUMN_SENIORITY_RANK) decides which seat is kept, matching what the MOVE
+ * reconciliation converges on: the promotion is the newer truth, so the higher role wins and the
+ * stale lower one is vacated.
+ *
+ * Emp-no only, deliberately: two different people can share a name, and vacating a real manager's
+ * seat is worse than leaving a duplicate for the scheduled scan to clean up. Rows whose emp-no is
+ * missing on one side are left alone.
+ */
+function vacateDuplicatePersonHierarchyRoles(row) {
+  const vacatedColumns = [];
+  if (!row || typeof row !== "object") return { row, changed: false, vacatedColumns };
+
+  // emp-no -> the most senior target this person currently occupies.
+  const mostSeniorByEmpNo = new Map();
+  for (const target of DEAL_RECRUITER_HIERARCHY_TARGETS) {
+    const heldName = normalizeHierarchyPersonName(row[target.column]);
+    if (heldName === "" || heldName === HIERARCHY_ROLE_VACANT.toLowerCase()) continue;
+    const empNo = normalizeHierarchyEmpNo(row[target.empNoColumn]);
+    if (empNo === "" || empNo === HIERARCHY_ROLE_VACANT) continue;
+    const incumbent = mostSeniorByEmpNo.get(empNo);
+    if (
+      incumbent == null ||
+      hierarchySeniorityRank(target.column) > hierarchySeniorityRank(incumbent)
+    ) {
+      mostSeniorByEmpNo.set(empNo, target.column);
+    }
+  }
+
+  let next = row;
+  for (const target of DEAL_RECRUITER_HIERARCHY_TARGETS) {
+    const empNo = normalizeHierarchyEmpNo(row[target.empNoColumn]);
+    if (empNo === "" || empNo === HIERARCHY_ROLE_VACANT) continue;
+    const keeper = mostSeniorByEmpNo.get(empNo);
+    if (keeper == null || keeper === target.column) continue;
+
+    if (next === row) next = { ...row };
+    next[target.column] = HIERARCHY_ROLE_VACANT;
+    next[target.empNoColumn] = null;
+    vacatedColumns.push(target.column);
   }
 
   return { row: next, changed: vacatedColumns.length > 0, vacatedColumns };
@@ -5224,6 +5372,7 @@ async function applyDealRecruiterHierarchyForInsertRows(rows, options = {}, deps
   const eligibleSet = new Set(eligible.map((row) => String(row.PLACEMENT_ID).trim()));
   let backfilledCount = 0;
   let selfReferenceVacatedCount = 0;
+  let duplicatePersonVacatedCount = 0;
 
   const out = rows.map((row) => {
     const key = String(row.PLACEMENT_ID).trim();
@@ -5239,10 +5388,21 @@ async function applyDealRecruiterHierarchyForInsertRows(rows, options = {}, deps
     // Same one-person-one-role rule the EXTENSION path applies. The directory snapshot is anchored on
     // NEW_HIRE_DATE, so a recruiter promoted since then can still be listed as their own manager in
     // it; that has to be vacated here rather than stored.
-    const vacated = vacateSelfReferencedHierarchyRoles(merged.row);
-    if (!vacated.changed) return merged.row;
-    selfReferenceVacatedCount += vacated.vacatedColumns.length;
-    return vacated.row;
+    let current = merged.row;
+    const vacated = vacateSelfReferencedHierarchyRoles(current);
+    if (vacated.changed) {
+      current = vacated.row;
+      selfReferenceVacatedCount += vacated.vacatedColumns.length;
+    }
+
+    // One person in two manager columns — see vacateDuplicatePersonHierarchyRoles. The directory
+    // chain alone can produce this when a stale hierarchy value is already on the row.
+    const deduped = vacateDuplicatePersonHierarchyRoles(current);
+    if (deduped.changed) {
+      current = deduped.row;
+      duplicatePersonVacatedCount += deduped.vacatedColumns.length;
+    }
+    return current;
   });
 
   if (hierarchyByPlacementId.size > 0) {
@@ -5253,6 +5413,11 @@ async function applyDealRecruiterHierarchyForInsertRows(rows, options = {}, deps
   if (selfReferenceVacatedCount > 0) {
     logDetail(
       `[enriched sync] [BigQuery insertAll] DEAL hierarchy roles vacated to NA (held by the row's own recruiter): ${selfReferenceVacatedCount}`
+    );
+  }
+  if (duplicatePersonVacatedCount > 0) {
+    logDetail(
+      `[enriched sync] [BigQuery insertAll] DEAL hierarchy roles vacated to NA (same person in a more senior column): ${duplicatePersonVacatedCount}`
     );
   }
 
@@ -7133,11 +7298,204 @@ function buildOwnershipChangeLogRows(latestRow, previousRow) {
  * previous owner ends START_DATE - 1); CHANGE_REASON_NOTES marks CONTRACT_CHAIN so the placement
  * date overwrite applies the chain rule to these rows instead of the tentative-based one.
  */
-function buildContractOwnershipChangeLogRows(latestRow, previousRow) {
+function buildContractOwnershipChangeLogRows(latestRow, previousRow, lastUpdatedIso) {
   if (!latestRow || !previousRow) return [];
-  const nowIso = new Date().toISOString();
+  // Callers that already know the deal row's own LAST_UPDATED pass it in, so the log row carries the
+  // SAME timestamp as the deal-sheet row that caused it (insert-time path). The scheduled scan omits
+  // it and falls back to scan time, as before.
+  const nowIso =
+    typeof lastUpdatedIso === "string" && lastUpdatedIso.trim() !== ""
+      ? lastUpdatedIso.trim()
+      : new Date().toISOString();
   const ctx = buildContractOwnershipChangeLogContext(latestRow, previousRow, nowIso);
   return buildOwnershipChangeLogRowsWithContext(latestRow, previousRow, ctx);
+}
+
+/**
+ * Latest row per placement for a specific set of CONTRACT_IDs (ownership scan columns).
+ * Scoped lookup — the table-wide equivalent is fetchLatestOwnershipRowsPerContractPlacement.
+ * @param {string[]} contractIds
+ * @returns {Promise<object[]>}
+ */
+async function fetchLatestOwnershipRowsForContractIds(contractIds, options = {}) {
+  if (!contractIds || contractIds.length === 0) return [];
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+
+  const uniq = [];
+  const seen = new Set();
+  for (const raw of contractIds) {
+    if (raw == null) continue;
+    const cid = String(raw).trim().toUpperCase();
+    if (cid === "" || seen.has(cid)) continue;
+    seen.add(cid);
+    uniq.push(cid);
+  }
+  if (uniq.length === 0) return [];
+
+  const unionParts = buildActiveChangeScanUnionParts(datasetId);
+  const out = [];
+  const chunkSize = 500;
+  for (let i = 0; i < uniq.length; i += chunkSize) {
+    const chunk = uniq.slice(i, i + chunkSize);
+    const inList = chunk.map((v) => `'${escapeSqlString(v)}'`).join(", ");
+    const sql = `WITH all_rows AS (
+                   ${unionParts.join("\n                   UNION ALL\n                   ")}
+                 ),
+                 ranked AS (
+                   SELECT
+                     *,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY UPPER(TRIM(CAST(CONTRACT_ID AS STRING))), CAST(PLACEMENT_ID AS STRING)
+                       ORDER BY LAST_UPDATED DESC NULLS LAST
+                     ) AS rn
+                   FROM all_rows
+                   WHERE CONTRACT_ID IS NOT NULL AND TRIM(CAST(CONTRACT_ID AS STRING)) != ''
+                     AND PLACEMENT_ID IS NOT NULL
+                     AND UPPER(TRIM(CAST(CONTRACT_ID AS STRING))) IN (${inList})
+                 )
+                 SELECT * EXCEPT(rn) FROM ranked WHERE rn = 1`;
+    const rows = await queryObjects(sql, 100000);
+    for (const raw of rows) out.push(stripRateChangeHistoryMetaFields(raw));
+  }
+  return out;
+}
+
+/**
+ * Build CONTRACT_CHAIN ownership log rows for rows that were JUST inserted, without waiting for the
+ * next scheduled scan.
+ *
+ * Why this exists: the scheduled ownership scan runs once at the END of a trigger run and reads the
+ * deal-sheet tables with SQL. A new extension inserted on a late submittal page (or on a run that
+ * stops at max_pages) is not part of that scan's pair set, so its handover row only appears on a
+ * LATER run — hours after the deal itself is visible to users. In that window the deal sheet shows
+ * an extension whose ownership_change_logs entry does not exist yet, which reads as a data bug.
+ *
+ * The fix is to build the pair from the row we already hold in memory: the freshly-inserted row is
+ * the chain's NEW segment, and its PREVIOUS segment is read back per CONTRACT_ID (a scoped lookup,
+ * not a table-wide scan). The in-memory row also supplies LAST_UPDATED, so the log row carries the
+ * same timestamp as the deal row that caused it.
+ *
+ * Safe to run alongside the scheduled scan: insertOwnershipChangeLogBatch dedupes on
+ * (placement, role, new owner, previous owner), so whichever path runs second inserts nothing.
+ *
+ * @param {object[]} insertedRows - fully-derived rows exactly as written (insertResult.finalRows)
+ * @returns {Promise<{built:number, inserted:number, contractIds:number, errorBatches:number}>}
+ */
+async function insertContractChainOwnershipLogsForInsertedRows(insertedRows, options = {}, deps = {}) {
+  // Injected in tests so the pairing/stamping logic can be exercised without BigQuery.
+  const fetchStoredRows =
+    typeof deps.fetchLatestOwnershipRowsForContractIds === "function"
+      ? deps.fetchLatestOwnershipRowsForContractIds
+      : fetchLatestOwnershipRowsForContractIds;
+  const insertLogBatch =
+    typeof deps.insertOwnershipChangeLogBatch === "function"
+      ? deps.insertOwnershipChangeLogBatch
+      : insertOwnershipChangeLogBatch;
+
+  const empty = { built: 0, inserted: 0, contractIds: 0, errorBatches: 0 };
+  if (!insertedRows || insertedRows.length === 0) return empty;
+
+  // Only rows that can actually form a chain segment: both a CONTRACT_ID and a PLACEMENT_ID.
+  const newRowsByContract = new Map();
+  for (const row of insertedRows) {
+    const cid = row?.CONTRACT_ID == null ? "" : String(row.CONTRACT_ID).trim().toUpperCase();
+    const pid = row?.PLACEMENT_ID == null ? "" : String(row.PLACEMENT_ID).trim();
+    if (cid === "" || pid === "") continue;
+    if (!newRowsByContract.has(cid)) newRowsByContract.set(cid, []);
+    newRowsByContract.get(cid).push(row);
+  }
+  if (newRowsByContract.size === 0) return empty;
+
+  const contractIds = [...newRowsByContract.keys()];
+  const storedRows = await fetchStoredRows(contractIds, {
+    datasetId: options.dealSheetDatasetId,
+  });
+
+  // Stored rows win over the in-memory copy of the SAME placement (the stored row went through the
+  // same derivation and may already carry a later append), so seed the map with stored rows first
+  // and only add an in-memory row when its placement is not there yet.
+  const rowsByContract = new Map();
+  const seenPlacementByContract = new Map();
+  for (const row of storedRows) {
+    const cid = row?.CONTRACT_ID == null ? "" : String(row.CONTRACT_ID).trim().toUpperCase();
+    const pid = row?.PLACEMENT_ID == null ? "" : String(row.PLACEMENT_ID).trim();
+    if (cid === "" || pid === "") continue;
+    if (!rowsByContract.has(cid)) {
+      rowsByContract.set(cid, []);
+      seenPlacementByContract.set(cid, new Set());
+    }
+    rowsByContract.get(cid).push(row);
+    seenPlacementByContract.get(cid).add(pid);
+  }
+
+  const lastUpdatedByPlacement = new Map();
+  for (const [cid, rows] of newRowsByContract) {
+    if (!rowsByContract.has(cid)) {
+      rowsByContract.set(cid, []);
+      seenPlacementByContract.set(cid, new Set());
+    }
+    const seenPids = seenPlacementByContract.get(cid);
+    for (const row of rows) {
+      const pid = String(row.PLACEMENT_ID).trim();
+      // The deal row's own LAST_UPDATED, so the log row is stamped with the same instant.
+      const lu = row?.LAST_UPDATED;
+      const luStr = lu == null ? "" : String(lu.value ?? lu).trim();
+      if (luStr !== "") lastUpdatedByPlacement.set(`${cid}|${pid}`, luStr);
+      if (seenPids.has(pid)) continue;
+      seenPids.add(pid);
+      rowsByContract.get(cid).push(row);
+    }
+  }
+
+  const allRows = [];
+  for (const rows of rowsByContract.values()) allRows.push(...rows);
+
+  const pairs = buildConsecutiveContractPlacementPairs(allRows, ownershipChangeRolesDiffer);
+  if (pairs.size === 0) {
+    logDetail(
+      `[ownership change logs] insert-time contract chain: contracts=${contractIds.length} pairs=0 (no ownership diff)`
+    );
+    return { ...empty, contractIds: contractIds.length };
+  }
+
+  // Only pairs whose NEW segment is one of the rows we just inserted — an older pair on the same
+  // contract is the scheduled scan's job and may already be logged.
+  const insertedPlacementKeys = new Set();
+  for (const [cid, rows] of newRowsByContract) {
+    for (const row of rows) insertedPlacementKeys.add(`${cid}|${String(row.PLACEMENT_ID).trim()}`);
+  }
+
+  const logRows = [];
+  for (const { latest, previous } of pairs.values()) {
+    const cid = String(latest.CONTRACT_ID).trim().toUpperCase();
+    const key = `${cid}|${String(latest.PLACEMENT_ID).trim()}`;
+    if (!insertedPlacementKeys.has(key)) continue;
+    logRows.push(...buildContractOwnershipChangeLogRows(latest, previous, lastUpdatedByPlacement.get(key)));
+  }
+
+  if (logRows.length === 0) {
+    logDetail(
+      `[ownership change logs] insert-time contract chain: contracts=${contractIds.length} pairs=${pairs.size} builtRows=0`
+    );
+    return { ...empty, contractIds: contractIds.length };
+  }
+
+  const result = await insertLogBatch(logRows, 0, {
+    datasetId: options.logDatasetId,
+    tableId: options.logTableId,
+  });
+  logDetail(
+    `[ownership change logs] insert-time contract chain: contracts=${contractIds.length} pairs=${pairs.size} builtRows=${logRows.length} inserted=${result.inserted}`
+  );
+  return {
+    built: logRows.length,
+    inserted: result.inserted,
+    contractIds: contractIds.length,
+    errorBatches: result.errorBatches,
+  };
 }
 
 /**
@@ -7969,6 +8327,9 @@ module.exports = {
   EXTENSION_RUNRATE_HIERARCHY_COLUMNS,
   EXTENSION_RUNRATE_MANUAL_COLUMNS,
   RUNRATE_HIERARCHY_MISSING_COLUMNS_BY_TABLE,
+  ACTIVE_CHANGE_SCAN_MISSING_COLUMNS_BY_TABLE,
+  buildActiveChangeScanColumnList,
+  buildActiveChangeScanUnionParts,
   RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE,
   RUNRATE_MANUAL_MISSING_COLUMNS_BY_TABLE,
   resolveExtensionRunrateHierarchyColumns,
@@ -8015,8 +8376,11 @@ module.exports = {
   fetchContractOwnershipChangePairsFromActive,
   fetchContractSegmentRateChangePairsFromActive,
   buildRecruiterHandoverOwnershipLogRows,
+  vacateDuplicatePersonHierarchyRoles,
   buildOwnershipChangeLogRows,
   buildContractOwnershipChangeLogRows,
+  fetchLatestOwnershipRowsForContractIds,
+  insertContractChainOwnershipLogsForInsertedRows,
   buildConsecutiveContractPlacementPairs,
   ownershipChangeRolesDiffer,
   contractSegmentRateFieldsDiffer,

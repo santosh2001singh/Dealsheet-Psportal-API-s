@@ -5,10 +5,16 @@ const {
   legacyDealManualColumns,
   RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE,
   RUNRATE_MANUAL_MISSING_COLUMNS_BY_TABLE,
+  resolveExtensionRunrateHierarchyColumns,
+  RUNRATE_HIERARCHY_MISSING_COLUMNS_BY_TABLE,
+  buildActiveChangeScanColumnList,
+  buildActiveChangeScanUnionParts,
+  ACTIVE_CHANGE_SCAN_MISSING_COLUMNS_BY_TABLE,
 } = require("./bigQueryClient");
 const {
   applyCanadaDefaultEntity,
   CANADA_DEFAULT_ENTITY,
+  sanitizeCanadaDealSheetRow,
 } = require("./canadaDerivedPlacementFields");
 const { resolveRunrateTableIdForDealSheetTable } = require("./recruiterDomainTables");
 
@@ -97,7 +103,7 @@ test("the canada list has no duplicates", () => {
   assert.equal(new Set(cols).size, cols.length);
 });
 
-test("only the canada run-rate table has overrides registered", () => {
+test("only the canada run-rate table has manual-column overrides registered", () => {
   assert.deepEqual([...RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE.keys()], [CANADA_RUNRATE]);
   assert.deepEqual([...RUNRATE_MANUAL_MISSING_COLUMNS_BY_TABLE.keys()], [CANADA_RUNRATE]);
 });
@@ -149,12 +155,6 @@ test("the ENTITY default tolerates junk input", () => {
 // is that Canada has no AVP role — the chain tops out at VP / Sr. VP.
 // --------------------------------------------------------------------------
 
-const {
-  resolveExtensionRunrateHierarchyColumns,
-  RUNRATE_HIERARCHY_MISSING_COLUMNS_BY_TABLE,
-} = require("./bigQueryClient");
-const { sanitizeCanadaDealSheetRow } = require("./canadaDerivedPlacementFields");
-
 test("canada's extension hierarchy select omits AVP", () => {
   // all_Health_Canada_Deal_sheet_data has no AVP column, so naming it would fail the query with
   // "Unrecognized name: AVP".
@@ -202,4 +202,60 @@ test("a canada row never reaches BigQuery carrying AVP", () => {
   assert.equal(out.VP_EMP_NO, "E9");
   assert.equal(out.TEAM_LEAD, "TL");
   assert.equal(out.DELIVERY_DIRECTOR, "DD");
+});
+
+// --------------------------------------------------------------------------
+// The cross-domain audit scan must survive Canada's dropped AVP.
+//
+// fetchDealSheetRecruiterChangePairsFromActive / the ownership + inorganic log scans UNION ALL all
+// three active deal sheet tables. Dropping AVP from the canada tables broke that union with
+// "Unrecognized name: AVP" — and because the cynet health trigger is what runs the scan, the
+// failure surfaced on HEALTH. Canada selects NULL for the column instead, keeping the union shapes
+// aligned and health's own branch byte-identical.
+// --------------------------------------------------------------------------
+
+test("health and locums select AVP as a real column in the change scan", () => {
+  for (const t of ["cynet_health_deal_sheet", "cynet_locums_deal_sheet"]) {
+    const list = buildActiveChangeScanColumnList(t);
+    assert.ok(list.includes("AVP"), t);
+    assert.ok(!list.includes("CAST(NULL AS STRING) AS AVP"), `${t} must not null out AVP`);
+  }
+});
+
+test("canada selects NULL for AVP and AVP_EMP_NO in the change scan", () => {
+  for (const t of ["cynet_health_canada_deal_sheet", "cynet_health_canada_ended_deal_sheet"]) {
+    const list = buildActiveChangeScanColumnList(t);
+    assert.ok(list.includes("CAST(NULL AS STRING) AS AVP"), t);
+    assert.ok(list.includes("CAST(NULL AS STRING) AS AVP_EMP_NO"), t);
+  }
+});
+
+test("every change-scan union branch has the same column count", () => {
+  // A UNION ALL rejects branches of differing width, so this is the invariant that actually matters.
+  const parts = buildActiveChangeScanUnionParts("rr_project_data");
+  assert.equal(parts.length, 3);
+  const widths = parts.map((p) => {
+    const select = p.slice("SELECT ".length, p.indexOf(" FROM "));
+    // No commas occur inside CAST(NULL AS STRING), so a plain split is safe here.
+    return select.split(",").length;
+  });
+  assert.equal(new Set(widths).size, 1, `branch widths differ: ${widths.join(" / ")}`);
+});
+
+test("the canada branch keeps AVP in the same ordinal position", () => {
+  const health = buildActiveChangeScanColumnList("cynet_health_deal_sheet")
+    .split(",").map((s) => s.trim());
+  const canada = buildActiveChangeScanColumnList("cynet_health_canada_deal_sheet")
+    .split(",").map((s) => s.trim());
+  assert.equal(health.length, canada.length);
+  const i = health.indexOf("AVP");
+  assert.ok(i >= 0);
+  assert.equal(canada[i], "CAST(NULL AS STRING) AS AVP", "AVP must stay in place, aliased");
+});
+
+test("only the canada tables are registered as missing scan columns", () => {
+  assert.deepEqual(
+    [...ACTIVE_CHANGE_SCAN_MISSING_COLUMNS_BY_TABLE.keys()].sort(),
+    ["cynet_health_canada_deal_sheet", "cynet_health_canada_ended_deal_sheet"]
+  );
 });
