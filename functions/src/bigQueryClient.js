@@ -26,6 +26,92 @@ const {
 } = require("./columnMappings");
 const { isCynetHealthCanadaRecruiter, isCanadaDealSheetRow, sanitizeCanadaDealSheetRow, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
 const { isCynetLocumsRecruiter, sanitizeLocumsDealSheetRow, LOCUMS_EXCLUDED_API_OWNED_COLUMNS } = require("./locumsDerivedPlacementFields");
+
+/**
+ * While Cynet Health Canada is being validated, no log table should accumulate rows keyed on its
+ * placements — the deal sheet is deleted and re-synced repeatedly, so those log rows would only have
+ * to be cleaned up again (see sql/cleanup_canada_test_rows.sql).
+ *
+ * This gates the insert-time contract-chain ownership logs, which run inside insertAll and are
+ * therefore reached by EVERY insert path (scheduled trigger, manual HTTP, refresh endpoint). The
+ * companion switches live in index.js (SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS, for the table-wide
+ * scans) and syncService.js (ENRICH_LOG_WRITES_DISABLED_DOMAINS, for the per-row enrich logs).
+ *
+ * Set to false once Canada's data is trusted; cynet health and locums are unaffected either way.
+ */
+const LOG_WRITES_DISABLED_FOR_CANADA = true;
+
+/**
+ * Deal sheet tables left OUT of the ch_rate_change_logs scan.
+ *
+ * rateChangeLogSyncTrigger is a SEPARATE scheduled function from the per-domain deal sheet triggers,
+ * so the domain gates in index.js do not reach it — it scans every active table on its own schedule.
+ * Canada is excluded here for the same reason its other log writes are off: its rows are deleted and
+ * re-synced repeatedly while the domain is validated.
+ *
+ * Empty this set (or remove the option at the call sites) to let canada back in.
+ */
+const RATE_CHANGE_LOG_EXCLUDED_TABLE_IDS = LOG_WRITES_DISABLED_FOR_CANADA
+  ? new Set(["cynet_health_canada_deal_sheet", "cynet_health_canada_ended_deal_sheet"])
+  : new Set();
+
+/**
+ * Columns each DEAL SHEET table does not have — the single source of truth for every query that
+ * names columns against one of them.
+ *
+ * Cynet Health Canada dropped these in Aug 2026 (see sql/migrate_canada_deal_sheet_schema.sql):
+ * it has no AVP role (the chain tops out at VP / Sr. VP), no 52-week tenure tracking, and no
+ * Conrep client name. Any SQL that hardcodes one of them against the Canada tables fails the whole
+ * run with "Unrecognized name: <col>".
+ *
+ * ALWAYS consult this map when writing a query that names deal-sheet columns and can run against
+ * more than one domain table. Cynet health and locums are absent from it and keep every column.
+ */
+const DEAL_SHEET_MISSING_COLUMNS_BY_TABLE = new Map([
+  [
+    "cynet_health_canada_deal_sheet",
+    new Set([
+      "AVP",
+      "AVP_EMP_NO",
+      "FIFTYTWO_TENURE_RTO_LASTDATE",
+      "FIFTYTWO_TENURE_CANDIDATE_STATUS",
+      "CLIENT_NAME_IN_CONREP",
+    ]),
+  ],
+  [
+    "cynet_health_canada_ended_deal_sheet",
+    new Set([
+      "AVP",
+      "AVP_EMP_NO",
+      "FIFTYTWO_TENURE_RTO_LASTDATE",
+      "FIFTYTWO_TENURE_CANDIDATE_STATUS",
+      "CLIENT_NAME_IN_CONREP",
+    ]),
+  ],
+]);
+
+/**
+ * Columns the given deal sheet table does not have.
+ *
+ * Pass the tableId a query runs against; with no tableId the query spans every active table, so the
+ * union of all tables' missing columns is returned (only columns common to all are safe to name).
+ *
+ * EVERY query that names deal-sheet columns and can run against more than one domain table must
+ * filter through this — see canadaSchemaGapGuard.test.js.
+ *
+ * @param {string} [tableId]
+ * @returns {Set<string>}
+ */
+function resolveDealSheetMissingColumns(tableId) {
+  const key = tableId == null ? "" : String(tableId).trim();
+  if (key) return DEAL_SHEET_MISSING_COLUMNS_BY_TABLE.get(key) ?? new Set();
+  const all = new Set();
+  for (const set of DEAL_SHEET_MISSING_COLUMNS_BY_TABLE.values()) {
+    for (const col of set) all.add(col);
+  }
+  return all;
+}
+
 // CONTRACT_ID allocation lives entirely in contractIdResolver.js (DEAL rows only) — this module
 // only ever reuses an existing id, so it needs neither the sequence nor its options builder.
 const { normalizeContractIdOrNull } = require("./contractIdFormat");
@@ -93,10 +179,15 @@ function escapeSqlString(value) {
 }
 
 /**
- * Run a BigQuery query and return results as objects
+ * Run a BigQuery query and return results as objects.
+ *
+ * maxResults is a PAGE size, not a total row cap, and bigquery.query() resolves with only the FIRST
+ * page — so an under-sized value silently drops every row past it. Omit it (the default) to let the
+ * client fetch the complete result set; pass a value only when a genuine cap is wanted.
  */
-async function queryObjects(sql, maxResults = 1000) {
-  const options = { query: sql, maxResults };
+async function queryObjects(sql, maxResults) {
+  const options = { query: sql };
+  if (Number.isFinite(maxResults) && maxResults > 0) options.maxResults = maxResults;
   const [rows] = await bigquery.query(options);
   return rows;
 }
@@ -368,8 +459,17 @@ function stripRateChangeHistoryMetaFields(row) {
  * @param {string} [whereClause] optional predicate appended per branch (e.g. "CONTRACT_ID IS NOT NULL")
  * @returns {Promise<string[]>}
  */
-async function buildActiveDealSheetSchemaSafeUnionParts(datasetId, whereClause = "") {
-  const inList = ACTIVE_DEAL_SHEET_TABLE_IDS.map((t) => `'${escapeSqlString(t)}'`).join(", ");
+async function buildActiveDealSheetSchemaSafeUnionParts(datasetId, whereClause = "", options = {}) {
+  // Callers can leave a domain's table out entirely (rate-change logs do this for canada while that
+  // domain is being validated). Defaults to all three tables, so existing callers are unaffected.
+  const excluded =
+    options.excludeTableIds instanceof Set
+      ? options.excludeTableIds
+      : new Set(Array.isArray(options.excludeTableIds) ? options.excludeTableIds : []);
+  const tableIds = ACTIVE_DEAL_SHEET_TABLE_IDS.filter((t) => !excluded.has(t));
+  if (tableIds.length === 0) return [];
+
+  const inList = tableIds.map((t) => `'${escapeSqlString(t)}'`).join(", ");
   const metaSql = `SELECT table_name, column_name, data_type, ordinal_position
                    FROM \`${config.projectId}.${datasetId}.INFORMATION_SCHEMA.COLUMNS\`
                    WHERE table_name IN (${inList})`;
@@ -378,14 +478,14 @@ async function buildActiveDealSheetSchemaSafeUnionParts(datasetId, whereClause =
   const colsByTable = new Map();
   const typeByCol = new Map();
   const healthOrdinal = new Map();
-  for (const t of ACTIVE_DEAL_SHEET_TABLE_IDS) colsByTable.set(t, new Set());
+  for (const t of tableIds) colsByTable.set(t, new Set());
   for (const r of metaRows) {
     const t = r?.table_name;
     const c = r?.column_name;
     if (t == null || c == null || !colsByTable.has(t)) continue;
     colsByTable.get(t).add(c);
     if (!typeByCol.has(c)) typeByCol.set(c, String(r.data_type || "STRING"));
-    if (t === ACTIVE_DEAL_SHEET_TABLE_IDS[0]) healthOrdinal.set(c, Number(r.ordinal_position));
+    if (t === tableIds[0]) healthOrdinal.set(c, Number(r.ordinal_position));
   }
 
   const orderedCols = [...typeByCol.keys()].sort((a, b) => {
@@ -396,7 +496,7 @@ async function buildActiveDealSheetSchemaSafeUnionParts(datasetId, whereClause =
   });
 
   const where = whereClause && whereClause.trim() !== "" ? ` WHERE ${whereClause}` : "";
-  return ACTIVE_DEAL_SHEET_TABLE_IDS.map((t) => {
+  return tableIds.map((t) => {
     const have = colsByTable.get(t);
     const proj = orderedCols.map((c) =>
       have.has(c) ? `\`${c}\`` : `CAST(NULL AS ${typeByCol.get(c)}) AS \`${c}\``
@@ -417,7 +517,13 @@ async function fetchContractRateChangePairsFromActive(options = {}) {
   // `SELECT *` UNION ALL fails with a column-count mismatch. Build a schema-safe union: project the
   // SUPERSET of columns (health ordinal order), and for any column a given table lacks, emit a typed
   // NULL so every UNION branch has identical columns. Robust to future per-table schema drift.
-  const unionParts = await buildActiveDealSheetSchemaSafeUnionParts(datasetId, "CONTRACT_ID IS NOT NULL");
+  const unionParts = await buildActiveDealSheetSchemaSafeUnionParts(
+    datasetId,
+    "CONTRACT_ID IS NOT NULL",
+    // Canada is excluded while it is being validated — no ch_rate_change_logs row should be
+    // keyed on a placement that is about to be deleted and re-synced.
+    { excludeTableIds: RATE_CHANGE_LOG_EXCLUDED_TABLE_IDS }
+  );
 
   const sql = `WITH all_rows AS (
                  ${unionParts.join("\n                 UNION ALL\n                 ")}
@@ -608,7 +714,10 @@ async function fetchLatestAdditionalCostLogRowsByKeys(logRows, options = {}) {
                    WHERE ${wherePairs}
                  )
                  WHERE _rn = 1`;
-    const dbRows = await queryObjects(sql, chunk.length * 2);
+    // No maxResults cap: the query is already ROW_NUMBER()-filtered to _rn = 1, so it returns at
+    // most one row per key. A cap here can only truncate the baseline set, and a missing baseline
+    // makes the append-on-change gate treat an existing placement as new and re-append it.
+    const dbRows = await queryObjects(sql);
     for (const row of dbRows) {
       const key = buildAdditionalCostLogCompositeKey(
         row?.DEAL_SHEET_ID,
@@ -674,7 +783,10 @@ async function fetchLatestTerminationReasonLogRowsByKeys(logRows, options = {}) 
                    WHERE ${wherePairs}
                  )
                  WHERE _rn = 1`;
-    const dbRows = await queryObjects(sql, chunk.length * 2);
+    // No maxResults cap: the query is already ROW_NUMBER()-filtered to _rn = 1, so it returns at
+    // most one row per key. A cap here can only truncate the baseline set, and a missing baseline
+    // makes the append-on-change gate treat an existing placement as new and re-append it.
+    const dbRows = await queryObjects(sql);
     for (const row of dbRows) {
       const key = buildTerminationReasonLogCompositeKey(row?.PLACEMENT_ID, row?.TERMINATION_DETAIL_ID);
       if (!key) continue;
@@ -724,7 +836,10 @@ async function fetchLatestRowsByDealSheetPlacementPairs(rows, options = {}) {
                    WHERE ${wherePairs}
                  )
                  WHERE _rn = 1`;
-    const dbRows = await queryObjects(sql, chunk.length * 2);
+    // No maxResults cap: the query is already ROW_NUMBER()-filtered to _rn = 1, so it returns at
+    // most one row per key. A cap here can only truncate the baseline set, and a missing baseline
+    // makes the append-on-change gate treat an existing placement as new and re-append it.
+    const dbRows = await queryObjects(sql);
     for (const row of dbRows) {
       const key = buildDealSheetPlacementCompositeKey(row?.DEAL_SHEET_ID, row?.PLACEMENT_ID);
       if (!key) continue;
@@ -2032,10 +2147,22 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
   // once at the end of a trigger and would otherwise leave a new extension's handover row missing
   // until a later run — a visible gap where the deal exists but its ownership log does not. Non-fatal
   // and idempotent (the log batch dedupes), so the scheduled scan stays as the safety net.
+  //
+  // Canada rows are excluded while that domain is being validated: its deal sheet is deleted and
+  // re-synced repeatedly, and each run would otherwise seed ownership_change_logs rows keyed on
+  // placements that are about to disappear. Filtered on the ROWS (CLIENT_STATE province), not on a
+  // caller flag, so no insert path can miss the gate. See LOG_WRITES_DISABLED_FOR_CANADA.
   let contractChainOwnershipLog = null;
-  if (options.skipInsertTimeContractChainOwnershipLogs !== true && result.inserted > 0) {
+  const ownershipLogRows = LOG_WRITES_DISABLED_FOR_CANADA
+    ? rowsToInsert.filter((row) => !isCanadaDealSheetRow(row))
+    : rowsToInsert;
+  if (
+    options.skipInsertTimeContractChainOwnershipLogs !== true &&
+    result.inserted > 0 &&
+    ownershipLogRows.length > 0
+  ) {
     try {
-      contractChainOwnershipLog = await insertContractChainOwnershipLogsForInsertedRows(rowsToInsert, {
+      contractChainOwnershipLog = await insertContractChainOwnershipLogsForInsertedRows(ownershipLogRows, {
         dealSheetDatasetId: options.datasetId,
       });
     } catch (ownErr) {
@@ -2781,10 +2908,7 @@ Object.freeze(ACTIVE_CHANGE_SCAN_COLUMNS);
  * "Unrecognized name: AVP". Such a column is selected as NULL for that table instead of being
  * omitted, because a UNION ALL needs every branch to have the same shape in the same order.
  */
-const ACTIVE_CHANGE_SCAN_MISSING_COLUMNS_BY_TABLE = new Map([
-  ["cynet_health_canada_deal_sheet", new Set(["AVP", "AVP_EMP_NO"])],
-  ["cynet_health_canada_ended_deal_sheet", new Set(["AVP", "AVP_EMP_NO"])],
-]);
+const ACTIVE_CHANGE_SCAN_MISSING_COLUMNS_BY_TABLE = DEAL_SHEET_MISSING_COLUMNS_BY_TABLE;
 
 /** `col` or `CAST(NULL AS STRING) AS col` per table, so every UNION branch lines up. */
 function buildActiveChangeScanColumnList(tableId) {
@@ -2822,7 +2946,10 @@ async function fetchContractIdsByDealSheetIds(dealSheetIds, options = {}) {
     typeof options.datasetId === "string" && options.datasetId.trim() !== ""
       ? options.datasetId.trim()
       : config.datasetId;
-  const unionSql = buildActiveDealSheetsUnionSql(datasetId);
+  // LAST_UPDATED is NOT in ACTIVE_DEAL_SHEET_UNION_BASE_COLUMNS, but the ranking below orders by it,
+  // so it has to be requested explicitly — otherwise the inner union never projects it and the query
+  // fails with "Unrecognized name: LAST_UPDATED".
+  const unionSql = buildActiveDealSheetsUnionSql(datasetId, undefined, ["LAST_UPDATED"]);
 
   const uniq = [];
   const seen = new Set();
@@ -3700,7 +3827,7 @@ const RUNRATE_HIERARCHY_MISSING_COLUMNS_BY_TABLE = new Map([
   // Cynet Health Canada has no AVP role — the hierarchy tops out at VP / Sr. VP — so neither the
   // Canada run-rate table nor the Canada deal sheet tables carry AVP / AVP_EMP_NO. Selecting it
   // would fail the extension backfill query with "Unrecognized name: AVP".
-  ["all_Health_Canada_Deal_sheet_data", new Set(["AVP"])],
+  ["all_Health_Canada_data_Runrate", new Set(["AVP"])],
 ]);
 
 /**
@@ -3712,7 +3839,7 @@ const RUNRATE_HIERARCHY_MISSING_COLUMNS_BY_TABLE = new Map([
  * in EXTENSION_RUNRATE_MANUAL_COLUMNS would break the health SELECT with "Unrecognized name".
  * Keeping them here leaves cynet health's behaviour byte-identical.
  *
- * Verified on live data (all_Health_Canada_Deal_sheet_data, 618 rows):
+ * Verified on live data (all_Health_Canada_data_Runrate, 620 rows):
  *   CLIENT_AVERAGING_AGREEMENT     301 populated
  *   CANDIDATE_AVERAGING_AGREEMENT  301
  *   NO_OF_TIME_EXTENSION_RECEIVED  116
@@ -3723,7 +3850,7 @@ const RUNRATE_HIERARCHY_MISSING_COLUMNS_BY_TABLE = new Map([
  */
 const RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE = new Map([
   [
-    "all_Health_Canada_Deal_sheet_data",
+    "all_Health_Canada_data_Runrate",
     Object.freeze([
       "CLIENT_AVERAGING_AGREEMENT",
       "CANDIDATE_AVERAGING_AGREEMENT",
@@ -3738,13 +3865,13 @@ const RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE = new Map([
  * Manual columns a specific run-rate table does NOT have, so they must be left out of its SELECT.
  *
  * Same idea as RUNRATE_HIERARCHY_MISSING_COLUMNS_BY_TABLE but for the manual/ops list. Confirmed
- * against all_Health_Canada_Deal_sheet_data's schema: these three are the only members of
+ * against all_Health_Canada_data_Runrate's schema: these three are the only members of
  * EXTENSION_RUNRATE_MANUAL_COLUMNS it lacks, and all three are also columns Canada dropped from its
  * own deal sheet tables, so there is nothing to carry either way.
  */
 const RUNRATE_MANUAL_MISSING_COLUMNS_BY_TABLE = new Map([
   [
-    "all_Health_Canada_Deal_sheet_data",
+    "all_Health_Canada_data_Runrate",
     new Set([
       "CLIENT_NAME_IN_CONREP",
       "FIFTYTWO_TENURE_RTO_LASTDATE",
@@ -3874,6 +4001,33 @@ const EXTENSION_PARENT_DEAL_INHERIT_COLUMNS = [
   "SKU_NUMBER",
 ];
 Object.freeze(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS);
+
+/**
+ * Parent-DEAL inherit columns a specific deal sheet table does not have.
+ *
+ * The cynet health canada tables dropped these three (Aug 2026), so selecting them off a Canada
+ * parent DEAL row failed the extension-inherit query with "Unrecognized name:
+ * FIFTYTWO_TENURE_RTO_LASTDATE". Unlike the change-scan union, these queries run against ONE table
+ * at a time, so the column is simply left out rather than selected as NULL.
+ *
+ * cynet health and locums are absent from this map and keep the full 61-column list.
+ */
+const PARENT_DEAL_INHERIT_MISSING_COLUMNS_BY_TABLE = DEAL_SHEET_MISSING_COLUMNS_BY_TABLE;
+
+/**
+ * Parent-DEAL inherit columns that actually exist on `tableId`, safe to name in a SELECT.
+ *
+ * With no tableId the query spans every active table, so only columns common to all of them are
+ * safe — the Canada-missing three are dropped in that case too.
+ *
+ * @param {string} [tableId]
+ * @returns {string[]}
+ */
+function resolveExtensionParentDealInheritColumns(tableId) {
+  const missing = resolveDealSheetMissingColumns(tableId);
+  if (missing.size === 0) return EXTENSION_PARENT_DEAL_INHERIT_COLUMNS;
+  return EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.filter((col) => !missing.has(col));
+}
 
 function runrateAliasForColumn(col) {
   return `runrate_${col.toLowerCase()}`;
@@ -4038,19 +4192,22 @@ async function fetchExtensionParentDealInheritByPlacementId(rows, options = {}) 
   // The inner union must project the hierarchy columns this query reads (NEW_HIRE_DATE + the
   // EXTENSION_PARENT_DEAL_INHERIT_COLUMNS) plus LAST_UPDATED for the latest-append tiebreaker;
   // the base union column set does not include them.
+  // Canada dropped three of these columns, so the list is resolved per table before it reaches the
+  // SQL (see PARENT_DEAL_INHERIT_MISSING_COLUMNS_BY_TABLE). Health/locums get the full list.
+  const inheritColumns = resolveExtensionParentDealInheritColumns(tableId);
   const unionSql = buildActiveDealSheetsUnionSql(
     datasetId,
     tableId || undefined,
-    [...EXTENSION_PARENT_DEAL_INHERIT_COLUMNS, "LAST_UPDATED"]
+    [...inheritColumns, "LAST_UPDATED"]
   );
 
-  const parentDealSelectColumns = EXTENSION_PARENT_DEAL_INHERIT_COLUMNS
+  const parentDealSelectColumns = inheritColumns
     .map((col) => `          ${col}`)
     .join(",\n");
-  const parentDealJoinedSelect = EXTENSION_PARENT_DEAL_INHERIT_COLUMNS
+  const parentDealJoinedSelect = inheritColumns
     .map((col) => `          d.${col}`)
     .join(",\n");
-  const parentDealOuterSelect = EXTENSION_PARENT_DEAL_INHERIT_COLUMNS
+  const parentDealOuterSelect = inheritColumns
     .map((col) => `        ${col}`)
     .join(",\n");
 
@@ -4117,7 +4274,8 @@ ${parentDealOuterSelect}
     `;
 
     const bqRows = await queryObjects(sql, structLiterals.length);
-    const parentFields = ["INITIAL_START_DATE", ...EXTENSION_PARENT_DEAL_INHERIT_COLUMNS];
+    // Same per-table list the SELECT used, or a column the query never projected reads as undefined.
+    const parentFields = ["INITIAL_START_DATE", ...inheritColumns];
 
     for (const bqRow of bqRows) {
       const pid = bqRow?.placement_id;
@@ -4126,7 +4284,7 @@ ${parentDealOuterSelect}
       const entry = {
         INITIAL_START_DATE: normalizeExtensionRunrateBackfillValue(bqRow?.proposed_original_start_date),
       };
-      for (const col of EXTENSION_PARENT_DEAL_INHERIT_COLUMNS) {
+      for (const col of inheritColumns) {
         entry[col] = normalizeExtensionRunrateBackfillValue(bqRow?.[col]);
       }
       if (!extensionBackfillEntryHasValues(entry, parentFields)) continue;
@@ -4179,7 +4337,14 @@ async function fetchExtensionPriorExtensionInheritByPlacementId(rows, options = 
   const priorManualExtraColumns = EXTENSION_RUNRATE_MANUAL_COLUMNS.filter(
     (col) => !DEAL_RECRUITER_HIERARCHY_FIELDS.includes(col)
   );
-  const priorLatestFields = [...DEAL_RECRUITER_HIERARCHY_FIELDS, ...priorManualExtraColumns];
+  // Filter to columns THIS deal sheet table actually has. Canada has no AVP / AVP_EMP_NO, and
+  // DEAL_RECRUITER_HIERARCHY_FIELDS names both — selecting them failed the whole run with
+  // "Unrecognized name: AVP". With no tableId the query spans every active table, so only columns
+  // common to all of them are safe.
+  const priorMissing = resolveDealSheetMissingColumns(tableId);
+  const priorLatestFields = [...DEAL_RECRUITER_HIERARCHY_FIELDS, ...priorManualExtraColumns].filter(
+    (col) => !priorMissing.has(col)
+  );
   const unionSql = buildActiveDealSheetsUnionSql(datasetId, tableId || undefined, [
     ...priorExtensionDateSkuFields,
     ...priorLatestFields,
@@ -4354,9 +4519,13 @@ async function fetchExtensionRunrateBackfillByPlacementId(rows, options = {}) {
     col,
     `${col}_EMP_NO`,
   ]);
+  // Use the per-table manual list, NOT the raw one: the canada run-rate table has no
+  // FIFTYTWO_TENURE_* / CLIENT_NAME_IN_CONREP columns, and naming them failed the whole run with
+  // "Unrecognized name: FIFTYTWO_TENURE_RTO_LASTDATE". legacyDealManualColumns() also adds the
+  // columns only canada has (averaging agreements, DT rates), which this SELECT should pick up too.
   const runrateSelectColumns = [
     ...runrateHierarchyAndEmpNoColumns,
-    ...EXTENSION_RUNRATE_MANUAL_COLUMNS,
+    ...legacyDealManualColumns(runrateTableId),
   ];
   // Dedupe SECONDARY_RECRUITER* if it ever appears in both lists (it doesn't today for hierarchy).
   const runrateSelectColumnsUnique = [...new Set(runrateSelectColumns)];
@@ -4621,13 +4790,15 @@ ${bestMatchHierarchySelect}
           normalizeExtensionRunrateBackfillValue(bqRow?.proposed_contract_id)
         ),
       };
-      for (const col of EXTENSION_RUNRATE_HIERARCHY_COLUMNS) {
+      // Both loops must read exactly what the SELECT above projected for THIS run-rate table —
+      // a column the query never selected is always undefined on the result row.
+      for (const col of runrateHierarchyColumns) {
         entry[col] = normalizeExtensionRunrateBackfillValue(bqRow?.[proposedAliasForColumn(col)]);
         entry[`${col}_EMP_NO`] = normalizeExtensionRunrateBackfillValue(
           bqRow?.[proposedAliasForColumn(`${col}_EMP_NO`)]
         );
       }
-      for (const col of EXTENSION_RUNRATE_MANUAL_COLUMNS) {
+      for (const col of legacyDealManualColumns(runrateTableId)) {
         entry[col] = normalizeExtensionRunrateBackfillValue(bqRow?.[proposedAliasForColumn(col)]);
       }
       out.set(key, entry);
@@ -4760,15 +4931,21 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
   // Hierarchy the parent DEAL owns outright: overwrite it on the extension rather than filling only
   // when empty, so a stale name carried over from the candidate's previous contract cannot survive.
   // Restricted to fields the parent-DEAL query actually selects; everything else stays fill-if-empty.
+  // Must match the list fetchExtensionParentDealInheritByPlacementId actually selected for this
+  // table — Canada drops three of them, and a column the query never projected is always undefined.
+  const parentInheritColumns = resolveExtensionParentDealInheritColumns(options?.tableId);
+  const parentMissingColumns = resolveDealSheetMissingColumns(options?.tableId);
   const parentHierarchyOverwriteFields = DEAL_RECRUITER_HIERARCHY_FIELDS.filter((col) =>
-    EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.includes(col)
+    parentInheritColumns.includes(col)
   );
-  const parentFields = ["INITIAL_START_DATE", ...EXTENSION_PARENT_DEAL_INHERIT_COLUMNS].filter(
+  const parentFields = ["INITIAL_START_DATE", ...parentInheritColumns].filter(
     (col) => !parentHierarchyOverwriteFields.includes(col)
   );
   const priorManualExtraColumns = EXTENSION_RUNRATE_MANUAL_COLUMNS.filter(
     (col) => !DEAL_RECRUITER_HIERARCHY_FIELDS.includes(col)
   );
+  // Must match what fetchExtensionPriorExtensionInheritByPlacementId actually selected for this
+  // table — a column the query never projected is always undefined on the result row.
   const priorExtensionFields = [
     "CONTRACT_ID",
     "INITIAL_START_DATE",
@@ -4776,7 +4953,7 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
     "SKU_NUMBER",
     ...DEAL_RECRUITER_HIERARCHY_FIELDS,
     ...priorManualExtraColumns,
-  ];
+  ].filter((col) => !parentMissingColumns.has(col));
   const runrateFields = [
     // CONTRACT_ID rides along with SKU_NUMBER: same matched run-rate row, same contract chain.
     // Fill-if-empty like every other field here, so a parent DEAL's id already on the row wins.
@@ -7156,7 +7333,13 @@ async function fetchContractSegmentRateChangePairsFromActive(options = {}) {
       ? options.datasetId.trim()
       : config.datasetId;
 
-  const unionParts = await buildActiveDealSheetSchemaSafeUnionParts(datasetId, "CONTRACT_ID IS NOT NULL");
+  const unionParts = await buildActiveDealSheetSchemaSafeUnionParts(
+    datasetId,
+    "CONTRACT_ID IS NOT NULL",
+    // Canada is excluded while it is being validated — no ch_rate_change_logs row should be
+    // keyed on a placement that is about to be deleted and re-synced.
+    { excludeTableIds: RATE_CHANGE_LOG_EXCLUDED_TABLE_IDS }
+  );
   const sql = `WITH all_rows AS (
                  ${unionParts.join("\n                 UNION ALL\n                 ")}
                ),
@@ -7890,28 +8073,38 @@ async function backfillDeliveryPocForActive(options = {}, deps = {}) {
       : config.datasetId;
   const fetchEmailsFn = deps.fetchEmailsFn ?? fetchDeliveryPocEmails;
 
-  const pocCols = [];
-  for (const slot of DELIVERY_POC_PRIORITY) {
-    pocCols.push(slot.nameCol, slot.empCol);
-  }
-  const selectCols = [
-    ...new Set([
-      "ID",
-      "DELIVERY_POC",
-      "DELIVERY_POC_EMP_NO",
-      "DELIVERY_POC_EMAIL",
-      "ASSIGNMENT_RECRUITER_EMAIL",
-      ...pocCols,
-    ]),
-  ].join(", ");
   const available = (c) =>
     `(${c} IS NOT NULL AND TRIM(CAST(${c} AS STRING)) != '' AND UPPER(TRIM(CAST(${c} AS STRING))) != 'NA')`;
 
   let totalUpdated = 0;
   for (const tableId of ACTIVE_DEAL_SHEET_TABLE_IDS) {
+    // Column set is per table: Canada has no AVP / AVP_EMP_NO (its hierarchy tops out at VP), so
+    // naming them here failed the whole run with "Unrecognized name: AVP". Health and locums keep
+    // the full priority list. See DEAL_SHEET_MISSING_COLUMNS_BY_TABLE.
+    const missing = DEAL_SHEET_MISSING_COLUMNS_BY_TABLE.get(tableId) ?? new Set();
+    const pocCols = [];
+    for (const slot of DELIVERY_POC_PRIORITY) {
+      if (missing.has(slot.nameCol)) continue;
+      pocCols.push(slot.nameCol, slot.empCol);
+    }
+    const selectCols = [
+      ...new Set([
+        "ID",
+        "DELIVERY_POC",
+        "DELIVERY_POC_EMP_NO",
+        "DELIVERY_POC_EMAIL",
+        "ASSIGNMENT_RECRUITER_EMAIL",
+        ...pocCols,
+      ]),
+    ].join(", ");
+    // The WHERE mirrors the same rule: a table without AVP filters on DELIVERY_DIRECTOR alone.
+    const whereParts = [];
+    if (!missing.has("AVP")) whereParts.push(available("AVP"));
+    whereParts.push(available("DELIVERY_DIRECTOR"));
+
     const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
     const rows = await queryObjects(
-      `SELECT ${selectCols} FROM ${fqn} WHERE ${available("AVP")} OR ${available("DELIVERY_DIRECTOR")}`,
+      `SELECT ${selectCols} FROM ${fqn} WHERE ${whereParts.join(" OR ")}`,
       1000000
     );
 
@@ -8326,6 +8519,11 @@ module.exports = {
   formatDateOnlyForSql,
   EXTENSION_RUNRATE_HIERARCHY_COLUMNS,
   EXTENSION_RUNRATE_MANUAL_COLUMNS,
+  DEAL_SHEET_MISSING_COLUMNS_BY_TABLE,
+  resolveDealSheetMissingColumns,
+  RATE_CHANGE_LOG_EXCLUDED_TABLE_IDS,
+  buildActiveDealSheetSchemaSafeUnionParts,
+  DELIVERY_POC_PRIORITY,
   RUNRATE_HIERARCHY_MISSING_COLUMNS_BY_TABLE,
   ACTIVE_CHANGE_SCAN_MISSING_COLUMNS_BY_TABLE,
   buildActiveChangeScanColumnList,
@@ -8337,6 +8535,8 @@ module.exports = {
   isExtensionRunrateEligiblePlacementStatus,
   buildRunrateEligiblePlacementStatusSqlPredicate,
   EXTENSION_PARENT_DEAL_INHERIT_COLUMNS,
+  PARENT_DEAL_INHERIT_MISSING_COLUMNS_BY_TABLE,
+  resolveExtensionParentDealInheritColumns,
   SQL_CANDIDATE_EMAIL_NORM,
   SQL_PHONE_NUMBER_NORM,
   rowNeedsExtensionInsertBackfill,

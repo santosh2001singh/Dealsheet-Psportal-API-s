@@ -10,7 +10,7 @@
  *
  * Unlike locums (which stamps its entity on every row unconditionally), Canada treats ENTITY as a
  * fill-if-empty default: a value carried from the matched legacy run-rate row, or hand-edited in
- * BigQuery, always wins. 616 of the 618 rows in all_Health_Canada_Deal_sheet_data already read
+ * BigQuery, always wins. 616 of the 620 rows in all_Health_Canada_data_Runrate already read
  * "CANADA HEALTH", so this only fills the genuine blanks.
  */
 const CANADA_DEFAULT_ENTITY = "CANADA HEALTH";

@@ -97,6 +97,26 @@ function domainUsesDealSheetMinStartDate(domain) {
   return !SYNC_DOMAINS_WITHOUT_MIN_START_DATE.has(key);
 }
 
+/**
+ * Sync domains whose triggers skip the shared audit-log scans (ownership_change_logs,
+ * inorganic_hierarchy_logs and the ownership effective-date reconciliation).
+ *
+ * Canada is still being validated: its deal sheet rows are deleted and re-synced repeatedly, and
+ * every scan run writes log rows keyed on those placements that then have to be cleaned up too.
+ * Remove "canada" here once the data is trusted and the logs should start accumulating.
+ *
+ * This only gates the table-WIDE scans run from the scheduled triggers. Per-row log writes that
+ * happen inside the enrich pipeline (ch_additional_cost_logs, ch_termination_reason_logs) are
+ * separate — see ENRICH_LOG_WRITES_DISABLED_DOMAINS in syncService.js.
+ */
+const SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS = new Set(["canada"]);
+
+/** True when `domain`'s trigger should run the shared audit-log scans. */
+function domainRunsAuditLogScans(domain) {
+  const key = domain == null ? "" : String(domain).trim().toLowerCase();
+  return !SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS.has(key);
+}
+
 /** Max placement composites refreshed per `dealSheetSyncUpdateTrigger` invocation (env override). */
 function resolveDealSheetUpdateTriggerMaxPairs() {
   const raw = process.env.DEAL_SHEET_UPDATE_TRIGGER_MAX_PAIRS;
@@ -678,6 +698,17 @@ async function runDealSheetInsertSyncForDomain(domain, label) {
   // write to shared log tables. Running them from each domain's trigger is harmless (they are
   // idempotent — they only insert rows for changes not already logged), and it keeps every domain's
   // logs current even while another domain's schedule is paused.
+  //
+  // EXCEPT while a domain is still being validated: canada is loading from scratch and its rows are
+  // being deleted and re-synced repeatedly, so writing audit logs for them just creates rows that
+  // have to be cleaned up again (see sql/cleanup_canada_test_rows.sql). Skipped entirely for the
+  // domains in SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS; health and locums are unaffected.
+  if (!domainRunsAuditLogScans(domain)) {
+    logLine(
+      `[${label}] audit-log scans SKIPPED for domain=${domain} (ownership / inorganic / effective-date)`
+    );
+    return { success: true, domain, result, auditLogScansSkipped: true };
+  }
 
   // Extensions get inserted here; reconcile ownership_change_logs OWNERSHIP_EFFECTIVE_DATE from the
   // matching CONTRACT_ID's extension start date (overwrites the temporary tentative+1 value).
@@ -841,7 +872,14 @@ async function runDealSheetUpdateSyncForDomain(domain, label) {
   );
 
   // As on the insert trigger, the audit-log scans below are shared (not domain-scoped) and
-  // idempotent, so running them from each domain's trigger is safe.
+  // idempotent, so running them from each domain's trigger is safe — except for a domain still being
+  // validated, which skips them so its test rows do not seed log tables. See
+  // SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS.
+  if (!domainRunsAuditLogScans(domain)) {
+    logLine(`[${label}] audit-log scans SKIPPED for domain=${domain} (inorganic / ownership)`);
+    return { success: true, domain, result, auditLogScansSkipped: true };
+  }
+
   logLine(
     `[${label}] Invoking syncInorganicHierarchyLogsFromBigQuery (recruiter-change + CSM-divergence + recruiter-hierarchy-divergence scan)`
   );

@@ -152,7 +152,7 @@ firebase functions:config:set nexus.username="your_username"
 firebase functions:config:set nexus.password="your_password"
 
 # Optional: Override defaults
-firebase functions:config:set nexus.base_url="https://nexus-api-web-440611099785.us-central1.run.app"
+firebase functions:config:set nexus.base_url="https://nexusapi.cynetcorp.com"
 firebase functions:config:set bigquery.project_id="cynetdatabase"
 firebase functions:config:set bigquery.dataset_id="demo_purpose"
 firebase functions:config:set bigquery.table_id="deal_sheet_data"

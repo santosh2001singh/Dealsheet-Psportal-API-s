@@ -208,8 +208,33 @@ function dedupeLogRowsByCompositeKey(rows, getKey) {
 /**
  * Write termination-reason log rows with append-on-change dedupe (no duplicate unchanged snapshots).
  */
+/**
+ * Sync domains whose runs do NOT write the per-row enrich logs (ch_additional_cost_logs,
+ * ch_termination_reason_logs).
+ *
+ * Canada is still being validated: its deal sheet rows get deleted and re-synced repeatedly, and
+ * every run would otherwise seed log rows keyed on placements that are about to disappear (see
+ * sql/cleanup_canada_test_rows.sql). Remove "canada" once the data is trusted.
+ *
+ * cynet health and locums are NOT in this set and keep writing these logs exactly as before.
+ */
+const ENRICH_LOG_WRITES_DISABLED_DOMAINS = new Set(["canada"]);
+
+/** True when this run's domain should write the per-row enrich logs. */
+function domainWritesEnrichLogs(params) {
+  const domain = normalizeSyncDomain(params?.sync_domain);
+  const key = domain == null ? "" : String(domain).trim().toLowerCase();
+  return !ENRICH_LOG_WRITES_DISABLED_DOMAINS.has(key);
+}
+
 async function writeTerminationReasonLogRows(terminationLogRows, insertIdBase, params = {}, options = {}) {
   if (!terminationLogRows || terminationLogRows.length === 0) return { inserted: 0 };
+  if (!domainWritesEnrichLogs(params)) {
+    logLine(
+      `[termination-reason logs] SKIP: domain=${normalizeSyncDomain(params?.sync_domain)} does not write enrich logs`
+    );
+    return { inserted: 0, skippedDomain: true };
+  }
 
   let rowsToWrite = terminationLogRows;
 
@@ -332,6 +357,12 @@ async function writeTerminationReasonLogRows(terminationLogRows, insertIdBase, p
  */
 async function writeAdditionalCostLogRows(additionalCostLogRows, insertIdBase, params = {}, options = {}) {
   if (!additionalCostLogRows || additionalCostLogRows.length === 0) return { inserted: 0 };
+  if (!domainWritesEnrichLogs(params)) {
+    logLine(
+      `[additional-cost logs] SKIP: domain=${normalizeSyncDomain(params?.sync_domain)} does not write enrich logs`
+    );
+    return { inserted: 0, skippedDomain: true };
+  }
 
   let rowsToWrite = additionalCostLogRows;
 
@@ -2980,6 +3011,8 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
 }
 
 module.exports = {
+  ENRICH_LOG_WRITES_DISABLED_DOMAINS,
+  domainWritesEnrichLogs,
   syncEnrichedDealSheetCandidatesToBigQuery,
   isOfferRejectedSubmittalRow,
   syncExistingActiveDealSheetUpdatesFromBigQuery,

@@ -10,15 +10,19 @@ const {
   buildActiveChangeScanColumnList,
   buildActiveChangeScanUnionParts,
   ACTIVE_CHANGE_SCAN_MISSING_COLUMNS_BY_TABLE,
+  resolveExtensionParentDealInheritColumns,
+  PARENT_DEAL_INHERIT_MISSING_COLUMNS_BY_TABLE,
+  EXTENSION_PARENT_DEAL_INHERIT_COLUMNS,
 } = require("./bigQueryClient");
 const {
   applyCanadaDefaultEntity,
   CANADA_DEFAULT_ENTITY,
   sanitizeCanadaDealSheetRow,
+  CANADA_EXCLUDED_API_OWNED_COLUMNS,
 } = require("./canadaDerivedPlacementFields");
 const { resolveRunrateTableIdForDealSheetTable } = require("./recruiterDomainTables");
 
-const CANADA_RUNRATE = "all_Health_Canada_Deal_sheet_data";
+const CANADA_RUNRATE = "all_Health_Canada_data_Runrate";
 const HEALTH_RUNRATE = "all_CH_data_runrate";
 const LOCUMS_RUNRATE = "all_locums_runrate";
 
@@ -156,7 +160,7 @@ test("the ENTITY default tolerates junk input", () => {
 // --------------------------------------------------------------------------
 
 test("canada's extension hierarchy select omits AVP", () => {
-  // all_Health_Canada_Deal_sheet_data has no AVP column, so naming it would fail the query with
+  // all_Health_Canada_data_Runrate has no AVP column, so naming it would fail the query with
   // "Unrecognized name: AVP".
   const cols = resolveExtensionRunrateHierarchyColumns(CANADA_RUNRATE);
   assert.ok(!cols.includes("AVP"));
@@ -258,4 +262,80 @@ test("only the canada tables are registered as missing scan columns", () => {
     [...ACTIVE_CHANGE_SCAN_MISSING_COLUMNS_BY_TABLE.keys()].sort(),
     ["cynet_health_canada_deal_sheet", "cynet_health_canada_ended_deal_sheet"]
   );
+});
+
+// --------------------------------------------------------------------------
+// Parent-DEAL inherit columns.
+//
+// An EXTENSION inherits contract-level detail from its parent DEAL row. Canada dropped three of
+// those columns, so naming them against a Canada parent failed the whole trigger with
+// "Unrecognized name: FIFTYTWO_TENURE_RTO_LASTDATE". These queries run one table at a time, so the
+// column is left out rather than selected as NULL.
+// --------------------------------------------------------------------------
+
+const CANADA_DROPPED_INHERIT = [
+  "FIFTYTWO_TENURE_RTO_LASTDATE",
+  "FIFTYTWO_TENURE_CANDIDATE_STATUS",
+  "CLIENT_NAME_IN_CONREP",
+];
+
+test("health and locums inherit the full parent-DEAL column list", () => {
+  for (const t of ["cynet_health_deal_sheet", "cynet_locums_deal_sheet"]) {
+    const cols = resolveExtensionParentDealInheritColumns(t);
+    assert.deepEqual(cols, EXTENSION_PARENT_DEAL_INHERIT_COLUMNS, t);
+    for (const c of CANADA_DROPPED_INHERIT) {
+      assert.ok(cols.includes(c), `${t} should still inherit ${c}`);
+    }
+  }
+});
+
+test("canada omits the three columns its tables no longer have", () => {
+  for (const t of ["cynet_health_canada_deal_sheet", "cynet_health_canada_ended_deal_sheet"]) {
+    const cols = resolveExtensionParentDealInheritColumns(t);
+    for (const c of CANADA_DROPPED_INHERIT) {
+      assert.ok(!cols.includes(c), `${t} must not select ${c}`);
+    }
+    assert.equal(cols.length, EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.length - 3, t);
+  }
+});
+
+test("canada still inherits everything else from its parent DEAL", () => {
+  const cols = resolveExtensionParentDealInheritColumns("cynet_health_canada_deal_sheet");
+  for (const c of ["ENTITY", "SKU_NUMBER", "COMMENTS", "TYPE_OF_CLIENT", "ST_DT_PUSHBACK_REASON"]) {
+    assert.ok(cols.includes(c), c);
+  }
+});
+
+test("a cross-table run drops anything missing from any table", () => {
+  // With no tableId the union spans every active table, so only common columns are safe.
+  const cols = resolveExtensionParentDealInheritColumns();
+  for (const c of CANADA_DROPPED_INHERIT) {
+    assert.ok(!cols.includes(c), `cross-table run must not select ${c}`);
+  }
+});
+
+test("an unknown table id is treated as cross-table, never as full access", () => {
+  const cols = resolveExtensionParentDealInheritColumns("some_other_table");
+  assert.deepEqual(cols, EXTENSION_PARENT_DEAL_INHERIT_COLUMNS);
+});
+
+test("only the canada tables have parent-inherit columns registered missing", () => {
+  assert.deepEqual(
+    [...PARENT_DEAL_INHERIT_MISSING_COLUMNS_BY_TABLE.keys()].sort(),
+    ["cynet_health_canada_deal_sheet", "cynet_health_canada_ended_deal_sheet"]
+  );
+});
+
+// A single guard covering every list that feeds a Canada query: none may name a dropped column.
+test("no canada query path names a column canada dropped", () => {
+  const excluded = [...CANADA_EXCLUDED_API_OWNED_COLUMNS];
+  const paths = {
+    "legacy manual columns": legacyDealManualColumns(CANADA_RUNRATE),
+    "extension hierarchy": resolveExtensionRunrateHierarchyColumns(CANADA_RUNRATE),
+    "parent DEAL inherit": resolveExtensionParentDealInheritColumns("cynet_health_canada_deal_sheet"),
+  };
+  for (const [name, cols] of Object.entries(paths)) {
+    const bad = cols.filter((c) => excluded.includes(c));
+    assert.deepEqual(bad, [], `${name} names dropped column(s): ${bad.join(", ")}`);
+  }
 });

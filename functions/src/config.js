@@ -14,13 +14,17 @@ const config = {
    */
   runrateTableId: process.env.RUNRATE_TABLE_ID || "all_CH_data_runrate",
   /**
-   * Canada's legacy source. NOTE: this was "all_Health_Canada_data_Runrate" until Aug 2026, a table
-   * that does not exist in rr_project_data — every Canada legacy lookup failed on it, so no Canada
-   * row ever recovered its CONTRACT_ID / SKU_NUMBER / manual ops columns. The real table is
-   * all_Health_Canada_Deal_sheet_data (618 rows).
+   * Canada's legacy source: the run-rate table SKU_NUMBER / CONTRACT_ID / manual ops columns are
+   * recovered from, the Canada twin of all_CH_data_runrate.
+   *
+   * History, because this moved twice: it briefly pointed at all_Health_Canada_Deal_sheet_data,
+   * which held the data at the time. That table was recreated empty on 2026-08-24, so lookups
+   * against it matched nothing and every synced row landed with a blank SKU and blank manual
+   * columns. The populated table is all_Health_Canada_data_Runrate (620 rows, 498 with a SKU) —
+   * verified to match all 86 synced deal rows on candidate + facility + parent client + date window.
    */
   runrateCanadaTableId:
-    process.env.RUNRATE_CANADA_TABLE_ID || "all_Health_Canada_Deal_sheet_data",
+    process.env.RUNRATE_CANADA_TABLE_ID || "all_Health_Canada_data_Runrate",
   runrateLocumsTableId: process.env.RUNRATE_LOCUMS_TABLE_ID || "all_locums_runrate",
   rateChangeLogDatasetId: process.env.BQ_RATE_CHANGE_LOG_DATASET || "rr_project_data",
   rateChangeLogTableId: process.env.BQ_RATE_CHANGE_LOG_TABLE || "ch_rate_change_logs",
@@ -66,7 +70,7 @@ const config = {
   nexus: {
     baseUrl:
       process.env.NEXUS_BASE_URL ||
-      "https://nexus-api-web-440611099785.us-central1.run.app",
+      "https://nexusapi.cynetcorp.com",
     username: process.env.NEXUS_USERNAME || "",
     password: process.env.NEXUS_PASSWORD || "",
     csrfToken:

@@ -1,5 +1,6 @@
 {
   "projects": {
-    "default": "cynet-uat-projects"
+    "default": "runrate-505913",
+    "uat": "cynet-uat-projects"
   }
 }

@@ -28,8 +28,16 @@ test("resolveExtensionRunrateHierarchyColumns drops AVP for all_locums_runrate o
 
 test("resolveExtensionRunrateHierarchyColumns is a no-op for tables with no registered gap", () => {
   assert.deepEqual(resolveExtensionRunrateHierarchyColumns("all_CH_data_runrate"), EXTENSION_RUNRATE_HIERARCHY_COLUMNS);
-  assert.deepEqual(resolveExtensionRunrateHierarchyColumns("all_Health_Canada_data_Runrate"), EXTENSION_RUNRATE_HIERARCHY_COLUMNS);
   assert.deepEqual(resolveExtensionRunrateHierarchyColumns("some_future_table"), EXTENSION_RUNRATE_HIERARCHY_COLUMNS);
+});
+
+test("the canada run-rate table drops AVP (it has no AVP column)", () => {
+  // Cynet Health Canada has no AVP role — the chain tops out at VP / Sr. VP — so
+  // all_Health_Canada_data_Runrate carries no AVP column and naming it fails the query.
+  const cols = resolveExtensionRunrateHierarchyColumns("all_Health_Canada_data_Runrate");
+  assert.ok(!cols.includes("AVP"));
+  assert.ok(cols.includes("VP"));
+  assert.equal(cols.length, EXTENSION_RUNRATE_HIERARCHY_COLUMNS.length - 1);
 });
 
 test("EXTENSION_RUNRATE_HIERARCHY_COLUMNS itself is untouched (source of truth stays intact)", () => {

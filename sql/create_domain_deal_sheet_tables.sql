@@ -228,14 +228,21 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_deal_shee
   EXT_CANCELLED BOOL,
 );
 
+-- CANADA (cynet health canada) — starts as a copy of health, then diverges.
+--
+-- Canada keeps CALCULATED_MARGIN (bill - pay, the figure MARGIN used to hold) and GROSS_MARGIN, and
+-- reserves MARGIN for the API's hourly_revenue. It has no NET_MARGIN and no W2 pay family (T4 is the
+-- Canada equivalent). Full rationale + the one-time migration for the live table:
+-- sql/migrate_canada_deal_sheet_schema.sql
 CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_canada_deal_sheet`
 LIKE `cynetdatabase.rr_project_data.cynet_health_deal_sheet`;
 
 ALTER TABLE `cynetdatabase.rr_project_data.cynet_health_canada_deal_sheet`
+  -- US-only rate/hours/bonus families
+  DROP COLUMN IF EXISTS W2_PAY_RATE,
   DROP COLUMN IF EXISTS W2_PAY_RATE_NEW,
   DROP COLUMN IF EXISTS FINAL_PAY_RATE_NEW,
   DROP COLUMN IF EXISTS FINAL_COST_NEW,
-  DROP COLUMN IF EXISTS CALCULATED_MARGIN,
   DROP COLUMN IF EXISTS FINAL_BILL_RATE_NEW,
   DROP COLUMN IF EXISTS FIRST_WEEK_HOURS,
   DROP COLUMN IF EXISTS SECOND_WEEK_HOURS,
@@ -245,7 +252,38 @@ ALTER TABLE `cynetdatabase.rr_project_data.cynet_health_canada_deal_sheet`
   DROP COLUMN IF EXISTS REGULAR_HOURS_2,
   DROP COLUMN IF EXISTS SCHEDULE_HOURS_2,
   DROP COLUMN IF EXISTS BILLABLE_ORIENTATION_HRS,
-  DROP COLUMN IF EXISTS BILLABLE_ORIENTATION;
+  DROP COLUMN IF EXISTS BILLABLE_ORIENTATION,
+  -- Canada does not use net margin (bill - cost)
+  DROP COLUMN IF EXISTS NET_MARGIN,
+  -- Hierarchy / cluster / client-ownership columns Canada does not track (all verified empty)
+  DROP COLUMN IF EXISTS EXT_PENDING_ID,
+  DROP COLUMN IF EXISTS AVP,
+  DROP COLUMN IF EXISTS AVP_EMP_NO,
+  DROP COLUMN IF EXISTS CLIENT_OWNER,
+  DROP COLUMN IF EXISTS ONSITE_CLIENT_OWNER,
+  DROP COLUMN IF EXISTS CLIENT_NAME_IN_CONREP,
+  DROP COLUMN IF EXISTS CLIENT_CLUSTER_REGION,
+  DROP COLUMN IF EXISTS RECRUITER_CLUSTER_REGION,
+  DROP COLUMN IF EXISTS CLUSTER_TYPE,
+  DROP COLUMN IF EXISTS HOURLY_GP,
+  DROP COLUMN IF EXISTS FIFTYTWO_TENURE_RTO_LASTDATE,
+  DROP COLUMN IF EXISTS FIFTYTWO_TENURE_CANDIDATE_STATUS,
+  DROP COLUMN IF EXISTS AGENCY_SWITCH,
+  DROP COLUMN IF EXISTS ONSITE_OWNER,
+  DROP COLUMN IF EXISTS DIRECTOR_CLIENT_PARTNERSHIP,
+  DROP COLUMN IF EXISTS ASSOCIATE_JUNIOR_CSM,
+  DROP COLUMN IF EXISTS ONSITE_VP_AVP,
+  DROP COLUMN IF EXISTS ASSOCIATE_SALES_PERSON;
+
+-- Canada-only columns: T4 pay rate, the renamed margin pair, and the manual sheet columns that have
+-- no API source.
+ALTER TABLE `cynetdatabase.rr_project_data.cynet_health_canada_deal_sheet`
+  ADD COLUMN IF NOT EXISTS T4_PAY_RATE FLOAT64,
+  ADD COLUMN IF NOT EXISTS CALCULATED_MARGIN FLOAT64,
+  ADD COLUMN IF NOT EXISTS GROSS_MARGIN FLOAT64,
+  ADD COLUMN IF NOT EXISTS CLIENT_AVERAGING_AGREEMENT STRING,
+  ADD COLUMN IF NOT EXISTS CANDIDATE_AVERAGING_AGREEMENT STRING,
+  ADD COLUMN IF NOT EXISTS NO_OF_TIME_EXTENSION_RECEIVED STRING;
 
 CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_locums_deal_sheet`
 LIKE `cynetdatabase.rr_project_data.cynet_health_deal_sheet`;

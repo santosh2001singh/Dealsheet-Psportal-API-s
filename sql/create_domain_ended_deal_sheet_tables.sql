@@ -214,24 +214,16 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_ended_dea
   EXT_CANCELLED BOOL,
 );
 
+-- CANADA ended mirrors CANADA active exactly (same columns, same drops/adds), so it is created from
+-- the canada active table rather than from health ended. Requires the canada active table above to
+-- exist first.
+--
+-- NOTE: the live cynet_health_canada_ended_deal_sheet was on an older legacy schema (POSITION,
+-- END_CLIENT_DEPT_FACILITY, TENTATIVE_DATE, VP_SRVP, EXTENSION_REHIRE, ...) that never matched this
+-- file. It was empty, so sql/migrate_canada_deal_sheet_schema.sql drops and rebuilds it from canada
+-- active. This CREATE keeps that shape for fresh environments.
 CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_canada_ended_deal_sheet`
-LIKE `cynetdatabase.rr_project_data.cynet_health_ended_deal_sheet`;
-
-ALTER TABLE `cynetdatabase.rr_project_data.cynet_health_canada_ended_deal_sheet`
-  DROP COLUMN IF EXISTS W2_PAY_RATE_NEW,
-  DROP COLUMN IF EXISTS FINAL_PAY_RATE_NEW,
-  DROP COLUMN IF EXISTS FINAL_COST_NEW,
-  DROP COLUMN IF EXISTS CALCULATED_MARGIN,
-  DROP COLUMN IF EXISTS FINAL_BILL_RATE_NEW,
-  DROP COLUMN IF EXISTS FIRST_WEEK_HOURS,
-  DROP COLUMN IF EXISTS SECOND_WEEK_HOURS,
-  DROP COLUMN IF EXISTS TOTAL_BONUS_TAXABLE,
-  DROP COLUMN IF EXISTS TOTAL_BONUS_NON_TAXABLE,
-  DROP COLUMN IF EXISTS REGULAR_HOURS_1,
-  DROP COLUMN IF EXISTS REGULAR_HOURS_2,
-  DROP COLUMN IF EXISTS SCHEDULE_HOURS_2,
-  DROP COLUMN IF EXISTS BILLABLE_ORIENTATION_HRS,
-  DROP COLUMN IF EXISTS BILLABLE_ORIENTATION;
+LIKE `cynetdatabase.rr_project_data.cynet_health_canada_deal_sheet`;
 
 CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_locums_ended_deal_sheet`
 LIKE `cynetdatabase.rr_project_data.cynet_health_ended_deal_sheet`;
