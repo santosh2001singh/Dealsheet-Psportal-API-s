@@ -3718,7 +3718,14 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
     const tier1 = key.spanKey ? bySpanKey.get(buildSpanKeyString(key.spanKey)) : null;
     const tier2 = tier1 ? null : key.nexusKey ? byNexusKey.get(key.nexusKey) : null;
     const hit = tier1 ?? tier2;
-    if (!hit || hit.CONTRACT_ID == null) continue;
+    // A hit is worth keeping when it carries EITHER a contract id OR a SKU / manual ops columns.
+    // The canada run-rate table has no contract ids at all (0/620) but 498 SKUs, so requiring one
+    // here threw away every canada match AFTER the SQL had already found it — matched=0 in the log
+    // while the same join run by hand returned rows.
+    if (!hit) continue;
+    const hasContract = hit.CONTRACT_ID != null;
+    const hasSku = hit.SKU_NUMBER != null && String(hit.SKU_NUMBER).trim() !== "";
+    if (!hasContract && !hasSku) continue;
     if (tier1) spanHits++;
     else nexusHits++;
     out.set(key.rowKey, hit);

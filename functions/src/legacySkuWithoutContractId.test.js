@@ -168,3 +168,17 @@ test("no lookup tier still requires a contract id on its own", () => {
     "a bare contract-id requirement would zero out canada again"
   );
 });
+
+test("the tier-selection loop keeps a SKU-only hit", () => {
+  // The THIRD place this bug lived: the SQL matched and returned the SKU, but the loop that turns
+  // hits into results discarded anything without a contract id — so matched=0 in the log while the
+  // same join run by hand returned rows.
+  assert.ok(
+    BQ_SRC.includes("if (!hasContract && !hasSku) continue;"),
+    "a hit with a SKU but no contract id must be kept"
+  );
+  assert.ok(
+    !/const hit = tier1 \?\? tier2;\s*\n\s*if \(!hit \|\| hit\.CONTRACT_ID == null\) continue;/.test(BQ_SRC),
+    "the old contract-id-only gate must be gone"
+  );
+});
