@@ -4,6 +4,7 @@
  */
 
 const config = require("./config");
+const { applyDomainTuning } = config;
 const admin = require("firebase-admin");
 const { logLine, logDetail, setPipelineDetailQuiet, formatDuration } = require("./logger");
 const {
@@ -76,7 +77,11 @@ const { startDateOnOrAfterUtcMin, effectiveMinFilterDate, API_OWNED_COLUMNS } = 
 const { buildEnrichedRowsFromDealSheetCandidates } = require("./api/dealSheetEnricher");
 const { normalizeContractIdOrNull } = require("./contractIdFormat");
 const { getCheckpointRef } = require("./firestoreWorkspace");
-const { isCanadaDealSheetRow, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
+const {
+  isCanadaDealSheetRow,
+  submittalMayBeCanada,
+  CANADA_EXCLUDED_API_OWNED_COLUMNS,
+} = require("./canadaDerivedPlacementFields");
 const { isCynetLocumsRecruiter, LOCUMS_EXCLUDED_API_OWNED_COLUMNS } = require("./locumsDerivedPlacementFields");
 const { computeNewMargin } = require("./w2PayRateNew");
 const {
@@ -1578,6 +1583,12 @@ async function fetchDealSheetCandidatesByJobIdsParallel(jobIds, accessToken, dea
 async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
   /** One of "health" | "canada" | "locums"; null means the legacy all-domains run. */
   const syncDomain = normalizeSyncDomain(params.sync_domain);
+  // Pace Nexus requests for THIS domain before any fetching starts (canada runs unfiltered, so it
+  // needs a gentler fan-out than health/locums). Credentials are shared and untouched.
+  const tuning = applyDomainTuning(syncDomain);
+  logLine(
+    `[enriched sync] Nexus pacing domain=${syncDomain || "all"} fetchAllMax=${tuning.fetchAllMax} batchDelayMs=${tuning.batchDelayMs} maxRetries=${tuning.maxRetries}`
+  );
   const onlyNewDealSheets = params.only_new_deal_sheets === true;
   const skipExistingDealSheetOrPlacement =
     params.skip_existing_deal_sheet_or_placement === true || onlyNewDealSheets;
@@ -1699,6 +1710,8 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
   let totalCandidatesProcessed = 0;
   let totalRowsInserted = 0;
   let totalRowsSkippedOtherDomain = 0;
+  /** CANADA only: submittals dropped before enrich because their client is not in a canadian province. */
+  let totalSubmittalsSkippedNonCanada = 0;
   let errorBatches = 0;
   let hasMore = false;
 
@@ -2001,10 +2014,30 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
         `[enriched sync] STEP 2/5 NEXUS API: RESPONSE wave=${pageNum} listPage=${nexusListPage ?? "?"} submittalsInPage=${submittalItems.length} nextPage=${nextUrl ? "yes" : "no"} httpMs=${reqMs}${testSubmittalLimit > 0 ? " (test: single page)" : ""}`
       );
 
+      // CANADA ONLY: drop non-canadian submittals before anything is fetched for them.
+      //
+      // Nexus's job-submittals endpoint has no state parameter, so a canada run used to enrich every
+      // submittal (~11 API calls each) and discard the non-canada ones afterwards. Only ~5% of live
+      // submittals are canadian, so ~95% of that fan-out was wasted — and that volume is what tripped
+      // the edge rate limit into HTML 403s. The province is already on the submittal
+      // (client.zipcode_data.state_code), which is the very field CLIENT_STATE is derived from.
+      //
+      // health and locums are untouched: they need US states, so no filter is applied for them.
+      // rowMatchesSyncDomainForRow still runs after enrich for every domain, as the safety net.
+      const submittalsForDomain =
+        syncDomain === "canada" ? submittalItems.filter(submittalMayBeCanada) : submittalItems;
+      if (syncDomain === "canada" && submittalsForDomain.length !== submittalItems.length) {
+        const dropped = submittalItems.length - submittalsForDomain.length;
+        totalSubmittalsSkippedNonCanada += dropped;
+        logLine(
+          `[enriched sync] STEP 2/5 canada pre-filter: kept=${submittalsForDomain.length} droppedNonCanada=${dropped} (no enrich calls made for those)`
+        );
+      }
+
       const uniqueJobIds = [];
       const seenJobIds = new Set();
 
-      for (const row of submittalItems) {
+      for (const row of submittalsForDomain) {
         const jobId = normalizeNexusResourceId(row?.job);
         const candId = normalizeNexusResourceId(row?.candidate);
         if (!jobId || !candId) continue;
@@ -2275,6 +2308,11 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
   logLine(
     `[enriched sync] === DONE === rowsInsertedThisRun=${totalRowsInserted} candidatesProcessed=${totalCandidatesProcessed} submittalPagesFetched=${pageNum} errorBatches=${errorBatches} elapsed=${elapsedStr}`
   );
+  if (totalSubmittalsSkippedNonCanada > 0) {
+    logLine(
+      `[enriched sync] canada pre-filter total: droppedNonCanada=${totalSubmittalsSkippedNonCanada} submittal(s) never enriched`
+    );
+  }
   logLine(`TIMING syncEnrichedDealSheetCandidatesToBigQuery elapsed=${elapsedStr}`);
 
   return {
@@ -2283,6 +2321,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
     candidatesProcessed: totalCandidatesProcessed,
     syncDomain: syncDomain,
     rowsSkippedOtherDomain: totalRowsSkippedOtherDomain,
+    submittalsSkippedNonCanada: totalSubmittalsSkippedNonCanada,
     errorBatches,
     bigQueryTarget: tableFqn,
     submittalStatusCodes: allowedSubmittalCodes,
@@ -2815,6 +2854,11 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
   // Domain-scoped run: only read update targets out of this domain's own table, so a canada/locums
   // run never refreshes or re-appends a cynet health row.
   const syncDomain = normalizeSyncDomain(params.sync_domain);
+  // Same per-domain Nexus pacing as the insert path.
+  const updateTuning = applyDomainTuning(syncDomain);
+  logLine(
+    `[update sync] Nexus pacing domain=${syncDomain || "all"} fetchAllMax=${updateTuning.fetchAllMax} batchDelayMs=${updateTuning.batchDelayMs} maxRetries=${updateTuning.maxRetries}`
+  );
   const domainTableId = resolveActiveDealSheetTableIdForDomain(syncDomain);
   const allTargets = await fetchActiveDealSheetUpdateTargets({
     datasetId: effectiveDatasetId,

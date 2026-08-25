@@ -165,17 +165,49 @@ function rootAxiosError(err) {
 }
 
 /**
- * Retry-worthy: no HTTP response (reset/hang-up), 429/500/502/503/504, or errno-style failures
+ * True when a 403 came from the edge (Cloud Armor / load balancer) rather than from Nexus itself.
+ *
+ * Nexus is a Django API: every genuine auth/permission failure returns JSON, e.g.
+ *   {"detail": "Authentication credentials were not provided."}   (401)
+ *   {"detail": "You do not have permission to perform this action."} (403)
+ *
+ * The edge returns an HTML error page instead — `<!doctype html>...<title>403</title>`. That kind of
+ * 403 is a throttle, not a permission decision: the same request succeeds moments later and from
+ * other IPs. Seen on 2026-08-24, when a Canada run firing 3222 requests in one wave started getting
+ * HTML 403s mid-batch while the identical URLs worked fine from a laptop.
+ *
+ * Treating it as transient lets the existing backoff ride it out; a real JSON 403 still fails fast.
+ *
+ * @param {*} ax - root axios error
+ * @returns {boolean}
+ */
+function isEdgeThrottle403(ax) {
+  if (!ax || ax.response?.status !== 403) return false;
+  const body = ax.response?.data;
+  // A JSON body (object, or a string that parses) means Nexus answered — a real permission error.
+  if (body && typeof body === "object") return false;
+  const text = String(body ?? "");
+  if (text.trim() === "") return false;
+  return /<!doctype html|<html|<title>\s*403/i.test(text);
+}
+
+/**
+ * Retry-worthy: no HTTP response (reset/hang-up), 429/500/502/503/504, an edge-throttle HTML 403,
+ * or errno-style failures
  */
 function isTransientNexusError(err) {
   const ax = rootAxiosError(err);
   if (ax) {
     const st = ax.response?.status;
     if (st === 429 || st === 500 || st === 502 || st === 503 || st === 504) return true;
+    if (isEdgeThrottle403(ax)) return true;
     if (!ax.response) return true;
     return false;
   }
   const msg = `${String(err?.message || "")} ${String(err?.code || "")}`;
+  // Same edge-throttle rule, for callers that only have the formatted message (the batch fallback
+  // wraps the axios error in a plain Error whose text keeps the HTML snippet).
+  if (/HTTP 403/i.test(msg) && /<!doctype html|<html|<title>\s*403/i.test(msg)) return true;
   return /address unavailable|timeout|ECONNRESET|ETIMEDOUT|socket|EPIPE|ECONNABORTED|ENOTFOUND|EAI_AGAIN|ECANCELED|ERR_SOCKET|UND_ERR_SOCKET|network|HTTP 500|HTTP 502|HTTP 503|HTTP 504|HTTP 429/i.test(
     msg
   );

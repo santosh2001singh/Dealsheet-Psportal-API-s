@@ -7,6 +7,8 @@ const {
   DEAL_SHEET_MISSING_COLUMNS_BY_TABLE,
   ACTIVE_CHANGE_SCAN_MISSING_COLUMNS_BY_TABLE,
   PARENT_DEAL_INHERIT_MISSING_COLUMNS_BY_TABLE,
+  PARENT_DEAL_INHERIT_EXTRA_COLUMNS_BY_TABLE,
+  EXTENSION_PARENT_DEAL_INHERIT_COLUMNS,
   buildActiveChangeScanColumnList,
   buildActiveChangeScanUnionParts,
   resolveExtensionParentDealInheritColumns,
@@ -119,14 +121,17 @@ test("change-scan nulls AVP for canada and nothing for health", () => {
   assert.ok(!buildActiveChangeScanColumnList(HEALTH).includes("CAST(NULL"));
 });
 
-test("parent-DEAL inherit drops exactly three columns for canada", () => {
+test("parent-DEAL inherit drops the three columns canada lacks", () => {
+  // Canada also GAINS three of its own (see PARENT_DEAL_INHERIT_EXTRA_COLUMNS_BY_TABLE), so the two
+  // lists happen to be the same length — what matters is which columns are on each side.
   const health = resolveExtensionParentDealInheritColumns(HEALTH);
   const canada = resolveExtensionParentDealInheritColumns(CANADA);
-  assert.equal(health.length - canada.length, 3);
   for (const c of ["FIFTYTWO_TENURE_RTO_LASTDATE", "FIFTYTWO_TENURE_CANDIDATE_STATUS", "CLIENT_NAME_IN_CONREP"]) {
     assert.ok(!canada.includes(c), c);
     assert.ok(health.includes(c), `health keeps ${c}`);
   }
+  const dropped = health.filter((c) => !canada.includes(c));
+  assert.equal(dropped.length, 3, `unexpected drops: ${dropped.join(", ")}`);
 });
 
 // --------------------------------------------------------------------------
@@ -323,4 +328,64 @@ test("fetchContractIdsByDealSheetIds requests LAST_UPDATED for its ranking", () 
     src.includes('buildActiveDealSheetsUnionSql(datasetId, undefined, ["LAST_UPDATED"]);'),
     "the CONTRACT_ID lookup ranks by LAST_UPDATED, so it must project it"
   );
+});
+
+// --------------------------------------------------------------------------
+// Canada-only manual columns must carry from BOTH sources
+//
+// The manual sheet columns describe the CONTRACT, not the individual booking, so an extension keeps
+// whatever its parent DEAL recorded. Canada has three such columns that no other domain has, so
+// they cannot live in the shared EXTENSION_PARENT_DEAL_INHERIT_COLUMNS list.
+// --------------------------------------------------------------------------
+
+const CANADA_ONLY_MANUAL = [
+  "CLIENT_AVERAGING_AGREEMENT",
+  "CANDIDATE_AVERAGING_AGREEMENT",
+  "NO_OF_TIME_EXTENSION_RECEIVED",
+];
+
+test("canada inherits its own manual columns from the parent DEAL", () => {
+  const cols = resolveExtensionParentDealInheritColumns(CANADA);
+  for (const c of CANADA_ONLY_MANUAL) assert.ok(cols.includes(c), c);
+});
+
+test("the canada ended table inherits them too", () => {
+  const cols = resolveExtensionParentDealInheritColumns(CANADA_ENDED);
+  for (const c of CANADA_ONLY_MANUAL) assert.ok(cols.includes(c), c);
+});
+
+test("health and locums never see the canada-only columns", () => {
+  // Naming one against cynet health would fail the query — the column does not exist there.
+  for (const t of [HEALTH, LOCUMS]) {
+    const cols = resolveExtensionParentDealInheritColumns(t);
+    for (const c of CANADA_ONLY_MANUAL) {
+      assert.ok(!cols.includes(c), `${t} must not select ${c}`);
+    }
+  }
+});
+
+test("health's parent-inherit list is unchanged in length", () => {
+  assert.equal(
+    resolveExtensionParentDealInheritColumns(HEALTH).length,
+    EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.length
+  );
+});
+
+test("the extras are added once, with no duplicates", () => {
+  const cols = resolveExtensionParentDealInheritColumns(CANADA);
+  assert.equal(new Set(cols).size, cols.length);
+});
+
+test("only the canada tables register parent-inherit extras", () => {
+  assert.deepEqual(
+    [...PARENT_DEAL_INHERIT_EXTRA_COLUMNS_BY_TABLE.keys()].sort(),
+    [CANADA, CANADA_ENDED].sort()
+  );
+});
+
+test("the same three columns also carry from the run-rate row", () => {
+  // Two independent paths: the run-rate match, and the parent DEAL already in the table. A contract
+  // with no run-rate history still inherits from its parent deal, and vice versa.
+  const fromRunrate = legacyDealManualColumns(CANADA_RUNRATE_TABLE);
+  for (const c of CANADA_ONLY_MANUAL) assert.ok(fromRunrate.includes(c), c);
 });

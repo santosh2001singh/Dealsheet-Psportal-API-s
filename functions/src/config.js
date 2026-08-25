@@ -55,6 +55,25 @@ const config = {
   maxRetries: parseInt(process.env.MAX_RETRIES || "3", 10),
   /** Delay between fetch chunks; slightly higher default for API stability */
   batchDelayMs: parseInt(process.env.BATCH_DELAY_MS || "100", 10),
+
+  /**
+   * Per-domain Nexus fan-out tuning, applied on top of the values above.
+   *
+   * Canada runs with NO start-date filter, so one run enriches its whole Nexus history — a single
+   * wave fired 3222 requests on 2026-08-24 and tripped the edge (Cloud Armor) rate limit, which
+   * answers with an HTML 403 page. Health and locums only fetch from 2026-01-01, so their volume
+   * never reaches that point and they keep the faster defaults.
+   *
+   * These live in code rather than per-function env vars on purpose: setting them with
+   * `gcloud --update-env-vars` truncated NEXUS_PASSWORD at its trailing "#" (shell comment), which
+   * broke Canada's auth with a 401. Keeping the tuning here means every function can be deployed
+   * with plain `firebase deploy`, which reads .env verbatim and handles "#" correctly.
+   *
+   * An explicit env var still wins — see resolveDomainTuning.
+   */
+  domainTuning: {
+    canada: { fetchAllMax: 5, batchDelayMs: 500, maxRetries: 5 },
+  },
   /**
    * Per-request Nexus timeout. Without one, axios waits forever on a hung socket: a run on Aug 19
    * 2026 processed 9 submittal pages in 28 min at a steady ~3 min/page, then sat on page 10 for 22+
@@ -178,4 +197,71 @@ const config = {
   },
 };
 
+/**
+ * The env/default tuning values as loaded at module start, before any domain override is applied.
+ * applyDomainTuning mutates config.fetchAllMax and friends, so the fallbacks have to come from an
+ * immutable snapshot or one domain's run would poison the next resolve() in the same process.
+ */
+const TUNING_BASELINE = Object.freeze({
+  fetchAllMax: config.fetchAllMax,
+  batchDelayMs: config.batchDelayMs,
+  maxRetries: config.maxRetries,
+});
+
+/**
+ * Nexus fan-out tuning for one sync domain.
+ *
+ * ONLY the request-pacing knobs vary by domain — how many Nexus GETs run in parallel, the gap
+ * between batches, and how many times a transient failure is retried. Credentials (NEXUS_USERNAME /
+ * NEXUS_PASSWORD / NEXUS_BASE_URL / NEXUS_CSRF_TOKEN) are the SAME for every domain and are never
+ * touched here: all three pull from the same Nexus account.
+ *
+ * Precedence: an explicit env var always wins, then the per-domain entry, then the global default.
+ * That keeps a one-off override possible without editing code.
+ *
+ * @param {string} [domain] - "health" | "canada" | "locums"
+ * @returns {{fetchAllMax: number, batchDelayMs: number, maxRetries: number}}
+ */
+function resolveDomainTuning(domain) {
+  const key = domain == null ? "" : String(domain).trim().toLowerCase();
+  const perDomain = config.domainTuning[key] || {};
+  const fromEnv = (name) => {
+    const raw = process.env[name];
+    if (raw == null || String(raw).trim() === "") return null;
+    const n = parseInt(String(raw).trim(), 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  // Fall back to the BASELINE, never to config.* — applyDomainTuning mutates those, so reading them
+  // here would let one domain's values leak into the next resolve() in the same process.
+  return {
+    fetchAllMax: fromEnv("FETCH_ALL_MAX") ?? perDomain.fetchAllMax ?? TUNING_BASELINE.fetchAllMax,
+    batchDelayMs:
+      fromEnv("BATCH_DELAY_MS") ?? perDomain.batchDelayMs ?? TUNING_BASELINE.batchDelayMs,
+    maxRetries: fromEnv("MAX_RETRIES") ?? perDomain.maxRetries ?? TUNING_BASELINE.maxRetries,
+  };
+}
+
+/**
+ * Apply a domain's fan-out tuning to the live config, for the rest of this process.
+ *
+ * Each scheduled function runs exactly ONE domain (dealSheetSyncTriggerCanada only ever syncs
+ * canada), so mutating the shared config at the start of a run is safe and keeps every downstream
+ * batching site — nexusFetchAllJsonBatched, the enricher's note batches, the retry wrapper — on the
+ * right values without threading a parameter through every call.
+ *
+ * Idempotent and logged, so a run's actual pacing is visible in the logs.
+ *
+ * @param {string} [domain]
+ * @returns {{fetchAllMax: number, batchDelayMs: number, maxRetries: number}} the applied values
+ */
+function applyDomainTuning(domain) {
+  const t = resolveDomainTuning(domain);
+  config.fetchAllMax = t.fetchAllMax;
+  config.batchDelayMs = t.batchDelayMs;
+  config.maxRetries = t.maxRetries;
+  return t;
+}
+
 module.exports = config;
+module.exports.resolveDomainTuning = resolveDomainTuning;
+module.exports.applyDomainTuning = applyDomainTuning;

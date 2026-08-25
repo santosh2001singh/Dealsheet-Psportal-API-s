@@ -295,7 +295,10 @@ test("canada omits the three columns its tables no longer have", () => {
     for (const c of CANADA_DROPPED_INHERIT) {
       assert.ok(!cols.includes(c), `${t} must not select ${c}`);
     }
-    assert.equal(cols.length, EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.length - 3, t);
+    // Canada also GAINS three columns of its own (the averaging agreements and extension count), so
+    // the list is not simply shorter — assert on membership, not length.
+    const dropped = EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.filter((c) => !cols.includes(c));
+    assert.deepEqual(dropped.sort(), [...CANADA_DROPPED_INHERIT].sort(), t);
   }
 });
 

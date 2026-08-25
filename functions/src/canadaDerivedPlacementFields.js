@@ -33,6 +33,11 @@ const CANADA_PROVINCES = Object.freeze({
 
 const CANADA_PROVINCE_CODES = Object.freeze(new Set(Object.keys(CANADA_PROVINCES)));
 
+/** Full province names, lower-cased, for matching Nexus's zipcode_data.state_name. */
+const CANADA_PROVINCE_NAMES = Object.freeze(
+  new Set(Object.values(CANADA_PROVINCES).map((n) => n.toLowerCase()))
+);
+
 /**
  * Employer burden loading applied to the hourly pay rate, per province and payment type.
  *
@@ -444,8 +449,98 @@ function sanitizeCanadaDealSheetRow(row) {
   return out;
 }
 
+
+/**
+ * CLIENT_STATE for a raw Nexus job-submittal, read straight off the list response.
+ *
+ * The submittal already embeds the client, and `client.zipcode_data.state_code` is the SAME field
+ * mapClientToBq derives CLIENT_STATE from — so the province is knowable before any enrich call is
+ * made. Measured on live data: present on 300/300 submittals.
+ *
+ * @param {Record<string, *>|null|undefined} submittal
+ * @returns {string|null} upper-cased state code, or null when the response has none
+ */
+function submittalClientStateCode(submittal) {
+  const raw = submittal?.client?.zipcode_data?.state_code;
+  if (raw == null) return null;
+  const s = String(raw).trim().toUpperCase();
+  return s === "" ? null : s;
+}
+
+/**
+ * Full province name for a raw job-submittal (zipcode_data.state_name), or null.
+ * @param {Record<string, *>|null|undefined} submittal
+ * @returns {string|null}
+ */
+function submittalClientStateName(submittal) {
+  const raw = submittal?.client?.zipcode_data?.state_name;
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  return s === "" ? null : s;
+}
+
+/**
+ * ISO country for a raw job-submittal (zipcode_data.iso_country_code), or null.
+ * @param {Record<string, *>|null|undefined} submittal
+ * @returns {string|null}
+ */
+function submittalClientCountryCode(submittal) {
+  const raw = submittal?.client?.zipcode_data?.iso_country_code;
+  if (raw == null) return null;
+  const s = String(raw).trim().toUpperCase();
+  return s === "" ? null : s;
+}
+
+/**
+ * True when a raw job-submittal should be enriched for the CANADA domain.
+ *
+ * Nexus's job-submittals endpoint takes no state parameter, so a canada run used to enrich every
+ * submittal (~11 API calls each) and discard the non-canada ones only afterwards, at
+ * rowMatchesSyncDomainForRow. On live data only ~5% of submittals are canadian, so ~95% of that
+ * fan-out was wasted — and the volume is what tripped the edge rate limit into HTML 403s.
+ *
+ * Deciding here instead skips those calls entirely.
+ *
+ * Three independent signals are accepted, any one of which is enough:
+ *   1. state_code       — "BC"                     (the field CLIENT_STATE is derived from)
+ *   2. state_name       — "British Columbia"       (more explicit; unambiguous across 49 live names)
+ *   3. iso_country_code — "CA"                     (the country itself)
+ *
+ * All three were present on 1200/1200 live submittals and never disagreed, so any one alone would
+ * do; taking them together means a single missing field cannot silently drop a canadian placement.
+ *
+ * NOTE state_code "CA" is CALIFORNIA, not Canada — only iso_country_code carries the country. That
+ * is why the country check reads a different field rather than reusing the province code.
+ *
+ * A submittal with NONE of the three resolvable is KEPT on purpose: dropping it would silently lose
+ * a row if Nexus ever omits zipcode_data. The post-enrich domain filter still catches it.
+ *
+ * @param {Record<string, *>|null|undefined} submittal
+ * @returns {boolean}
+ */
+function submittalMayBeCanada(submittal) {
+  const code = submittalClientStateCode(submittal);
+  if (code != null && CANADA_PROVINCE_CODES.has(code)) return true;
+
+  const name = submittalClientStateName(submittal);
+  if (name != null && CANADA_PROVINCE_NAMES.has(name.toLowerCase())) return true;
+
+  const country = submittalClientCountryCode(submittal);
+  if (country === "CA") return true;
+
+  // Nothing identified it at all -> keep, so a missing field never silently drops a row.
+  if (code == null && name == null && country == null) return true;
+
+  return false;
+}
+
 module.exports = {
   isCynetHealthCanadaRecruiter,
+  submittalClientStateCode,
+  submittalClientStateName,
+  submittalClientCountryCode,
+  submittalMayBeCanada,
+  CANADA_PROVINCE_NAMES,
   CANADA_DEFAULT_ENTITY,
   applyCanadaDefaultEntity,
   isCanadaProvince,

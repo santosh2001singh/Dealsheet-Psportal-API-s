@@ -445,11 +445,20 @@ async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
     const key = buildLegacyContractLookupKey(row);
     if (!key) continue;
     const identity = identityByRowKey.get(key.rowKey);
-    const contractId = normalizeContractIdOrNull(identity?.CONTRACT_ID);
-    if (contractId == null) continue;
+    if (!identity) continue;
 
-    row.CONTRACT_ID = contractId;
-    reused++;
+    // A matched run-rate row may carry a SKU and the manual ops columns but NO CONTRACT_ID — the
+    // whole canada run-rate table is like this (0/620 rows have a contract id, 498 have a SKU).
+    // Bailing out here on a missing contract id therefore threw away the SKU and every manual
+    // column for those rows, which is why canada rows landed with a blank SKU_NUMBER, ENTITY,
+    // CLIENT_RECRUITER and so on despite matching cleanly.
+    //
+    // The contract id is applied when the legacy row has one; everything below runs regardless.
+    const contractId = normalizeContractIdOrNull(identity?.CONTRACT_ID);
+    if (contractId != null) {
+      row.CONTRACT_ID = contractId;
+      reused++;
+    }
 
     // SKU_NUMBER is only carried over for placements that actually took effect. A DID NOT START /
     // DID NOT ACCEPT row never became a working assignment, so it must not inherit the legacy SKU

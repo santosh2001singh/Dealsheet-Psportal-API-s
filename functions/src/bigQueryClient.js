@@ -4015,6 +4015,37 @@ Object.freeze(EXTENSION_PARENT_DEAL_INHERIT_COLUMNS);
 const PARENT_DEAL_INHERIT_MISSING_COLUMNS_BY_TABLE = DEAL_SHEET_MISSING_COLUMNS_BY_TABLE;
 
 /**
+ * Parent-DEAL inherit columns that exist on ONE domain's tables only.
+ *
+ * EXTENSION_PARENT_DEAL_INHERIT_COLUMNS is shared across all three domains, so a column only canada
+ * has cannot live in it — naming it against cynet health would fail the query. These three are
+ * canada-only sheet columns with no API source, and they describe the CONTRACT rather than the
+ * individual booking: an extension of the same contract must keep whatever its parent DEAL recorded.
+ *
+ * They already come across from the run-rate row (RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE); this adds
+ * the second path, so a placement whose contract has no run-rate history still inherits them from
+ * the parent deal already in the table.
+ */
+const PARENT_DEAL_INHERIT_EXTRA_COLUMNS_BY_TABLE = new Map([
+  [
+    "cynet_health_canada_deal_sheet",
+    Object.freeze([
+      "CLIENT_AVERAGING_AGREEMENT",
+      "CANDIDATE_AVERAGING_AGREEMENT",
+      "NO_OF_TIME_EXTENSION_RECEIVED",
+    ]),
+  ],
+  [
+    "cynet_health_canada_ended_deal_sheet",
+    Object.freeze([
+      "CLIENT_AVERAGING_AGREEMENT",
+      "CANDIDATE_AVERAGING_AGREEMENT",
+      "NO_OF_TIME_EXTENSION_RECEIVED",
+    ]),
+  ],
+]);
+
+/**
  * Parent-DEAL inherit columns that actually exist on `tableId`, safe to name in a SELECT.
  *
  * With no tableId the query spans every active table, so only columns common to all of them are
@@ -4025,8 +4056,16 @@ const PARENT_DEAL_INHERIT_MISSING_COLUMNS_BY_TABLE = DEAL_SHEET_MISSING_COLUMNS_
  */
 function resolveExtensionParentDealInheritColumns(tableId) {
   const missing = resolveDealSheetMissingColumns(tableId);
-  if (missing.size === 0) return EXTENSION_PARENT_DEAL_INHERIT_COLUMNS;
-  return EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.filter((col) => !missing.has(col));
+  const extra = PARENT_DEAL_INHERIT_EXTRA_COLUMNS_BY_TABLE.get(
+    tableId == null ? "" : String(tableId).trim()
+  );
+  const base =
+    missing.size === 0
+      ? EXTENSION_PARENT_DEAL_INHERIT_COLUMNS
+      : EXTENSION_PARENT_DEAL_INHERIT_COLUMNS.filter((col) => !missing.has(col));
+  if (!extra || extra.length === 0) return base;
+  const seen = new Set(base);
+  return [...base, ...extra.filter((col) => !seen.has(col))];
 }
 
 function runrateAliasForColumn(col) {
@@ -8536,6 +8575,7 @@ module.exports = {
   buildRunrateEligiblePlacementStatusSqlPredicate,
   EXTENSION_PARENT_DEAL_INHERIT_COLUMNS,
   PARENT_DEAL_INHERIT_MISSING_COLUMNS_BY_TABLE,
+  PARENT_DEAL_INHERIT_EXTRA_COLUMNS_BY_TABLE,
   resolveExtensionParentDealInheritColumns,
   SQL_CANDIDATE_EMAIL_NORM,
   SQL_PHONE_NUMBER_NORM,
