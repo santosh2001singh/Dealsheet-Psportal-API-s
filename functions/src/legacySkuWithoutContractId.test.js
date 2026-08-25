@@ -139,3 +139,32 @@ test("blank legacy values do not overwrite anything", async () => {
   assert.equal(rows[0].ENTITY, undefined);
   assert.equal(rows[0].CLIENT_RECRUITER, undefined);
 });
+
+// --------------------------------------------------------------------------
+// The SQL side of the same bug.
+//
+// Fixing the JS apply loop was not enough: the lookup QUERY also required a contract id, so canada
+// rows never came back from BigQuery at all. Live check at the time: the old predicate matched 0
+// deal rows, the fixed one matches 209 — every one of which has a SKU.
+// --------------------------------------------------------------------------
+
+const fs = require("node:fs");
+const path = require("node:path");
+
+const BQ_SRC = fs.readFileSync(path.join(__dirname, "bigQueryClient.js"), "utf8");
+
+test("the legacy lookup accepts a run-rate row with a SKU but no contract id", () => {
+  // Both tiers (span-key and nexus-key) must allow it.
+  const guarded = BQ_SRC.match(
+    /\(r\.CONTRACT_ID IS NOT NULL AND TRIM\(r\.CONTRACT_ID\) != ''\)\s*\n\s*OR \(r\.SKU_NUMBER IS NOT NULL AND TRIM\(r\.SKU_NUMBER\) != ''\)/g
+  );
+  assert.equal(guarded?.length, 2, "both lookup tiers must accept SKU-only rows");
+});
+
+test("no lookup tier still requires a contract id on its own", () => {
+  // The exact old predicate must be gone — it filtered every canada row out.
+  assert.ok(
+    !/WHERE r\.CONTRACT_ID IS NOT NULL AND TRIM\(r\.CONTRACT_ID\) != ''/.test(BQ_SRC),
+    "a bare contract-id requirement would zero out canada again"
+  );
+});

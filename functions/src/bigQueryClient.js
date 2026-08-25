@@ -3614,7 +3614,14 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
                  ELSE LOWER(TRIM(r.FACILITY_NAME)) = w.fac
                   AND LOWER(TRIM(r.PARENT_CLIENT_NAME)) = w.pc
                END )
-        WHERE r.CONTRACT_ID IS NOT NULL AND TRIM(r.CONTRACT_ID) != ''
+        -- A run-rate row is worth matching when it carries EITHER a contract id OR a SKU: the
+        -- canada run-rate table has no contract ids at all (0/620) but 498 SKUs, and the manual ops
+        -- columns ride on the same row. Requiring a contract id here filtered every canada row out,
+        -- so nothing matched and SKU_NUMBER / ENTITY / CLIENT_RECRUITER all landed blank.
+        WHERE (
+              (r.CONTRACT_ID IS NOT NULL AND TRIM(r.CONTRACT_ID) != '')
+           OR (r.SKU_NUMBER IS NOT NULL AND TRIM(r.SKU_NUMBER) != '')
+          )
           AND r.START_DATE IS NOT NULL
           -- The window needs an end: END_DATE preferred, TENTATIVE_END_DATE when it is absent.
           AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE) IS NOT NULL
@@ -3679,7 +3686,11 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
         JOIN wanted w
           ON CAST(r.CANDIDATE_ID AS STRING) = w.cand
          AND CAST(r.INTERNAL_JOB_ID AS STRING) = w.job
-        WHERE r.CONTRACT_ID IS NOT NULL AND TRIM(r.CONTRACT_ID) != ''
+        -- Same rule as tier 1: a SKU-only run-rate row still carries the manual ops columns.
+        WHERE (
+              (r.CONTRACT_ID IS NOT NULL AND TRIM(r.CONTRACT_ID) != '')
+           OR (r.SKU_NUMBER IS NOT NULL AND TRIM(r.SKU_NUMBER) != '')
+          )
       )
       SELECT cand, job, contract_id, sku_number, initial_start_date, ${manualOut} FROM ranked WHERE rn = 1
     `;
