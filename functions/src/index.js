@@ -137,6 +137,35 @@ function resolveDealSheetInsertTriggerMaxPages() {
   if (!Number.isFinite(n) || n < 1) return 0;
   return n;
 }
+/**
+ * Per-domain row cap for the scheduled INSERT trigger, from an env var.
+ *
+ * A test switch: canada syncs its whole Nexus history with no start-date filter, so a full run takes
+ * a long time and a mistake is only visible at the end. Setting
+ * DEAL_SHEET_INSERT_TRIGGER_MAX_ROWS_CANADA=100 makes the run stop after 100 rows, so the output can
+ * be checked in minutes instead of waiting for the whole load.
+ *
+ * The cap is read per domain, so health and locums are unaffected unless their own var is set.
+ * Unset (or 0) means no cap — the normal production behaviour.
+ *
+ *   DEAL_SHEET_INSERT_TRIGGER_MAX_ROWS_CANADA=100   -> canada stops at 100 rows
+ *   DEAL_SHEET_INSERT_TRIGGER_MAX_ROWS=100          -> applies to every domain
+ *
+ * Remove the var (and redeploy) to go back to a full run.
+ *
+ * @param {string} domain - "health" | "canada" | "locums"
+ * @returns {number} row cap, or 0 for no cap
+ */
+function resolveInsertTriggerMaxRows(domain) {
+  const key = domain == null ? "" : String(domain).trim().toUpperCase();
+  const raw =
+    (key && process.env[`DEAL_SHEET_INSERT_TRIGGER_MAX_ROWS_${key}`]) ||
+    process.env.DEAL_SHEET_INSERT_TRIGGER_MAX_ROWS;
+  const n = parseInt(String(raw != null && raw !== "" ? raw : "0").trim(), 10);
+  if (!Number.isFinite(n) || n < 1) return 0;
+  return n;
+}
+
 /** Gen2 HTTP: max 3600s; avoids 540s Gen1 cap on full sync */
 const HTTP_TIMEOUT_SEC = 3600;
 const HTTP_MEMORY = "2GiB";
@@ -644,9 +673,11 @@ async function runDealSheetInsertSyncForDomain(domain, label) {
   const insertMaxPages = resolveDealSheetInsertTriggerMaxPages();
   const checkpointKey = `${ACTIVE_INSERT_SYNC_CHECKPOINT_KEY}-${domain}`;
   const useMinStartDate = domainUsesDealSheetMinStartDate(domain);
+  // Test cap: stop after N rows so a run can be inspected without waiting for the full load.
+  const insertMaxRows = resolveInsertTriggerMaxRows(domain);
 
   logLine(
-    `[${label}] Scheduled insert-only domain=${domain}: ${organizationSubmittalCodes} -> cynetdatabase.${bqDataset}; skip if DEAL_SHEET_ID or PLACEMENT_ID exists in BQ; START_DATE${useMinStartDate ? `>=${DEAL_SHEET_MIN_START_DATE_ISO}` : "=no filter (full history)"}; first_insert_allowlist=${firstInsertPlacementStatuses}; no append-on-change; checkpoint_key=${checkpointKey} (resume-on-error/timeout by submittal page, clear-on-complete); max_pages_per_run=${insertMaxPages || "none"}`
+    `[${label}] Scheduled insert-only domain=${domain}: ${organizationSubmittalCodes} -> cynetdatabase.${bqDataset}; skip if DEAL_SHEET_ID or PLACEMENT_ID exists in BQ; START_DATE${useMinStartDate ? `>=${DEAL_SHEET_MIN_START_DATE_ISO}` : "=no filter (full history)"}; first_insert_allowlist=${firstInsertPlacementStatuses}; no append-on-change; checkpoint_key=${checkpointKey} (resume-on-error/timeout by submittal page, clear-on-complete); max_pages_per_run=${insertMaxPages || "none"}; max_rows_per_run=${insertMaxRows || "none"}`
   );
   logLine(`[${label}] Invoking syncEnrichedDealSheetCandidatesToBigQuery`);
 
@@ -688,6 +719,8 @@ async function runDealSheetInsertSyncForDomain(domain, label) {
     checkpoint_use_submittal_page: true,
     clear_checkpoint_on_complete: true,
     ...(insertMaxPages > 0 ? { max_pages: insertMaxPages, max_pages_provided: true } : {}),
+    // Honoured by the enrich stream, which stops as soon as the cap is reached.
+    ...(insertMaxRows > 0 ? { max_candidates: insertMaxRows } : {}),
   });
 
   logLine(
