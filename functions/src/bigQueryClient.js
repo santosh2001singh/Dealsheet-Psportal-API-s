@@ -14,6 +14,7 @@ const {
   resolveActiveDealSheetTableId,
   resolveActiveDealSheetTableIdForRow,
   resolvePairedActiveTableId,
+  resolvePairedEndedTableId,
   resolveRunrateTableIdForDealSheetTable,
 } = require("./recruiterDomainTables");
 const {
@@ -114,7 +115,7 @@ function resolveDealSheetMissingColumns(tableId) {
 
 // CONTRACT_ID allocation lives entirely in contractIdResolver.js (DEAL rows only) — this module
 // only ever reuses an existing id, so it needs neither the sequence nor its options builder.
-const { normalizeContractIdOrNull } = require("./contractIdFormat");
+const { normalizeContractIdOrNull, getContractIdConfigForTable } = require("./contractIdFormat");
 const {
   DEAL_RECRUITER_HIERARCHY_TARGETS,
   DESIGNATION_TO_INORGANIC_LOG_COLUMN,
@@ -2938,6 +2939,48 @@ function buildActiveChangeScanUnionParts(datasetId) {
  * @param {object} [options]
  * @returns {Promise<Map<string, string>>} dealSheetId string -> contract id
  */
+/**
+ * Highest CONTRACT_ID sequence number already present for a table's prefix.
+ *
+ * Used as a FLOOR for the Firestore sequence counter. The counter doc is normally authoritative, but
+ * when it reads below reality (never created, deleted, restored from an older snapshot, or written by
+ * a run whose commit rolled back) the sequence restarts at startValue and re-mints ids that are
+ * already live — CHC23000..CHC23033 landed on two unrelated candidates each that way (Aug 2026).
+ *
+ * @param {string} tableId
+ * @param {object} [options] datasetId
+ * @returns {Promise<number|null>} max sequence, or null when nothing is issued / lookup fails
+ */
+async function fetchMaxContractIdSeqForTable(tableId, options = {}) {
+  const tid = tableId == null ? "" : String(tableId).trim();
+  if (!tid) return null;
+  const cfg = getContractIdConfigForTable(tid);
+  if (!cfg) return null;
+
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+
+  // Both the active and the paired ended table can carry ids from this sequence, so the floor has to
+  // clear the highest of the two — an id retired into the ended table is still spent.
+  const endedTableId = resolvePairedEndedTableId(tid);
+  const tables = endedTableId && endedTableId !== tid ? [tid, endedTableId] : [tid];
+  const pattern = `^${cfg.prefix}\\d+$`;
+  const parts = tables.map(
+    (t) =>
+      `SELECT MAX(CAST(REGEXP_EXTRACT(CONTRACT_ID, r'^${cfg.prefix}(\\d+)$') AS INT64)) AS max_seq
+       FROM \`${config.projectId}.${datasetId}.${t}\`
+       WHERE REGEXP_CONTAINS(CONTRACT_ID, r'${pattern}')`
+  );
+  const sql = `SELECT MAX(max_seq) AS max_seq FROM (${parts.join(" UNION ALL ")})`;
+  const rows = await queryObjects(sql, 1);
+  const raw = rows && rows.length > 0 ? rows[0]?.max_seq : null;
+  if (raw == null) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+}
+
 async function fetchContractIdsByDealSheetIds(dealSheetIds, options = {}) {
   const out = new Map();
   if (!dealSheetIds || dealSheetIds.length === 0) return out;
@@ -8565,6 +8608,7 @@ module.exports = {
   resolveNewHireDatesForEndedRows,
   computeDealSheetFirstInsertDateStamps,
   fetchContractIdsByDealSheetIds,
+  fetchMaxContractIdSeqForTable,
   fetchContractIdsForExtensions,
   fetchLegacyContractIdentityForDealRows,
   buildLegacyContractLookupKey,

@@ -48,17 +48,27 @@ const CANADA_PROVINCE_NAMES = Object.freeze(
  * t4a === null means Finance marked that province "No business" for T4A. Such a row gets a NULL pay
  * rate rather than an invented multiplier — see computeCanadaT4PayRate.
  *
- * Two deliberate departures from the older sheet formulas, both confirmed with the business:
+ * One deliberate departure from the older sheet formula, confirmed with the business:
  *   - AB group: the sheet multiplied PAY_RATE by 1.04 before the 1.1818 loading, but the 4% vacation
  *     is already inside 18.18%, so the extra 1.04 double-counted it (22.91% effective). Dropped.
- *   - NL: the sheet used 1.04 * 1.1672 (21.39% effective) via Finance's "Pay Rate + 4% vacation +
- *     16.72%" note. Finance's stated total is 20.72%, so the flat 1.2072 is used instead.
+ *
+ * NEWFOUNDLAND is the one province where Finance's email states the loading two different ways, and
+ * the two do not agree:
+ *   - the table says     "Final Loading Cost = 20.72%"                  -> 1.2072
+ *   - the note says      "Pay Rate + 4% Vacation pay + 16.72%"          -> 1.04 * 1.1672 = 1.213888
+ * i.e. the note's own arithmetic gives 21.39%, not the 20.72% it claims to break down.
+ *
+ * We follow the NOTE (1.04 * 1.1672), which is also what the legacy run-rate sheet applies, so the
+ * two sources reconcile. Awaiting Finance's confirmation of which reading is authoritative; if they
+ * confirm the flat total instead, change NL.t4 back to 1.2072 and re-run the backfill in
+ * sql/backfill_canada_nl_margins.sql.
  */
 const CANADA_BURDEN_BY_PROVINCE = Object.freeze({
   ON: { t4: 1.2155, t4a: 1.0337 },
   BC: { t4: 1.2258, t4a: 1.0 },
   NS: { t4: 1.2013, t4a: 1.0195 },
-  NL: { t4: 1.2072, t4a: 1.0254 },
+  // 1.04 * 1.1672 = 1.213888 — Finance's "Pay Rate + 4% Vacation pay + 16.72%" breakup.
+  NL: { t4: 1.04 * 1.1672, t4a: 1.0254 },
   // "No business" for T4A per Finance — T4 only.
   AB: { t4: 1.1818, t4a: null },
   MB: { t4: 1.1818, t4a: null },

@@ -29,6 +29,7 @@ const {
 const {
   fetchContractIdsByDealSheetIds,
   fetchContractIdsForExtensions,
+  fetchMaxContractIdSeqForTable,
   fetchLegacyContractIdentityForDealRows,
   buildLegacyContractLookupKey,
   legacyDealManualColumns,
@@ -697,7 +698,18 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
 
   let ids = [];
   try {
-    const result = await allocateContractIdsFn(totalToAllocate, sequenceOptions);
+    // Floor the Firestore counter at what the table has already issued, so a stale or absent
+    // sequence doc cannot re-mint a block that is already live (CHC23000..CHC23033 went out twice,
+    // Aug 2026 — 34 ids, each landing on two unrelated candidates). Advisory: if the lookup fails
+    // the stored counter stays in charge and minting still proceeds.
+    const seqOptionsWithFloor = {
+      ...sequenceOptions,
+      minNextValueFn: async () => {
+        const max = await fetchMaxContractIdSeqForTable(tableId, deps.bqOptions || {});
+        return max == null ? null : max + 1;
+      },
+    };
+    const result = await allocateContractIdsFn(totalToAllocate, seqOptionsWithFloor);
     if (Array.isArray(result)) ids = result;
   } catch (err) {
     logDetail(

@@ -117,7 +117,7 @@ test("isCanadaDealSheetRow keys on CLIENT_STATE only", () => {
 
 test("T4 loading matches Finance's Final Loading Cost per province", () => {
   const expected = {
-    ON: 1.2155, BC: 1.2258, NS: 1.2013, NL: 1.2072,
+    ON: 1.2155, BC: 1.2258, NS: 1.2013, NL: 1.04 * 1.1672,
     AB: 1.1818, MB: 1.1818, SK: 1.1818, QC: 1.1818, NB: 1.1818,
   };
   for (const [p, mult] of Object.entries(expected)) {
@@ -171,7 +171,7 @@ function payRow(overrides) {
 
 test("T4 pay rate applies the province multiplier to the pay rate", () => {
   const expected = {
-    ON: 121.55, BC: 122.58, NS: 120.13, NL: 120.72,
+    ON: 121.55, BC: 122.58, NS: 120.13, NL: 121.39,
     AB: 118.18, MB: 118.18, SK: 118.18, QC: 118.18, NB: 118.18,
   };
   for (const [p, want] of Object.entries(expected)) {
@@ -187,18 +187,21 @@ test("AB group does not double-count the 4% vacation", () => {
   assert.notEqual(out, 122.91);
 });
 
-test("NL uses the flat 20.72% loading, not 1.04 x 1.1672", () => {
+test("NL uses Finance's 4% + 16.72% breakup, not the flat 20.72%", () => {
+  // Finance's email states NL two ways that disagree: the table says 20.72% (1.2072) while the note
+  // says "Pay Rate + 4% Vacation pay + 16.72%" (1.04 * 1.1672 = 21.39%). We follow the note, which
+  // is also what the legacy run-rate sheet applies, so the two sources reconcile.
   const out = computeCanadaT4PayRate(payRow({ CLIENT_STATE: "NL" }));
-  assert.equal(out, 120.72);
-  assert.notEqual(out, 121.39);
+  assert.equal(out, 121.39);
+  assert.notEqual(out, 120.72);
 });
 
 test("NL alone adds the weekly per diem over 11.25 hours", () => {
   const withPerDiem = computeCanadaT4PayRate(
     payRow({ CLIENT_STATE: "NL", WEEKLY_PER_DIEM_NON_TAXED: 112.5 })
   );
-  // 120.72 + 112.5/11.25 = 120.72 + 10 = 130.72
-  assert.equal(withPerDiem, 130.72);
+  // 121.39 + 112.5/11.25 = 121.39 + 10 = 131.39
+  assert.equal(withPerDiem, 131.39);
 
   // Every other province ignores per diem.
   const bc = computeCanadaT4PayRate(

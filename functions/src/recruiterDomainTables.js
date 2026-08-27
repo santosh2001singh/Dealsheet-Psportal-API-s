@@ -162,6 +162,20 @@ function resolvePairedActiveTableId(endedTableId) {
   return ENDED_TO_ACTIVE_TABLE.get(key) ?? null;
 }
 
+const ACTIVE_TO_ENDED_TABLE = new Map(
+  [...ENDED_TO_ACTIVE_TABLE].map(([ended, active]) => [active, ended])
+);
+
+/**
+ * @param {unknown} activeTableId
+ * @returns {string|null} paired ended table id, or null if not an active table
+ */
+function resolvePairedEndedTableId(activeTableId) {
+  const key = activeTableId == null ? "" : String(activeTableId).trim();
+  if (!key) return null;
+  return ACTIVE_TO_ENDED_TABLE.get(key) ?? null;
+}
+
 /**
  * Domain-specific all_CH_data_runrate-equivalent table id for a given deal sheet table
  * (active or ended — ended is normalized to its paired active domain first).
@@ -268,5 +282,6 @@ module.exports = {
   TABLE_ENDED_CYNET_HEALTH_CANADA,
   TABLE_ENDED_CYNET_LOCUMS,
   resolvePairedActiveTableId,
+  resolvePairedEndedTableId,
   resolveRunrateTableIdForDealSheetTable,
 };
