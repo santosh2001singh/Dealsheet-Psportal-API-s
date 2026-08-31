@@ -617,11 +617,12 @@ exports.bulkBackfillByPlacementId = onRequest(
 
 /**
  * Scheduled: PeopleStrong employee sync daytime window.
- * Runs 8 times daily at 08:00-15:00 Eastern (hourly).
+ * Runs 4 times on WEEKDAYS ONLY at 08:00 / 10:00 / 12:00 / 14:00 Eastern (every 2 hours).
+ * Was hourly 08:00-15:00 every day; halved to a 2-hour cadence and cut to Mon-Fri to reduce cost.
  */
 exports.peoplestrongEmployeeDetailsSyncTrigger = onSchedule(
   {
-    schedule: "0 8,9,10,11,12,13,14,15 * * *",
+    schedule: "0 8,10,12,14 * * 1-5",
     timeZone: "America/New_York",
     region: REGION,
     timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
@@ -850,20 +851,23 @@ function buildDealSheetInsertTrigger(domain, label, schedule) {
 }
 
 // Staggered :00 / :10 / :20 so the three domains never run concurrently (shared Nexus API budget).
+// Weekdays only (day-of-week 1-5): no recruiting activity lands on Sat/Sun, so a weekend run scans
+// the same rows for nothing. Monday 08:00 picks up anything that did arrive over the weekend --
+// the sync is incremental over the page checkpoint, not a fixed lookback, so nothing is skipped.
 exports.dealSheetSyncTriggerHealth = buildDealSheetInsertTrigger(
   "health",
   "dealSheetSyncTriggerHealth",
-  "0 8-19 * * *"
+  "0 8-19 * * 1-5"
 );
 exports.dealSheetSyncTriggerCanada = buildDealSheetInsertTrigger(
   "canada",
   "dealSheetSyncTriggerCanada",
-  "10 8-19 * * *"
+  "10 8-19 * * 1-5"
 );
 exports.dealSheetSyncTriggerLocums = buildDealSheetInsertTrigger(
   "locums",
   "dealSheetSyncTriggerLocums",
-  "20 8-19 * * *"
+  "20 8-19 * * 1-5"
 );
 
 /**
@@ -1018,20 +1022,21 @@ function buildDealSheetUpdateTrigger(domain, label, schedule) {
 }
 
 // Interleaved with the inserts (:00/:10/:20) so each domain runs insert -> ~30m -> update.
+// Weekdays only, matching the insert triggers above.
 exports.dealSheetSyncUpdateTriggerHealth = buildDealSheetUpdateTrigger(
   "health",
   "dealSheetSyncUpdateTriggerHealth",
-  "30 8-19 * * *"
+  "30 8-19 * * 1-5"
 );
 exports.dealSheetSyncUpdateTriggerCanada = buildDealSheetUpdateTrigger(
   "canada",
   "dealSheetSyncUpdateTriggerCanada",
-  "40 8-19 * * *"
+  "40 8-19 * * 1-5"
 );
 exports.dealSheetSyncUpdateTriggerLocums = buildDealSheetUpdateTrigger(
   "locums",
   "dealSheetSyncUpdateTriggerLocums",
-  "50 8-19 * * *"
+  "50 8-19 * * 1-5"
 );
 
 /**
@@ -1152,10 +1157,15 @@ exports.dealSheetSyncOfferRejected = onRequest(
  * Scheduled: rate-change log stream (BigQuery CONTRACT_ID scan).
  * Scans active deal-sheet tables; when latest row per CONTRACT_ID has RATE_CHANGE=YES
  * and a previous row exists, writes OLD/NEW snapshot to ch_rate_change_logs.
+ *
+ * Runs 4 times on WEEKDAYS ONLY at 08:00 / 11:00 / 14:00 / 17:00 Eastern (every 3 hours).
+ * Was every 30 minutes 08:00-19:00 every day (24 runs/day); cut to a 3-hour cadence and Mon-Fri
+ * to reduce cost. This is an audit-log scan, not a data path — a longer gap only delays when a
+ * rate change is recorded, it never loses one (the scan is idempotent over CONTRACT_ID history).
  */
 exports.rateChangeLogSyncTrigger = onSchedule(
   {
-    schedule: "0,30 8-19 * * *",
+    schedule: "0 8,11,14,17 * * 1-5",
     timeZone: "America/New_York",
     region: REGION,
     timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
