@@ -44,6 +44,7 @@ const {
   buildInorganicHierarchyLogCandidate,
   resolveInorganicHierarchyLogRows,
   filterInorganicHierarchyAgainstFrozenOrganic,
+  buildInorganicCandidateFromReconciliation,
   insertInorganicHierarchyLogBatch,
   fetchDealSheetOwnershipChangePairsFromActive,
   fetchContractOwnershipChangePairsFromActive,
@@ -2485,19 +2486,51 @@ async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
     `[inorganic hierarchy logs BQ scan] afterOrganicFilter=${recruiterChangeRows.length} (droppedSameHierarchy=${resolvedRecruiterChange.length - recruiterChangeRows.length})`
   );
 
-  const rows = [...runrateRows, ...recruiterChangeRows];
-  const result = await insertInorganicHierarchyLogBatch(rows, 0, {
-    datasetId: logDatasetId,
-    tableId: logTableId,
-  });
-
   // ONSITE_AM hierarchy (LEVEL_2/3/4_CSM) is deliberately NOT logged inorganic — its organic columns
   // already track the current ONSITE_AM continuously on the deal sheet, and the change is captured in
   // ownership_change_logs. Business rule: no INORGANIC_ONSITE_AM / INORGANIC_LEVEL_*_CSM.
 
-  // Reconciliation still drives the hierarchy MOVE (RM<->AM interchange) appends and the
-  // ownership_change_logs vacate+fill rows below; its newPersons are no longer routed to inorganic.
+  // Reconciliation drives the hierarchy MOVE (RM<->AM interchange) appends and the
+  // ownership_change_logs vacate+fill rows below, AND (1c) its newPersons.
   const reconResults = await fetchRecruiterHierarchyReconciliation({ datasetId: dealSheetDatasetId });
+
+  // (1c) Recruiter-hierarchy newPersons: a manager who appeared in the recruiter's live chain AFTER
+  // the placement's hierarchy was frozen. Neither (1a) nor (1b) can see this — (1a) is EXTENSION-only
+  // run-rate sourced, and (1b) fires only when the recruiter EMAIL changes. Without this a DEAL row
+  // whose recruiter never changed but whose chain gained (say) a Team Lead post-hire produced no log
+  // row at all. Restores the pre-d9c4937 behaviour for that gap only; EXTENSION rows keep taking
+  // their INORGANIC_* from (1a), so any placement already covered there is dropped by the
+  // DEAL_SHEET_ID+PLACEMENT_ID dedupe inside insertInorganicHierarchyLogBatch.
+  const reconCandidates = [];
+  const reconFrozenLatest = [];
+  for (const r of reconResults) {
+    const candidate = buildInorganicCandidateFromReconciliation(r);
+    if (!candidate) continue;
+    reconCandidates.push(candidate);
+    reconFrozenLatest.push(r.latestScanRow || null);
+  }
+  const resolvedRecon = await resolveInorganicHierarchyLogRows(reconCandidates, {
+    datasetId: dealSheetDatasetId,
+  });
+  const reconRows = [];
+  for (let i = 0; i < resolvedRecon.length; i++) {
+    // Same frozen-organic filter (1b) applies: a chain slot that already matches the deal sheet's
+    // organic hierarchy is not "inorganic" and must not be logged.
+    const { row, hasDivergence } = filterInorganicHierarchyAgainstFrozenOrganic(
+      resolvedRecon[i],
+      reconFrozenLatest[i]
+    );
+    if (hasDivergence) reconRows.push(row);
+  }
+  logLine(
+    `[inorganic hierarchy logs BQ scan] reconNewPersonCandidates=${reconCandidates.length} afterOrganicFilter=${reconRows.length}`
+  );
+
+  const rows = [...runrateRows, ...recruiterChangeRows, ...reconRows];
+  const result = await insertInorganicHierarchyLogBatch(rows, 0, {
+    datasetId: logDatasetId,
+    tableId: logTableId,
+  });
 
   // (2) Apply hierarchy MOVES back to the deal sheet (append-only) ...
   let movesResult = { appended: 0, placements: 0 };

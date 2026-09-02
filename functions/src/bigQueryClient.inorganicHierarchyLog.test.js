@@ -417,8 +417,10 @@ test("filterInorganicHierarchyAgainstFrozenOrganic: EXTENSION new person only �
   assert.equal(row.INORGANIC_ACCOUNT_MANAGER_EMP_NO, null);
   assert.equal(row.INORGANIC_RM, "Brand New RM");
   assert.equal(row.INORGANIC_RM_EMP_NO, "RM_NEW");
-  assert.equal(row.INORGANIC_DELIVERY_POC, "Brand New RM");
-  assert.equal(row.INORGANIC_DELIVERY_POC_EMP_NO, "RM_NEW");
+  // POC chain is ADD -> DD -> AVP -> VP only; an RM-only divergence leaves no eligible POC.
+  assert.equal(row.INORGANIC_DELIVERY_POC, null);
+  assert.equal(row.INORGANIC_DELIVERY_POC_EMP_NO, null);
+  assert.equal(row.INORGANIC_DELIVERY_POC_EMAIL, null);
 });
 
 test("filterInorganicHierarchyAgainstFrozenOrganic: EXTENSION fully different chain → all divergent roles set", () => {
@@ -451,10 +453,65 @@ test("filterInorganicHierarchyAgainstFrozenOrganic: EXTENSION fully different ch
   assert.equal(row.INORGANIC_RM, "New RM");
   assert.equal(row.INORGANIC_ACCOUNT_MANAGER, "New AM");
   assert.equal(row.INORGANIC_ATL, "New ATL");
-  assert.equal(row.INORGANIC_DELIVERY_POC, "New AM");
-  assert.equal(row.INORGANIC_DELIVERY_POC_EMP_NO, "AM_NEW");
-  // Same emp remains POC → keep prior email.
-  assert.equal(row.INORGANIC_DELIVERY_POC_EMAIL, "newam@cynethealth.com");
+  // None of TL/RM/AM/ATL is POC-eligible (chain is ADD -> DD -> AVP -> VP), so POC clears.
+  assert.equal(row.INORGANIC_DELIVERY_POC, null);
+  assert.equal(row.INORGANIC_DELIVERY_POC_EMP_NO, null);
+  assert.equal(row.INORGANIC_DELIVERY_POC_EMAIL, null);
+});
+
+test("INORGANIC_DELIVERY_POC: ADD wins over DD/AVP/VP (nearest-owner-first)", () => {
+  const inorganicRow = {
+    INORGANIC_ASSOCIATE_GROUP_DIRECTOR: "The ADD",
+    INORGANIC_ASSOCIATE_GROUP_DIRECTOR_EMP_NO: "ADD1",
+    INORGANIC_DELIVERY_DIRECTOR: "The DD",
+    INORGANIC_DELIVERY_DIRECTOR_EMP_NO: "DD1",
+    INORGANIC_AVP: "The AVP",
+    INORGANIC_AVP_EMP_NO: "AVP1",
+    INORGANIC_VP_SR_VP: "The VP",
+    INORGANIC_VP_SR_VP_EMP_NO: "VP1",
+  };
+  const { row, hasDivergence } = filterInorganicHierarchyAgainstFrozenOrganic(inorganicRow, {});
+  assert.equal(hasDivergence, true);
+  assert.equal(row.INORGANIC_DELIVERY_POC, "The ADD");
+  assert.equal(row.INORGANIC_DELIVERY_POC_EMP_NO, "ADD1");
+});
+
+test("INORGANIC_DELIVERY_POC: climbs ADD -> DD -> AVP -> VP as slots empty out", () => {
+  const base = {
+    INORGANIC_DELIVERY_DIRECTOR: "The DD",
+    INORGANIC_DELIVERY_DIRECTOR_EMP_NO: "DD1",
+    INORGANIC_AVP: "The AVP",
+    INORGANIC_AVP_EMP_NO: "AVP1",
+    INORGANIC_VP_SR_VP: "The VP",
+    INORGANIC_VP_SR_VP_EMP_NO: "VP1",
+  };
+  assert.equal(filterInorganicHierarchyAgainstFrozenOrganic({ ...base }, {}).row.INORGANIC_DELIVERY_POC, "The DD");
+
+  const noDd = { ...base };
+  delete noDd.INORGANIC_DELIVERY_DIRECTOR;
+  delete noDd.INORGANIC_DELIVERY_DIRECTOR_EMP_NO;
+  assert.equal(filterInorganicHierarchyAgainstFrozenOrganic(noDd, {}).row.INORGANIC_DELIVERY_POC, "The AVP");
+
+  const vpOnly = { INORGANIC_VP_SR_VP: "The VP", INORGANIC_VP_SR_VP_EMP_NO: "VP1" };
+  assert.equal(filterInorganicHierarchyAgainstFrozenOrganic(vpOnly, {}).row.INORGANIC_DELIVERY_POC, "The VP");
+});
+
+test("INORGANIC_DELIVERY_POC: never falls through to AM/RM/TL/ATL/recruiter", () => {
+  const inorganicRow = {
+    INORGANIC_RECRUITER: "The Recruiter",
+    INORGANIC_RECRUITER_EMP_NO: "REC1",
+    INORGANIC_ACCOUNT_MANAGER: "The AM",
+    INORGANIC_ACCOUNT_MANAGER_EMP_NO: "AM1",
+    INORGANIC_RM: "The RM",
+    INORGANIC_RM_EMP_NO: "RM1",
+    INORGANIC_TL: "The TL",
+    INORGANIC_TL_EMP_NO: "TL1",
+    INORGANIC_ATL: "The ATL",
+    INORGANIC_ATL_EMP_NO: "ATL1",
+  };
+  const { row } = filterInorganicHierarchyAgainstFrozenOrganic(inorganicRow, {});
+  assert.equal(row.INORGANIC_DELIVERY_POC, null);
+  assert.equal(row.INORGANIC_DELIVERY_POC_EMP_NO, null);
 });
 
 test("filterInorganicHierarchyAgainstFrozenOrganic: same by name when emp missing still clears slot", () => {

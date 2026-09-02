@@ -5821,21 +5821,21 @@ function isAvailableHierarchyValue(value) {
 }
 
 /**
- * Same priority chain as DELIVERY_POC but over the INORGANIC_* columns of an inorganic_hierarchy_logs
- * row (no SECONDARY_AM / DELIVERY_DIRECTOR / AVP — mirrors DELIVERY_POC_PRIORITY exactly). Used to
- * derive INORGANIC_DELIVERY_POC = the highest-seniority person present in the recruiter's live chain.
+ * INORGANIC_DELIVERY_POC priority over the INORGANIC_* columns of an inorganic_hierarchy_logs row.
+ *
+ * Deliberately NOT the same shape as the deal-sheet DELIVERY_POC_PRIORITY: the inorganic POC starts
+ * at Associate Delivery Director and only ever climbs to VP. Delivery-side ownership of an inorganic
+ * placement sits with those four roles — AM / RM / TL / ATL / the recruiter are never the inorganic
+ * POC, so when none of the four is present the POC is left null rather than falling through to a
+ * junior role (which is what the old recruiter-terminated chain did).
+ *
+ * Order is nearest-owner-first: ADD -> DD -> AVP -> VP.
  */
 const INORGANIC_DELIVERY_POC_PRIORITY = [
-  { nameCol: "INORGANIC_VP_SR_VP", empCol: "INORGANIC_VP_SR_VP_EMP_NO" },
-  { nameCol: "INORGANIC_AVP", empCol: "INORGANIC_AVP_EMP_NO" },
   { nameCol: "INORGANIC_ASSOCIATE_GROUP_DIRECTOR", empCol: "INORGANIC_ASSOCIATE_GROUP_DIRECTOR_EMP_NO" },
   { nameCol: "INORGANIC_DELIVERY_DIRECTOR", empCol: "INORGANIC_DELIVERY_DIRECTOR_EMP_NO" },
-  { nameCol: "INORGANIC_ACCOUNT_MANAGER", empCol: "INORGANIC_ACCOUNT_MANAGER_EMP_NO" },
-  { nameCol: "INORGANIC_ASSOCIATE_AM", empCol: "INORGANIC_ASSOCIATE_AM_EMP_NO" },
-  { nameCol: "INORGANIC_RM", empCol: "INORGANIC_RM_EMP_NO" },
-  { nameCol: "INORGANIC_TL", empCol: "INORGANIC_TL_EMP_NO" },
-  { nameCol: "INORGANIC_ATL", empCol: "INORGANIC_ATL_EMP_NO" },
-  { nameCol: "INORGANIC_RECRUITER", empCol: "INORGANIC_RECRUITER_EMP_NO", isRecruiter: true },
+  { nameCol: "INORGANIC_AVP", empCol: "INORGANIC_AVP_EMP_NO" },
+  { nameCol: "INORGANIC_VP_SR_VP", empCol: "INORGANIC_VP_SR_VP_EMP_NO" },
 ];
 
 /**
@@ -6232,7 +6232,6 @@ async function fetchRecruiterHierarchyReconciliation(options = {}, deps = {}) {
  * Map a reconciliation result's newPersons to the inorganic-log candidate shape
  * ({..., recruiterHierarchyDiverged: {designation: {name, empNo}}}), or null when there are none.
  */
-// @deprecated Reconciliation newPersons are no longer routed to the inorganic log. Kept for tests.
 function buildInorganicCandidateFromReconciliation(reconResult) {
   if (!reconResult || !reconResult.newPersons || reconResult.newPersons.length === 0) return null;
   const diverged = {};
