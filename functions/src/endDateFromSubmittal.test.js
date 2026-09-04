@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const { computeBqEndDateFromSubmittal, mapJobSubmittalToBq } = require("./columnMappings");
 
 // Business rule:
-//  TENTATIVE_END_DATE = job.end_date  (planned/tentative end)
+//  TENTATIVE_END_DATE = submittal.end_date (planned/tentative end), job.end_date as fallback only
 //  END_DATE       = submittal.end_date (ACTUAL end) — ONLY once the placement has ENDED / ENDED<30.
 //  STARTED/BOOKED/ACTIVE -> END_DATE null (not ended yet). DID NOT ACCEPT/START -> end = start.
 const JOB = { start_date: "2026-06-22", end_date: "2026-09-19" };
@@ -41,8 +41,8 @@ test("END_DATE = start_date for DID NOT ACCEPT / DID NOT START (never worked)", 
   assert.equal(computeBqEndDateFromSubmittal(withStatus("CANCELLED"), JOB), "2026-06-22");
 });
 
-test("TENTATIVE_END_DATE = job.end_date (planned), START_DATE = job.start_date", () => {
+test("TENTATIVE_END_DATE = submittal.end_date (planned), START_DATE = submittal.start_date", () => {
   const m = mapJobSubmittalToBq(withStatus("EARLY_TERM"), JOB);
-  assert.equal(m.TENTATIVE_END_DATE, "2026-09-19");
+  assert.equal(m.TENTATIVE_END_DATE, "2026-07-06");
   assert.equal(m.START_DATE, "2026-06-22");
 });

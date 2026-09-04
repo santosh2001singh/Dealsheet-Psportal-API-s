@@ -277,6 +277,10 @@ const CANADA_DROPPED_INHERIT = [
   "FIFTYTWO_TENURE_RTO_LASTDATE",
   "FIFTYTWO_TENURE_CANDIDATE_STATUS",
   "CLIENT_NAME_IN_CONREP",
+  // AVP joined EXTENSION_PARENT_DEAL_INHERIT_COLUMNS in Sep 2026 (it had been missing while every
+  // other hierarchy role was there). Canada has no AVP role, so its tables drop the pair.
+  "AVP",
+  "AVP_EMP_NO",
 ];
 
 test("health and locums inherit the full parent-DEAL column list", () => {
@@ -289,7 +293,7 @@ test("health and locums inherit the full parent-DEAL column list", () => {
   }
 });
 
-test("canada omits the three columns its tables no longer have", () => {
+test("canada omits the columns its tables no longer have", () => {
   for (const t of ["cynet_health_canada_deal_sheet", "cynet_health_canada_ended_deal_sheet"]) {
     const cols = resolveExtensionParentDealInheritColumns(t);
     for (const c of CANADA_DROPPED_INHERIT) {

@@ -22,6 +22,8 @@ const {
   SYSTEM_CONTROLLED_COLUMNS,
   MANUAL_COLUMNS,
   isDidNotStartPlacementStatus,
+  isBookedPlacementStatus,
+  isTentativeCapturePlacementStatus,
   startDateOnOrAfterUtcMin,
   effectiveMinFilterDate,
 } = require("./columnMappings");
@@ -1085,9 +1087,26 @@ function applyManualColumnsCarryForward(incomingRow, baselineRow) {
 }
 
 /**
- * Freeze TENTATIVE_END_DATE from baseline when START_DATE is unchanged; keep incoming
- * API value when START_DATE changed (then freeze again on subsequent same-start runs).
- * DID NOT START always clears TENTATIVE_END_DATE (no baseline carry-forward).
+ * TENTATIVE_END_DATE capture + freeze (business rule, Sep 2026).
+ *
+ * The value is the SUBMITTAL's end_date (mapJobSubmittalToBq), captured only inside a status window
+ * and then frozen permanently:
+ *
+ *   OFFERED  -> capture the incoming API value; NOT frozen (a re-offer can still move the date)
+ *   BOOKED   -> capture the incoming API value and HARD-FREEZE it from here on
+ *   STARTED / ENDED / ENDED<30 / anything else -> carry the frozen baseline value, ignore the API
+ *   DID NOT START -> always cleared to null (no baseline carry-forward)
+ *
+ * The freeze is unconditional once the baseline holds a value: unlike the previous rule it is NOT
+ * released when START_DATE changes, so a start pushback after BOOKED leaves the tentative end date
+ * exactly as it was booked.
+ *
+ * Legacy rows carrying the old job-sourced value are simply frozen as-is — there is no backfill, so
+ * they keep whatever they already hold.
+ *
+ * Fallback: when the baseline has no tentative date at all (BOOKED was never observed, e.g. the
+ * placement was already STARTED on first sync) the incoming API value is captured instead of
+ * leaving the column permanently null.
  */
 function applyTentativeDateFreeze(incomingRow, baselineRow) {
   if (!baselineRow || !incomingRow || typeof incomingRow !== "object") {
@@ -1096,15 +1115,32 @@ function applyTentativeDateFreeze(incomingRow, baselineRow) {
   if (isDidNotStartPlacementStatus(incomingRow?.PLACEMENT_STATUS)) {
     return { row: { ...incomingRow, TENTATIVE_END_DATE: null }, frozen: false };
   }
-  const incomingStart = normalizeForCompare(incomingRow.START_DATE);
-  const baselineStart = normalizeForCompare(baselineRow.START_DATE);
-  if (incomingStart === baselineStart) {
-    return {
-      row: { ...incomingRow, TENTATIVE_END_DATE: baselineRow.TENTATIVE_END_DATE },
-      frozen: true,
-    };
+  // OFFERED (pre-BOOKED): soft capture — take the incoming API value, nothing is pinned yet.
+  if (
+    isTentativeCapturePlacementStatus(incomingRow?.PLACEMENT_STATUS) &&
+    !isBookedPlacementStatus(incomingRow?.PLACEMENT_STATUS)
+  ) {
+    return { row: incomingRow, frozen: false };
   }
-  return { row: incomingRow, frozen: false };
+  // The freeze only exists once the BASELINE itself reached BOOKED. While the stored row is still
+  // pre-BOOKED its tentative date is the soft OFFERED capture, so the BOOKED transition must
+  // re-capture over it rather than inherit it.
+  const baselineIsPinned =
+    normalizeForCompare(baselineRow.TENTATIVE_END_DATE) !== "" &&
+    !isTentativeCapturePlacementStatus(baselineRow?.PLACEMENT_STATUS);
+  const baselineIsBooked = isBookedPlacementStatus(baselineRow?.PLACEMENT_STATUS);
+  if (!baselineIsPinned && !baselineIsBooked) {
+    // Baseline is pre-BOOKED (or empty): this run is the BOOKED capture that pins the value.
+    return { row: incomingRow, frozen: false };
+  }
+  if (normalizeForCompare(baselineRow.TENTATIVE_END_DATE) === "") {
+    // Baseline reached BOOKED but never captured a date (blank API value) — let a real value land.
+    return { row: incomingRow, frozen: false };
+  }
+  return {
+    row: { ...incomingRow, TENTATIVE_END_DATE: baselineRow.TENTATIVE_END_DATE },
+    frozen: true,
+  };
 }
 
 /**
@@ -3997,6 +4033,12 @@ const EXTENSION_PARENT_DEAL_INHERIT_COLUMNS = [
   "ASSOCIATE_AM_EMP_NO",
   "ASSOCIATE_DELIVERY_DIRECTOR",
   "ASSOCIATE_DELIVERY_DIRECTOR_EMP_NO",
+  // AVP was missing from this list until Sep 2026 while every other hierarchy role was here, so a
+  // parent DEAL's AVP was never handed down to its extensions (5 of the 23 rows found had one).
+  // Canada has no AVP role and its tables carry no such column — that is already handled per table
+  // by DEAL_SHEET_MISSING_COLUMNS_BY_TABLE, which strips the pair before the SQL is built.
+  "AVP",
+  "AVP_EMP_NO",
   "VP",
   "VP_EMP_NO",
   "SECONDARY_RECRUITER",
@@ -4685,10 +4727,21 @@ async function fetchExtensionRunrateBackfillByPlacementId(rows, options = {}) {
 
     const placementStatusPredicate = buildRunrateEligiblePlacementStatusSqlPredicate();
 
-    // Ported from the analyst-authored matching query: same tiered match priority, same
-    // client_first_assignment/sku_first_assignment fallback chain for INITIAL_START_DATE
-    // and NEW_HIRE_DATE, and the same fixed runrate.START_DATE < 2026-05-01 cutoff (this
-    // marks the boundary of the historical runrate snapshot; do not change to CURRENT_DATE()).
+    // Ported from the analyst-authored matching query: same tiered match priority and the same
+    // client_first_assignment/sku_first_assignment fallback chain for INITIAL_START_DATE and
+    // NEW_HIRE_DATE.
+    //
+    // The original carried a fixed `runrate.START_DATE < 2026-05-01` cutoff, on the assumption that
+    // run-rate was a frozen historical snapshot and everything after that boundary lived in the deal
+    // sheet instead. That stopped being true — run-rate now holds rows starting well after it (live
+    // example, Sep 2026: CHC22142 / Michelle Mercedes Brooks, run-rate START_DATE 2026-05-27) — so
+    // the cutoff silently dropped those rows from this CTE, the extension matched nothing, and its
+    // hierarchy stayed null forever (the __CARRIED_FORWARD_UPDATE guard in
+    // rowNeedsExtensionInsertBackfill means first insert is the only chance). 23 rows had been hit
+    // before it was found. The cutoff is gone: the tiered match (email + client id + facility + VMS
+    // job id, each against the run-rate row's own date window) is what distinguishes one of a
+    // candidate's contracts from the next — a blanket date filter never was.
+    //
     // Only delta from the original one-off analysis query: `extensions` is this batch's
     // UNNEST(...) literal instead of a table scan (CONTRACT_ID IS NULL / DEAL_TYPE = EXTENSION
     // already enforced in JS).
@@ -4713,8 +4766,7 @@ async function fetchExtensionRunrateBackfillByPlacementId(rows, options = {}) {
           NEW_HIRE_DATE AS runrate_new_hire_date,
 ${runrateSelectHierarchy}
         FROM ${runrateFqn}
-        WHERE START_DATE < DATE '2026-05-01'
-          AND ${placementStatusPredicate}
+        WHERE ${placementStatusPredicate}
       ),
       -- Keyed on the parent client id where the run-rate row has one, falling back to the lowered
       -- name otherwise, so this "candidate's first assignment at this client" fallback groups the

@@ -12,7 +12,7 @@
  *                               ENDED / ENDED<30.
  *   DEAL_TYPE = EXTENSION
  *     - EXTENSION             : extension of the candidate's FIRST deal.
- *     - REBOOKED/EXTENSION    : extension of a REPEAT deal.
+ *     - REBOOKED / EXTENSION  : extension of a REPEAT deal.
  *     Both apply at ANY placement status (BOOKED, STARTED, ENDED, DNS) and to EVERY extension in
  *     the run — the 1st, 2nd and Nth extension of the same deal all read the same value.
  *
@@ -23,7 +23,7 @@
  *      next deal a repeat. A candidate who comes back to the same hospital is just as much a
  *      repeat as one who moves to a new one.
  *   2. Which DEAL does this EXTENSION hang off? — the extension inherits its parent deal's
- *      standing: first deal -> EXTENSION, repeat deal -> REBOOKED/EXTENSION.
+ *      standing: first deal -> EXTENSION, repeat deal -> REBOOKED / EXTENSION.
  *
  * Chain identity (which extensions belong to which deal) = candidate + client + VMS job:
  *   candidate = CANDIDATE_ID (else CANDIDATE_EMAIL),
@@ -56,7 +56,9 @@ const EXT_OR_REHIRE_VALUES = Object.freeze({
   EXTENSION: "EXTENSION",
   REOFFERED: "REOFFERED",
   REBOOKED: "REBOOKED",
-  REBOOKED_EXTENSION: "REBOOKED/EXTENSION",
+  // Spaces around the slash are deliberate: RunRate writes "REBOOKED / EXTENSION" and the two must
+  // read identically side by side (business request, Sep 2026). Do not collapse them.
+  REBOOKED_EXTENSION: "REBOOKED / EXTENSION",
 });
 
 /** All 6 domain deal sheet tables carry the column (active + ended). */
@@ -110,10 +112,10 @@ function isStartedPlacementStatus(status) {
  *   isRepeatDeal      - a DEAL with EARLIER history for this candidate anywhere (any client).
  *                       Drives REOFFERED/REBOOKED. Deliberately client-agnostic.
  *   parentIsRepeatDeal- for an EXTENSION: the DEAL it hangs off is itself a repeat deal.
- *                       Drives REBOOKED/EXTENSION vs plain EXTENSION.
+ *                       Drives REBOOKED / EXTENSION vs plain EXTENSION.
  *
  * Extension RANK is deliberately absent: the 2nd, 3rd, Nth extension of the same deal all carry
- * the same value as the 1st. What separates EXTENSION from REBOOKED/EXTENSION is which DEAL the
+ * the same value as the 1st. What separates EXTENSION from REBOOKED / EXTENSION is which DEAL the
  * extension belongs to, not how many came before it.
  */
 const EXT_OR_REHIRE_RULES = Object.freeze([

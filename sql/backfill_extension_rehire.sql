@@ -260,7 +260,7 @@ CREATE TEMP TABLE ext_rehire_values AS
   SELECT
     unit_key,
     CASE
-      WHEN deal_type = 'EXTENSION' AND parent_is_repeat_deal THEN 'REBOOKED/EXTENSION'
+      WHEN deal_type = 'EXTENSION' AND parent_is_repeat_deal THEN 'REBOOKED / EXTENSION'
       WHEN deal_type = 'EXTENSION' THEN 'EXTENSION'
       WHEN deal_type = 'DEAL' AND is_repeat_deal AND ever_started THEN 'REBOOKED'
       WHEN deal_type = 'DEAL' AND is_repeat_deal THEN 'REOFFERED'

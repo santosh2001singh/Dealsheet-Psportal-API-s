@@ -141,7 +141,7 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_ended_dea
   ST_DT_PUSHBACK_REASON STRING,
   EXTENSION_DATE TIMESTAMP,
   EXTENSION_START_DATE DATE,
-  -- "Extension/Rehire": EXTENSION / REOFFERED / REBOOKED / REBOOKED/EXTENSION.
+  -- "Extension/Rehire": EXTENSION | REOFFERED | REBOOKED | "REBOOKED / EXTENSION".
   -- (REHIRED retired Aug 2026 -- prior-other-client deals now read REOFFERED.)
   -- Derived + recomputed on every sync by functions/src/extensionRehire.js; never hand-edited.
   EXT_OR_REHIRE_BY_RMG STRING,

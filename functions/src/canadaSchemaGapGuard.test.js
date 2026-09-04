@@ -121,17 +121,25 @@ test("change-scan nulls AVP for canada and nothing for health", () => {
   assert.ok(!buildActiveChangeScanColumnList(HEALTH).includes("CAST(NULL"));
 });
 
-test("parent-DEAL inherit drops the three columns canada lacks", () => {
-  // Canada also GAINS three of its own (see PARENT_DEAL_INHERIT_EXTRA_COLUMNS_BY_TABLE), so the two
-  // lists happen to be the same length — what matters is which columns are on each side.
+test("parent-DEAL inherit drops the columns canada lacks", () => {
+  // Canada also GAINS columns of its own (see PARENT_DEAL_INHERIT_EXTRA_COLUMNS_BY_TABLE), so what
+  // matters is which columns are on each side, not the list lengths.
   const health = resolveExtensionParentDealInheritColumns(HEALTH);
   const canada = resolveExtensionParentDealInheritColumns(CANADA);
-  for (const c of ["FIFTYTWO_TENURE_RTO_LASTDATE", "FIFTYTWO_TENURE_CANDIDATE_STATUS", "CLIENT_NAME_IN_CONREP"]) {
+  // AVP/AVP_EMP_NO joined the shared list in Sep 2026; canada has no AVP role and drops the pair.
+  const expectedDrops = [
+    "FIFTYTWO_TENURE_RTO_LASTDATE",
+    "FIFTYTWO_TENURE_CANDIDATE_STATUS",
+    "CLIENT_NAME_IN_CONREP",
+    "AVP",
+    "AVP_EMP_NO",
+  ];
+  for (const c of expectedDrops) {
     assert.ok(!canada.includes(c), c);
     assert.ok(health.includes(c), `health keeps ${c}`);
   }
   const dropped = health.filter((c) => !canada.includes(c));
-  assert.equal(dropped.length, 3, `unexpected drops: ${dropped.join(", ")}`);
+  assert.deepEqual(dropped.sort(), [...expectedDrops].sort(), `unexpected drops: ${dropped.join(", ")}`);
 });
 
 // --------------------------------------------------------------------------

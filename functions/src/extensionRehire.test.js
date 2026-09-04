@@ -30,7 +30,10 @@ function facts(overrides = {}) {
 test("column name has no slash (BigQuery identifier) but values do", () => {
   assert.equal(EXT_OR_REHIRE_COLUMN, "EXT_OR_REHIRE_BY_RMG");
   assert.ok(!EXT_OR_REHIRE_COLUMN.includes("/"));
-  assert.equal(V.REBOOKED_EXTENSION, "REBOOKED/EXTENSION");
+  // Spaces around the slash are required: RunRate writes "REBOOKED / EXTENSION" and the RR tool
+  // must match it exactly (business request, Sep 2026).
+  assert.equal(V.REBOOKED_EXTENSION, "REBOOKED / EXTENSION");
+  assert.ok(V.REBOOKED_EXTENSION.includes(" / "));
 });
 
 test("all 6 domain deal sheet tables (active + ended) are covered", () => {
@@ -603,4 +606,22 @@ test("EXT_OR_REHIRE_BY_RMG is carried forward on update-append (MANUAL_COLUMNS) 
   assert.ok(MANUAL_COLUMNS.has(EXT_OR_REHIRE_COLUMN));
   // ...and never part of the change-detection gate, so it can't trigger a 0-diff append on its own.
   assert.ok(!API_OWNED_COLUMNS.has(EXT_OR_REHIRE_COLUMN));
+});
+
+// Guard: the standalone SQL in sql/backfill_extension_rehire.sql writes the same four values as
+// EXT_OR_REHIRE_VALUES. It is a second copy of the rules (run by hand for a full rebuild), so a
+// value changed in one place and not the other silently rewrites rows to the stale spelling — which
+// is exactly what would have happened when "REBOOKED/EXTENSION" gained its spaces (Sep 2026).
+test("standalone backfill SQL writes the same values as EXT_OR_REHIRE_VALUES", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const sql = fs.readFileSync(
+    path.join(__dirname, "..", "..", "sql", "backfill_extension_rehire.sql"),
+    "utf8"
+  );
+  for (const value of Object.values(V)) {
+    assert.ok(sql.includes(`'${value}'`), `sql/backfill_extension_rehire.sql must write '${value}'`);
+  }
+  // And must NOT still carry the pre-space spelling.
+  assert.ok(!sql.includes("'REBOOKED/EXTENSION'"), "stale REBOOKED/EXTENSION left in the SQL");
 });

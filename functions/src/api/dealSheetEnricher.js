@@ -1074,6 +1074,9 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       // carried forward from the baseline row by applyManualColumnsCarryForward.
       LINE_OF_BUSINESS: lineOfBusiness,
       START_DATE: submittalPart?.START_DATE ?? null,
+      // Raw capture only (submittal end_date, job end_date as fallback — see mapJobSubmittalToBq).
+      // The OFFERED/BOOKED capture window and the BOOKED hard-freeze are applied downstream in
+      // applyTentativeDateFreeze, which is the only place the stored baseline is known.
       TENTATIVE_END_DATE: resolveTentativeDateForPlacementRow(
         submittalPart?.PLACEMENT_STATUS,
         submittalPart?.TENTATIVE_END_DATE ?? jobPart?.TENTATIVE_END_DATE ?? null

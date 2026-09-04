@@ -1344,14 +1344,15 @@ function mapJobSubmittalToBq(submittalRow, jobObj) {
   const startRaw = firstNonEmptyDate(submittalRow?.start_date, jobObj?.start_date);
   const startDate =
     startRaw == null ? null : (formatDateStringForBq(startRaw) ?? String(startRaw).trim());
-  // TENTATIVE_END_DATE (planned/tentative end): the JOB's end_date ONLY — no submittal fallback (business
-  // rule: tentative end comes from the job). Blank/absent job end_date -> null.
-  const tentativeRaw = jobObj?.end_date;
-  const tentativeDate = formatDateStringForBq(tentativeRaw) ?? (
-    tentativeRaw == null || String(tentativeRaw).trim() === ""
-      ? null
-      : String(tentativeRaw).trim()
-  );
+  // TENTATIVE_END_DATE (planned/tentative end): the SUBMITTAL's end_date, job end_date as fallback
+  // only when the submittal has none/blank. (Business rule changed Sep 2026: tentative end is the
+  // submittal's end date, captured at OFFERED and hard-frozen at BOOKED — see
+  // applyTentativeDateFreeze. It was previously the job's end_date only.) The status-based capture /
+  // freeze lives downstream; this mapper just surfaces the current API value.
+  const tentativeRaw = firstNonEmptyDate(submittalRow?.end_date, jobObj?.end_date);
+  const tentativeDate = tentativeRaw == null
+    ? null
+    : (formatDateStringForBq(tentativeRaw) ?? String(tentativeRaw).trim());
   return {
     PLACEMENT_ID: n != null && Number.isFinite(n) ? Math.trunc(n) : null,
     SUBMISSION_DATE: submittedStr,
@@ -1469,14 +1470,44 @@ function isDidNotStartPlacementStatus(status) {
   return normalizePlacementStatusKey(status) === "DID NOT START";
 }
 
+/** Placement statuses at/before which TENTATIVE_END_DATE is still captured from the API. */
+const TENTATIVE_CAPTURE_PLACEMENT_STATUSES = new Set(["OFFERED", "BOOKED"]);
+
 /**
- * TENTATIVE_END_DATE for enriched row: null when placement is DID NOT START.
+ * True while the placement is still at a status where TENTATIVE_END_DATE is captured from the
+ * submittal API (OFFERED = soft capture, BOOKED = capture then hard-freeze).
+ * @param {string|null|undefined} status
+ */
+function isTentativeCapturePlacementStatus(status) {
+  return TENTATIVE_CAPTURE_PLACEMENT_STATUSES.has(normalizePlacementStatusKey(status));
+}
+
+/** True when PLACEMENT_STATUS is BOOKED — the point TENTATIVE_END_DATE hard-freezes. */
+function isBookedPlacementStatus(status) {
+  return normalizePlacementStatusKey(status) === "BOOKED";
+}
+
+/**
+ * TENTATIVE_END_DATE for the enriched row: the raw capture (submittal end_date, job end_date as
+ * fallback), cleared for DID NOT START.
+ *
+ * The OFFERED/BOOKED capture window and the BOOKED hard-freeze are NOT applied here — the enrich
+ * stage has no access to the stored baseline. applyTentativeDateFreeze owns that, and it is the sole
+ * authority because TENTATIVE_END_DATE is a SYSTEM_CONTROLLED column (the change-gate never compares
+ * it). On a first insert there is no baseline, so this captured value is what lands — which is also
+ * the wanted fallback when BOOKED was never observed (placement already STARTED on first sync).
+ *
+ * `hasBaseline` lets a caller that DOES know the baseline apply the window here too; it defaults to
+ * false so the enrich path keeps the raw capture.
+ *
  * @param {string|null|undefined} placementStatus
  * @param {string|null|undefined} tentativeDate
+ * @param {boolean} [hasBaseline=false] - true when a stored row exists to be frozen from
  * @returns {string|null}
  */
-function resolveTentativeDateForPlacementRow(placementStatus, tentativeDate) {
+function resolveTentativeDateForPlacementRow(placementStatus, tentativeDate, hasBaseline = false) {
   if (isDidNotStartPlacementStatus(placementStatus)) return null;
+  if (hasBaseline && !isTentativeCapturePlacementStatus(placementStatus)) return null;
   if (tentativeDate == null) return null;
   const s = String(tentativeDate).trim();
   return s === "" ? null : tentativeDate;
@@ -1729,8 +1760,9 @@ Object.freeze(API_OWNED_COLUMNS);
  * `ID` is generated per insert, `LAST_UPDATED` is set at insert time,
  * `IS_REJECTED` is reset by applyIsRejectedResetForChangedUpdate,
  * `MOVE_RUNRATE` is gated by applyMoveRunrateAppendOverride,
- * `TENTATIVE_END_DATE` is cleared when PLACEMENT_STATUS is DID NOT START; otherwise frozen by
- * applyTentativeDateFreeze (release on START_DATE change),
+ * `TENTATIVE_END_DATE` is cleared when PLACEMENT_STATUS is DID NOT START; captured from the submittal
+ * end_date while OFFERED (soft) and BOOKED, then hard-frozen from baseline forever by
+ * applyTentativeDateFreeze (never released, not even on START_DATE change),
  * `NEW_HIRE_DATE` is set from job-submittal-notes (earliest BOOKED modified_date) for DEAL rows when baseline is empty;
  * EXTENSION rows are not set from API on enrich; once baseline has a value it is frozen on update-append (DEAL or EXTENSION)
  * unless `NEW_HIRE_DATE_FREEZE_ENABLED=false` (one-time migration to rewrite legacy insert-time stamps).
@@ -1924,6 +1956,8 @@ module.exports = {
   isTerminationApiEligiblePlacementStatus,
   normalizePlacementStatusKey,
   isDidNotStartPlacementStatus,
+  isBookedPlacementStatus,
+  isTentativeCapturePlacementStatus,
   resolveTentativeDateForPlacementRow,
   resolveNewHireDateFromSubmittalNotes,
   resolveNewHireDateForDealRow,

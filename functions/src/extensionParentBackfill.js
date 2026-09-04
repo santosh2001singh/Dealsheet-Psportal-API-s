@@ -53,11 +53,33 @@ const EXTENSION_PARENT_BACKFILL_TABLE_IDS = Object.freeze(["cynet_health_deal_sh
  */
 const EXTRA_PARENT_BACKFILL_COLUMNS = Object.freeze([]);
 
-/** DATE/TIMESTAMP columns: compared with a plain IS NULL, never TRIM()ed. */
+/**
+ * NON-STRING columns: compared with a plain IS NULL, never TRIM()ed / IFNULL(.., '')ed.
+ *
+ * Both helpers below wrap a column in `IFNULL(col, '')` unless it is listed here, which BigQuery
+ * rejects outright on a non-STRING column: `No matching signature for function IFNULL / Argument
+ * types: FLOAT64, STRING`. That error aborts the whole multi-statement script, so ONE unlisted
+ * numeric column silently disabled this entire pass — every EXTENSION whose parent DEAL landed after
+ * it kept its null hierarchy (23 rows found in Sep 2026, repaired by hand). The FLOAT64 and DATE
+ * members below were the ones missing.
+ *
+ * Whenever a column is added to EXTENSION_PARENT_DEAL_INHERIT_COLUMNS, check its type in
+ * sql/create_domain_deal_sheet_tables.sql and list it here if it is not a STRING.
+ */
 const DATE_LIKE_COLUMNS = new Set([
+  // TIMESTAMP / DATE
   "NEW_HIRE_DATE",
   "INITIAL_START_DATE",
   "FIFTYTWO_TENURE_RTO_LASTDATE",
+  "ONB_CAND_DOB",
+  "ONB_SUPP_DOC1_EXP_DT",
+  "ONB_SUPP_DOC2_EXP_DT",
+  // FLOAT64 — these are what triggered the IFNULL(FLOAT64, STRING) failure
+  "WEEKLY_WALLET_MONEY",
+  "BGC_AMOUNT1",
+  "BGC_AMOUNT2",
+  "BGC_AMOUNT3",
+  "BGC_TOTAL_BGV_COST",
 ]);
 
 /**

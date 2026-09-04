@@ -35,19 +35,25 @@ test("START_DATE null when neither submittal nor job has a start_date", () => {
   assert.equal(out.START_DATE, null);
 });
 
-test("TENTATIVE_END_DATE uses job.end_date only (no submittal fallback)", () => {
-  // job present -> job wins
+test("TENTATIVE_END_DATE is submittal.end_date first, job.end_date as fallback", () => {
+  // submittal present -> submittal wins over the job
   assert.equal(
     mapJobSubmittalToBq({ id: 1, end_date: "2026-06-08" }, { end_date: "2026-07-12" }).TENTATIVE_END_DATE,
+    "2026-06-08"
+  );
+  // submittal end_date blank/absent -> fall back to the job's end_date
+  assert.equal(
+    mapJobSubmittalToBq({ id: 1, end_date: null }, { end_date: "2026-07-12" }).TENTATIVE_END_DATE,
     "2026-07-12"
   );
-  // job end_date blank/null -> null, even though the submittal has an end_date (no fallback)
   assert.equal(
-    mapJobSubmittalToBq({ id: 1, end_date: "2026-06-08" }, { end_date: null }).TENTATIVE_END_DATE,
+    mapJobSubmittalToBq({ id: 1, end_date: "   " }, { end_date: "2026-07-12" }).TENTATIVE_END_DATE,
+    "2026-07-12"
+  );
+  // neither has one -> null
+  assert.equal(
+    mapJobSubmittalToBq({ id: 1, end_date: null }, { end_date: null }).TENTATIVE_END_DATE,
     null
   );
-  assert.equal(
-    mapJobSubmittalToBq({ id: 1, end_date: "2026-06-08" }, {}).TENTATIVE_END_DATE,
-    null
-  );
+  assert.equal(mapJobSubmittalToBq({ id: 1, end_date: null }, {}).TENTATIVE_END_DATE, null);
 });
