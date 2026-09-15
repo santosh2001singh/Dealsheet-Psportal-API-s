@@ -1056,6 +1056,253 @@ function applyContractIdCarryForward(incomingRow, baselineRow) {
 }
 
 /**
+ * Every column a DEAL row inherits from a matched legacy run-rate row, alongside CONTRACT_ID.
+ *
+ * When the match turns out to be wrong the id is not the only casualty: the whole entry was copied
+ * off that row (see assignLegacyManualColumns / legacyDealManualColumns), so the placement is also
+ * carrying the other contract's SKU, its ops/credentialing setup and its narrative. Repairing the
+ * id without clearing these leaves the row half-corrected — the Juan M Silva DEAL still read
+ * "Contract Extended till 09/05/2026 / Termination Reason - Contract Ended" from a contract it
+ * never belonged to.
+ *
+ * INITIAL_START_DATE is NOT in this list because it must not be blanked — it is RESET to the row's
+ * own START_DATE instead (see repairStoredContractIdForPlacement). A DEAL is the first placement of
+ * its contract, so its start IS the original start; the value inherited here belonged to the other
+ * contract's chain (Juan M Silva's fresh 2026-10-12 booking was carrying 2025-09-08).
+ *
+ * @param {string} [runrateTableId]
+ * @returns {string[]}
+ */
+function legacyInheritedColumnsForDealRow(runrateTableId) {
+  return ["SKU_NUMBER", ...legacyDealManualColumns(runrateTableId)];
+}
+
+/**
+ * Re-validate a DEAL row's CONTRACT_ID against the run-rate window as it stands TODAY.
+ *
+ * The window a match was judged against is not fixed. It is
+ * `START_DATE .. COALESCE(END_DATE, TENTATIVE_END_DATE)`, so while the previous placement is still
+ * running its END_DATE is null and the window stretches to the tentative end. Once the client ends
+ * that assignment the real END_DATE lands and the window SHRINKS — and a booking that legitimately
+ * sat inside the optimistic window can fall outside the real one.
+ *
+ * That is exactly what happened to Juan M Silva (CANDIDATE_ID 7976807):
+ *
+ *   2026-08-31  DEAL 1464679 (2026-10-12 .. 2027-01-09) inserted. Placement 1455761 was STARTED with
+ *               END_DATE null, so CHC19805's window was open-ended and the match looked right.
+ *   2026-09-08  1455761 went ENDED with END_DATE 2026-09-05. CHC19805's window became
+ *               2026-06-07 .. 2026-09-05 — and the DEAL now starts five weeks AFTER it closes.
+ *
+ * So the id was not necessarily wrong when it was assigned; it became wrong. applyContractIdCarryForward
+ * makes a placement's id immutable, so nothing in the normal flow re-examines it. This runs on the
+ * refresh endpoint, where a user who spots a wrong row asks for exactly that re-examination, and
+ * applies the same rule the insert path enforces (legacyWindowCoversAnyOwnDate): if none of this
+ * row's own dates falls inside the CURRENT window, the row belongs to a new contract.
+ *
+ * Returns the replacement id to write; it never leaves the row without one, so the placement is
+ * never parked on a null id waiting for some later run to notice.
+ *
+ * Narrow by design:
+ *   - DEAL rows only. An EXTENSION legitimately starts after its contract's window closes.
+ *   - Only when run-rate actually has a window for that id. No evidence -> no change.
+ *   - Only when the row contributes at least one date of its own.
+ *
+ * @param {object} incomingRow
+ * @param {object|null} baselineRow
+ * @param {object} [options] - { datasetId, tableId }
+ * @param {object} [deps] - { fetchWindowFn, allocateFn }
+ * @returns {Promise<{needsRepair: boolean, previousContractId: string|null, newContractId: string|null, clearedColumns: string[]}>}
+ */
+async function revalidateDealContractIdAgainstRunrate(incomingRow, baselineRow, options = {}, deps = {}) {
+  const none = { needsRepair: false, previousContractId: null, newContractId: null, clearedColumns: [] };
+  if (!incomingRow || typeof incomingRow !== "object") return none;
+  if (normalizeDealTypeKey(incomingRow.DEAL_TYPE) !== "DEAL") return none;
+
+  const currentId =
+    normalizeContractIdOrNull(incomingRow.CONTRACT_ID) ??
+    normalizeContractIdOrNull(baselineRow?.CONTRACT_ID);
+  if (currentId == null) return none;
+
+  const spanKey = {
+    startDate: normalizeLegacyDateOnlyOrNull(incomingRow.START_DATE) ?? "",
+    endDate: normalizeLegacyDateOnlyOrNull(incomingRow.END_DATE) ?? "",
+    tentativeEndDate: normalizeLegacyDateOnlyOrNull(incomingRow.TENTATIVE_END_DATE) ?? "",
+  };
+  if (!spanKey.startDate && !spanKey.endDate && !spanKey.tentativeEndDate) return none;
+
+  const fetchWindowFn = deps.fetchWindowFn ?? fetchRunrateWindowForContractId;
+  let window = null;
+  try {
+    window = await fetchWindowFn(currentId, options);
+  } catch (err) {
+    // Advisory: a lookup failure must never disturb a stored id.
+    logDetail(
+      `[contract revalidate] window lookup failed for ${currentId} (keeping id): ${String(err?.message || err).slice(0, 200)}`
+    );
+    return none;
+  }
+  if (!window) return none;
+  if (legacyWindowCoversAnyOwnDate(spanKey, window)) return none;
+
+  // Mint the replacement BEFORE anything is written, so the row moves old id -> new id in a single
+  // step and is never left holding null. A null in between is not a harmless intermediate state:
+  // hasBusinessColumnChanges treats "incoming null vs baseline null" as no change, so the row would
+  // be filtered out of the insert path and simply stay unidentified.
+  const allocateFn = deps.allocateFn ?? allocateContractIdForRepair;
+  let newContractId = null;
+  try {
+    newContractId = await allocateFn(options);
+  } catch (err) {
+    logDetail(
+      `[contract revalidate] could not mint a replacement id (keeping ${currentId}): ${String(err?.message || err).slice(0, 200)}`
+    );
+    return none;
+  }
+  if (normalizeContractIdOrNull(newContractId) == null) return none;
+
+  const clearedColumns = legacyInheritedColumnsForDealRow(
+    resolveRunrateTableIdForDealSheetTable(options.tableId)
+  );
+
+  logDetail(
+    `[contract revalidate] DEAL placement=${incomingRow.PLACEMENT_ID ?? "?"} dealSheet=${incomingRow.DEAL_SHEET_ID ?? "?"} ` +
+      `${currentId} -> ${newContractId}: its dates ` +
+      `(${spanKey.startDate || "-"}/${spanKey.endDate || "-"}/${spanKey.tentativeEndDate || "-"}) ` +
+      `are outside the current run-rate window ${window.__WINDOW_START_DATE}..${window.__WINDOW_END_DATE}; ` +
+      `clearing ${clearedColumns.length} inherited columns`
+  );
+
+  return {
+    needsRepair: true,
+    previousContractId: currentId,
+    newContractId: normalizeContractIdOrNull(newContractId),
+    clearedColumns,
+  };
+}
+
+/**
+ * Mint one CONTRACT_ID from the same Firestore sequence the insert path uses.
+ *
+ * Goes through allocateContractIds (never a hand-rolled max+1) so the repair shares the one counter
+ * that stops two writers issuing the same number, including its floor against the table's current
+ * maximum — the safeguard added after CHC23000..CHC23033 went out twice in Aug 2026.
+ *
+ * @param {object} [options] - { tableId }
+ * @returns {Promise<string|null>}
+ */
+async function allocateContractIdForRepair(options = {}) {
+  // From contractIdFormat / contractIdSequence directly, NOT contractIdResolver — that module
+  // requires this one, so importing it here would close a circular dependency.
+  const { buildSequenceOptionsForTable } = require("./contractIdFormat");
+  const { allocateContractIds } = require("./contractIdSequence");
+  const tableId = options.tableId == null ? "" : String(options.tableId).trim();
+  if (!tableId) return null;
+  const sequenceOptions = buildSequenceOptionsForTable(tableId);
+  if (!sequenceOptions) return null;
+
+  const ids = await allocateContractIds(1, {
+    ...sequenceOptions,
+    minNextValueFn: async () => {
+      const max = await fetchMaxContractIdSeqForTable(tableId, options);
+      return max == null ? null : max + 1;
+    },
+  });
+  return Array.isArray(ids) && ids.length > 0 ? ids[0] : null;
+}
+
+/**
+ * Widest run-rate window currently recorded for one CONTRACT_ID.
+ *
+ * MIN/MAX across the contract's rows, so a contract split into several run-rate segments is judged
+ * against its full span rather than one segment of it. END_DATE preferred over TENTATIVE_END_DATE —
+ * that preference is the whole point: it is what makes the window shrink when an assignment ends.
+ *
+ * @returns {Promise<{__WINDOW_START_DATE: string, __WINDOW_END_DATE: string}|null>}
+ */
+async function fetchRunrateWindowForContractId(contractId, options = {}) {
+  const normalized = normalizeContractIdOrNull(contractId);
+  if (normalized == null) return null;
+
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+  const runrateTableId = resolveRunrateTableIdForDealSheetTable(options.tableId);
+  const sql = `
+    SELECT
+      MIN(START_DATE) AS window_start_date,
+      MAX(COALESCE(END_DATE, TENTATIVE_END_DATE)) AS window_end_date
+    FROM \`${config.projectId}.${datasetId}.${runrateTableId}\`
+    WHERE UPPER(TRIM(CAST(CONTRACT_ID AS STRING))) = '${escapeSqlString(normalized.toUpperCase())}'
+      AND START_DATE IS NOT NULL
+      AND COALESCE(END_DATE, TENTATIVE_END_DATE) IS NOT NULL
+  `;
+  const rows = await queryObjects(sql, 1);
+  const start = normalizeLegacyDateOnlyOrNull(rows?.[0]?.window_start_date);
+  const end = normalizeLegacyDateOnlyOrNull(rows?.[0]?.window_end_date);
+  if (!start || !end) return null;
+  return { __WINDOW_START_DATE: start, __WINDOW_END_DATE: end };
+}
+
+/**
+ * Rewrite one placement's stored rows: old CONTRACT_ID -> new, and every column inherited from the
+ * wrong run-rate row blanked.
+ *
+ * An UPDATE, not an append. The row is not changing because the business changed, it is changing
+ * because it was wrong, so the placement should end up with the rows it should always have had
+ * rather than carrying the bad id forward as its visible history.
+ *
+ * Safe to run right after an insert: this pipeline writes via load jobs, so there is no streaming
+ * buffer for BigQuery's DML to refuse (see insertAll).
+ *
+ * Scoped to DEAL_SHEET_ID + PLACEMENT_ID, never to CONTRACT_ID. The same id is legitimately held by
+ * other placements of the real contract — other DEAL rows whose dates DO fall inside the window, and
+ * the extensions hanging off them — so a CONTRACT_ID-scoped UPDATE would corrupt correct rows.
+ *
+ * @param {object} params - { dealSheetId, placementId, newContractId, clearColumns }
+ * @param {object} [options] - { datasetId, tableId }
+ * @returns {Promise<{updatedRows: number|null}>}
+ */
+async function repairStoredContractIdForPlacement(params = {}, options = {}) {
+  const dsid = params.dealSheetId == null ? "" : String(params.dealSheetId).trim();
+  const pid = params.placementId == null ? "" : String(params.placementId).trim();
+  const newId = normalizeContractIdOrNull(params.newContractId);
+  if (dsid === "" || pid === "" || newId == null) return { updatedRows: null };
+
+  const { datasetId, tableId } = resolveBqDatasetTable(options);
+  const missing = resolveDealSheetMissingColumns(tableId);
+  const clearColumns = (Array.isArray(params.clearColumns) ? params.clearColumns : []).filter(
+    (col) => typeof col === "string" && col.trim() !== "" && !missing.has(col)
+  );
+
+  const sets = [`CONTRACT_ID = '${escapeSqlString(newId)}'`];
+  for (const col of clearColumns) sets.push(`${col} = NULL`);
+  // INITIAL_START_DATE is reset, not blanked: a DEAL is the first placement of its contract, so its
+  // own START_DATE is the original start (the same rule applyOriginalStartDateForDealRows applies at
+  // insert). The stored value came off the wrong contract's chain. Left alone when the row has no
+  // usable START_DATE, rather than writing a null the insert path would then have to re-derive.
+  if (!missing.has("INITIAL_START_DATE")) {
+    sets.push("INITIAL_START_DATE = START_DATE");
+  }
+
+  const sql = `
+    UPDATE \`${config.projectId}.${datasetId}.${tableId}\`
+    SET ${sets.join(", ")}
+    WHERE CAST(DEAL_SHEET_ID AS STRING) = '${escapeSqlString(dsid)}'
+      AND CAST(PLACEMENT_ID AS STRING) = '${escapeSqlString(pid)}'
+  `;
+
+  const [job] = await bigquery.createQueryJob({ query: sql });
+  await job.getQueryResults();
+  const updated = job.metadata?.statistics?.query?.dmlStats?.updatedRowCount ?? null;
+  logDetail(
+    `[contract revalidate] in-place UPDATE dealSheet=${dsid} placement=${pid} newContractId=${newId} ` +
+      `clearedColumns=${clearColumns.length} initialStartDate=reset-to-START_DATE updatedRows=${updated ?? "n/a"}`
+  );
+  return { updatedRows: updated == null ? null : Number(updated) };
+}
+
+/**
  * Copy explicit MANUAL_COLUMNS from baseline onto incoming before append-on-change insert.
  * Strips enrich-spread manual keys first so baseline always wins (incl. null).
  */
@@ -3348,9 +3595,44 @@ function legacyDealManualColumns(runrateTableId) {
   return extra && extra.length > 0 ? [...base, ...extra] : base;
 }
 
+/**
+ * Hierarchy name + `_EMP_NO` columns an EXTENSION row takes from its matched legacy run-rate row.
+ *
+ * The run-rate window match is the ONLY tier that can tell one of a candidate's contracts from the
+ * next (the identity-only tiers in applyExtensionInheritForInsertRows cannot), so the row it picks
+ * has to supply the hierarchy too — not just CONTRACT_ID / SKU_NUMBER / the manual ops columns.
+ *
+ * Without this the two halves came off DIFFERENT run-rate rows: the window match set CONTRACT_ID and
+ * SKU from the correct contract, left every hierarchy column empty because they were not in the
+ * SELECT, and the prior-EXTENSION tier then filled them from the candidate's PREVIOUS contract. Live
+ * example (CANDIDATE_ID 22101746, PLACEMENT_ID 1462717, Aug 2026): CONTRACT_ID CHC22685 + SKU ONB6947
+ * came from the Aug-27 run-rate row while ASSOCIATE_DELIVERY_DIRECTOR came from the Jan-18 row of
+ * contract CHC19540.
+ *
+ * DEAL rows deliberately do NOT get these — their hierarchy is resolved from the employee directory
+ * manager chain (applyDealRecruiterHierarchyForInsertRows), which is authoritative there.
+ * @returns {string[]}
+ */
+function legacyExtensionHierarchyColumns(runrateTableId) {
+  const names = resolveExtensionRunrateHierarchyColumns(runrateTableId);
+  return names.flatMap((col) => [col, `${col}_EMP_NO`]);
+}
+
+/**
+ * Every run-rate column the legacy lookup carries across for a given row type.
+ * EXTENSION rows additionally take the hierarchy (see legacyExtensionHierarchyColumns).
+ * @returns {string[]}
+ */
+function legacyCarryColumns(runrateTableId, includeHierarchy = false) {
+  const manual = legacyDealManualColumns(runrateTableId);
+  if (!includeHierarchy) return manual;
+  const seen = new Set(manual);
+  return [...manual, ...legacyExtensionHierarchyColumns(runrateTableId).filter((c) => !seen.has(c))];
+}
+
 /** `col AS col_lower` list for the legacy lookup SELECT, plus the alias->column mapping back. */
-function buildLegacyManualColumnSql(prefix = "r", runrateTableId) {
-  const cols = legacyDealManualColumns(runrateTableId);
+function buildLegacyManualColumnSql(prefix = "r", runrateTableId, includeHierarchy = false) {
+  const cols = legacyCarryColumns(runrateTableId, includeHierarchy);
   const select = cols.map((c) => `${prefix}.${c} AS ${c.toLowerCase()}`).join(",\n          ");
   return { cols, select };
 }
@@ -3362,8 +3644,8 @@ function buildLegacyManualColumnSql(prefix = "r", runrateTableId) {
  * FIFTYTWO_TENURE_RTO_LASTDATE is unwrapped here — the same trap documented on
  * formatTimestampLiteralForSql, where a wrapper reaching date handling silently became null.
  */
-function assignLegacyManualColumns(target, bqRow, runrateTableId) {
-  for (const col of legacyDealManualColumns(runrateTableId)) {
+function assignLegacyManualColumns(target, bqRow, runrateTableId, includeHierarchy = false) {
+  for (const col of legacyCarryColumns(runrateTableId, includeHierarchy)) {
     const raw = bqRow?.[col.toLowerCase()];
     const value =
       raw && typeof raw === "object" && !(raw instanceof Date) && "value" in raw ? raw.value : raw;
@@ -3465,7 +3747,11 @@ function buildLegacyContractLookupKey(row) {
         ? `pl:${String(row.PLACEMENT_ID).trim()}`
         : `k:${spanKey ? buildSpanKeyString(spanKey) : nexusKey}`;
 
-  return { rowKey, spanKey, nexusKey };
+  // DEAL_TYPE=DEAL gates the new-contract guard in the result loop. An EXTENSION legitimately
+  // starts after its contract's run-rate window closes, so it must never be judged by that rule.
+  const isDealRow = normalizeDealTypeKey(row.DEAL_TYPE) === "DEAL";
+
+  return { rowKey, spanKey, nexusKey, isDealRow };
 }
 
 /**
@@ -3541,6 +3827,10 @@ function buildSpanKeyString(spanKey) {
  * @param {string} [options.datasetId]
  * @param {string} [options.tableId] - destination deal sheet table (selects the domain's run-rate table)
  * @param {string} [options.runrateTableId]
+ * @param {boolean} [options.includeHierarchy=false] - also carry the hierarchy name/_EMP_NO columns
+ *   off the matched row. EXTENSION rows only: the window match is the sole tier that knows which
+ *   contract the row belongs to, so it must supply the hierarchy rather than leaving it to the
+ *   identity-only tiers downstream. DEAL rows resolve hierarchy from the employee directory instead.
  * @returns {Promise<Map<string, {CONTRACT_ID: string|null, SKU_NUMBER: string|null}>>} rowKey -> legacy identity
  */
 async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
@@ -3556,6 +3846,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
       ? options.runrateTableId.trim()
       : resolveRunrateTableIdForDealSheetTable(options.tableId);
   const runrateFqn = `\`${config.projectId}.${datasetId}.${runrateTableId}\``;
+  const includeHierarchy = options.includeHierarchy === true;
 
   const keyed = [];
   const nexusKeys = new Set();
@@ -3611,7 +3902,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
     // ROW_NUMBER picks one contract per IDENTITY (see the PARTITION BY below); an exact probe-date
     // hit wins, then the latest START_DATE, then CONTRACT_ID and ID break ties so repeated runs
     // always resolve identically.
-    const { cols: manualCols, select: manualSelect } = buildLegacyManualColumnSql("r", runrateTableId);
+    const { cols: manualCols, select: manualSelect } = buildLegacyManualColumnSql("r", runrateTableId, includeHierarchy);
     const manualOut = manualCols.map((c) => c.toLowerCase()).join(", ");
     const sql = `
       WITH wanted_keys AS (SELECT * FROM UNNEST([${structs.join(", ")}])),
@@ -3637,6 +3928,11 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
           -- every rate / ownership change, and each of those carries its OWN start; taking it from
           -- here keeps every row of the contract on the same INITIAL_START_DATE.
           r.START_DATE AS initial_start_date,
+          -- The matched row's own window, carried out so the per-row guard in the result loop can
+          -- check THIS row's dates against it (see legacyWindowCoversAnyOwnDate). The probe dates
+          -- are pooled per identity, so a hit here may have been won by a SIBLING row's date.
+          r.START_DATE AS window_start_date,
+          COALESCE(r.END_DATE, r.TENTATIVE_END_DATE) AS window_end_date,
           ${manualSelect},
           ROW_NUMBER() OVER (
             -- Identity only (candidate + client), matching buildSpanKeyString. The dates are join
@@ -3705,7 +4001,8 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
           -- The window needs an end: END_DATE preferred, TENTATIVE_END_DATE when it is absent.
           AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE) IS NOT NULL
       )
-      SELECT cand, em, fac, pc, fac_id, pc_id, contract_id, sku_number, initial_start_date, ${manualOut}
+      SELECT cand, em, fac, pc, fac_id, pc_id, contract_id, sku_number, initial_start_date,
+             window_start_date, window_end_date, ${manualOut}
       FROM ranked WHERE rn = 1
     `;
     const found = await queryObjects(sql, spanKeysByString.size);
@@ -3727,9 +4024,13 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
             CONTRACT_ID: normalizeContractIdOrNull(r.contract_id),
             SKU_NUMBER: normalizeLegacySkuOrNull(r.sku_number),
             INITIAL_START_DATE: normalizeLegacyDateOnlyOrNull(r.initial_start_date),
+            // Matched row's window, for the per-row guard below. Stripped before the entry is used.
+            __WINDOW_START_DATE: normalizeLegacyDateOnlyOrNull(r.window_start_date),
+            __WINDOW_END_DATE: normalizeLegacyDateOnlyOrNull(r.window_end_date),
           },
           r,
-          runrateTableId
+          runrateTableId,
+          includeHierarchy
         )
       );
     }
@@ -3745,7 +4046,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
     // resolve the same candidate's rows (whichever one a given row falls to), so opposite orderings
     // had them pick contracts from opposite ends of the candidate's history and hand two rows of one
     // contract two different ids.
-    const { cols: manualCols, select: manualSelect } = buildLegacyManualColumnSql("r", runrateTableId);
+    const { cols: manualCols, select: manualSelect } = buildLegacyManualColumnSql("r", runrateTableId, includeHierarchy);
     const manualOut = manualCols.map((c) => c.toLowerCase()).join(", ");
     const sql = `
       WITH wanted AS (SELECT * FROM UNNEST([${pairs.join(", ")}])),
@@ -3784,7 +4085,8 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
             INITIAL_START_DATE: normalizeLegacyDateOnlyOrNull(r.initial_start_date),
           },
           r,
-          runrateTableId
+          runrateTableId,
+          includeHierarchy
         )
       );
     }
@@ -3793,8 +4095,18 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
   // Tier 1 (the data team's rule) decides; tier 2 only fills what it could not match.
   let spanHits = 0;
   let nexusHits = 0;
+  let newContractCount = 0;
   for (const key of keyed) {
-    const tier1 = key.spanKey ? bySpanKey.get(buildSpanKeyString(key.spanKey)) : null;
+    let tier1 = key.spanKey ? bySpanKey.get(buildSpanKeyString(key.spanKey)) : null;
+    // New-contract guard (DEAL rows only): the pooled probe dates can win a window this row does
+    // not itself touch, which relabels a fresh booking as an old contract. See
+    // legacyWindowCoversAnyOwnDate. Dropping tier 1 here deliberately falls through to tier 2
+    // (exact CANDIDATE_ID + INTERNAL_JOB_ID) — that tier does not depend on the window at all, so
+    // a row whose Nexus job is genuinely the run-rate row's job still keeps its identity.
+    if (tier1 && key.isDealRow && !legacyWindowCoversAnyOwnDate(key.spanKey, tier1)) {
+      tier1 = null;
+      newContractCount++;
+    }
     const tier2 = tier1 ? null : key.nexusKey ? byNexusKey.get(key.nexusKey) : null;
     const hit = tier1 ?? tier2;
     // A hit is worth keeping when it carries EITHER a contract id OR a SKU / manual ops columns.
@@ -3807,14 +4119,69 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
     if (!hasContract && !hasSku) continue;
     if (tier1) spanHits++;
     else nexusHits++;
-    out.set(key.rowKey, hit);
+    // The window fields are guard-internal — never let them reach a deal-sheet row.
+    const { __WINDOW_START_DATE, __WINDOW_END_DATE, ...entry } = hit;
+    out.set(key.rowKey, entry);
   }
 
   logDetail(
-    `[legacy contract lookup] runrate=${runrateTableId} dealRows=${rows.length} keyed=${keyed.length} matched=${out.size} (spanKey=${spanHits} nexusKey=${nexusHits})`
+    `[legacy contract lookup] runrate=${runrateTableId} dealRows=${rows.length} keyed=${keyed.length} matched=${out.size} (spanKey=${spanHits} nexusKey=${nexusHits}) newContractGuard=${newContractCount}`
   );
 
   return out;
+}
+
+/**
+ * Does the matched run-rate window cover ANY of THIS row's own dates?
+ *
+ * The tier-1 lookup key is identity-only (candidate + client) and the probe dates of every row
+ * sharing that identity are POOLED into one Set before the window join (see the `wanted` CTE). That
+ * pooling is deliberate — a BOOKED row has no END_DATE and a re-issued row has a shifted START_DATE,
+ * so one contract's rows have to lend each other dates or the match is lost entirely.
+ *
+ * It also means a row can win a window it does not itself touch, using a SIBLING row's date. When
+ * the candidate has more than one contract at the same client, that hands a genuinely NEW booking
+ * the id of an OLD contract, and every manual/ops column rides along with it (COMMENTS,
+ * ST_DT_PUSHBACK_REASON, BACKOUT_OR_TERMINATION — see EXTENSION_RUNRATE_MANUAL_COLUMNS, which
+ * legacyDealManualColumns applies to DEAL rows too).
+ *
+ * Live case (CANDIDATE_ID 7976807 "Juan M Silva", DEAL_SHEET_ID 5255548 / PLACEMENT_ID 1464679,
+ * Aug 2026): a fresh DEAL starting 2026-10-12 took CHC19805, whose run-rate window is
+ * 2026-06-07..2026-09-05 — five weeks BEFORE it. The two dates that won that window (2026-06-07 and
+ * 2026-09-05) both belonged to placement 1455761, a different contract segment of the same
+ * candidate; the deal's own dates (2026-10-12 / 2027-01-09) are outside it. It arrived carrying that
+ * contract's id plus its "Contract Extended till 09/05/2026 / Termination Reason - Contract Ended"
+ * narrative.
+ *
+ * So: a DEAL row must stand on its OWN dates. If none of START_DATE / END_DATE /
+ * TENTATIVE_END_DATE falls inside the matched window, this is a new contract and the match is
+ * dropped, letting the Firestore allocator mint a fresh id.
+ *
+ * Applied to DEAL rows only. An EXTENSION legitimately starts after its contract's run-rate window
+ * closes (that is what an extension IS) and inherits identity from its parent DEAL / prior
+ * extension, so the same rule there would strip ids the extension is supposed to keep.
+ *
+ * A row with no usable date, or a match with no usable window, is left alone — absent data is not
+ * evidence of a new contract.
+ *
+ * @param {{startDate?: string, endDate?: string, tentativeEndDate?: string}} spanKey
+ * @param {{__WINDOW_START_DATE?: string|null, __WINDOW_END_DATE?: string|null}} hit
+ * @returns {boolean}
+ */
+function legacyWindowCoversAnyOwnDate(spanKey, hit) {
+  const winStart = hit?.__WINDOW_START_DATE;
+  const winEnd = hit?.__WINDOW_END_DATE;
+  // No window to judge against (e.g. canada run-rate rows matched on SKU alone) -> do not reject.
+  if (!winStart || !winEnd) return true;
+
+  const own = [spanKey?.startDate, spanKey?.endDate, spanKey?.tentativeEndDate].filter(
+    (d) => typeof d === "string" && d !== ""
+  );
+  // The row contributed no date at all -> nothing to judge -> do not reject.
+  if (own.length === 0) return true;
+
+  // ISO yyyy-mm-dd strings compare correctly with <= / >=, same as the SQL BETWEEN above.
+  return own.some((d) => d >= winStart && d <= winEnd);
 }
 
 /**
@@ -4240,11 +4607,19 @@ function buildExtensionContractMatchStructLiterals(rows) {
       const d = formatDateOnlyForSql(row.START_DATE);
       return d == null ? "CAST(NULL AS DATE)" : `DATE '${escapeSqlString(d)}'`;
     })();
+    // The contract this row has ALREADY been resolved to, when it has one. The run-rate window match
+    // runs before these tiers and is the only one that can tell one of a candidate's contracts from
+    // the next, so once it has spoken, an identity-only tier must not pull detail off a row of a
+    // DIFFERENT contract. Empty when unresolved, which leaves the guard inert.
+    const resolvedContractId = normalizeContractIdOrNull(row.CONTRACT_ID);
+    const contractIdSql = resolvedContractId == null
+      ? "''"
+      : `'${escapeSqlString(resolvedContractId)}'`;
 
     structLiterals.push(
       `STRUCT(${Math.trunc(pid)} AS placement_id, ${Math.trunc(cand)} AS candidate_nexus_id, `
       + `'${email}' AS candidate_email, '${phone}' AS phone_number, ${Math.trunc(client)} AS client_id, `
-      + `${startDateSql} AS extension_start_date)`
+      + `${startDateSql} AS extension_start_date, ${contractIdSql} AS resolved_contract_id)`
     );
   }
 
@@ -4558,6 +4933,15 @@ ${dateSkuJoinedSelect},
          AND (ext.extension_start_date IS NULL OR p.START_DATE IS NULL
               OR p.START_DATE <= ext.extension_start_date)
          AND p.CONTRACT_ID IS NOT NULL AND TRIM(p.CONTRACT_ID) != ''
+         -- Contract guard: once the run-rate window match has resolved this row's contract, a prior
+         -- extension of a DIFFERENT contract must not supply its hierarchy / ops detail. This tier
+         -- matches on candidate+client identity alone, which cannot tell one contract from the next —
+         -- the START_DATE guard above only rejects LATER rows, so the candidate's previous contract
+         -- sailed through it. Live case (CANDIDATE_ID 22101746, PLACEMENT_ID 1462717, Aug 2026): the
+         -- row was already on CHC22685 and still took ASSOCIATE_DELIVERY_DIRECTOR off the CHC19540
+         -- extension. Inert when the row has no id yet ('' below), which is what makes this tier a
+         -- genuine fallback for extensions the window match could not place.
+         AND (ext.resolved_contract_id = '' OR p.CONTRACT_ID = ext.resolved_contract_id)
       ),
       hierarchy_ranked AS (
         SELECT
@@ -4575,6 +4959,15 @@ ${hierarchyJoinedSelect},
          AND p.CLIENT_ID = ext.client_id
          AND (ext.extension_start_date IS NULL OR p.START_DATE IS NULL
               OR p.START_DATE <= ext.extension_start_date)
+         -- Contract guard: once the run-rate window match has resolved this row's contract, a prior
+         -- extension of a DIFFERENT contract must not supply its hierarchy / ops detail. This tier
+         -- matches on candidate+client identity alone, which cannot tell one contract from the next —
+         -- the START_DATE guard above only rejects LATER rows, so the candidate's previous contract
+         -- sailed through it. Live case (CANDIDATE_ID 22101746, PLACEMENT_ID 1462717, Aug 2026): the
+         -- row was already on CHC22685 and still took ASSOCIATE_DELIVERY_DIRECTOR off the CHC19540
+         -- extension. Inert when the row has no id yet ('' below), which is what makes this tier a
+         -- genuine fallback for extensions the window match could not place.
+         AND (ext.resolved_contract_id = '' OR p.CONTRACT_ID = ext.resolved_contract_id)
       )
       SELECT
         CAST(ds.placement_id AS STRING) AS placement_id,
@@ -5126,6 +5519,13 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
   let selfReferenceVacatedCount = 0;
   let duplicatePersonVacatedCount = 0;
 
+  // Live directory designation per emp-no — overrides seniority when the two disagree.
+  const authoritativeColumnByEmpNo = await fetchAuthoritativeHierarchyColumnByEmpNo(
+    rows,
+    options,
+    deps
+  );
+
   const out = rows.map((row) => {
     const key = String(row.PLACEMENT_ID).trim();
     if (!eligibleSet.has(key)) return row;
@@ -5210,7 +5610,7 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
     // Same reason, one step further: the collision above is the recruiter appearing as their own
     // manager, this one is any ONE person appearing in TWO manager columns because the inherit tiers
     // disagree about their designation (promoted since the older source was written).
-    const deduped = vacateDuplicatePersonHierarchyRoles(current);
+    const deduped = vacateDuplicatePersonHierarchyRoles(current, authoritativeColumnByEmpNo);
     if (deduped.changed) {
       current = deduped.row;
       rowChanged = true;
@@ -5386,8 +5786,79 @@ function hierarchySeniorityRank(column) {
  * Emp-no only, deliberately: two different people can share a name, and vacating a real manager's
  * seat is worse than leaving a duplicate for the scheduled scan to clean up. Rows whose emp-no is
  * missing on one side are left alone.
+ *
+ * `titleColumnByEmpNo` (optional) overrides seniority with the LIVE directory title: when the
+ * directory says this emp-no's designation IS a specific column, that column is the keeper and every
+ * other seat is vacated, regardless of rank. Seniority is only a tie-break for the promotion case it
+ * was written for (run-rate holds the pre-promotion role, directory the new one, higher wins). It is
+ * the WRONG rule when the stale source happens to name the more senior column: e.g. run-rate said
+ * VP='Maneet Gupta' while the directory says AVP - Delivery, and rank alone kept the stale VP seat
+ * and vacated the correct AVP one. The directory is the live source of truth, so when it has an
+ * opinion it wins outright.
  */
-function vacateDuplicatePersonHierarchyRoles(row) {
+/**
+ * emp-no -> the hierarchy column the LIVE directory title says that person occupies, for the
+ * emp-nos present in `rows`' hierarchy columns. Only unambiguous people are included: an emp-no
+ * whose titles resolve to more than one column is omitted so the caller falls back to seniority.
+ *
+ * Feeds vacateDuplicatePersonHierarchyRoles so a stale run-rate/parent value can never keep a seat
+ * the directory disagrees with (the VP-vs-AVP case).
+ */
+async function fetchAuthoritativeHierarchyColumnByEmpNo(rows, options = {}, deps = {}) {
+  const out = new Map();
+  if (!rows || rows.length === 0) return out;
+
+  const empNos = new Set();
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    for (const target of DEAL_RECRUITER_HIERARCHY_TARGETS) {
+      const emp = normalizeHierarchyEmpNo(row[target.empNoColumn]);
+      if (emp !== "" && emp !== HIERARCHY_ROLE_VACANT) empNos.add(emp);
+    }
+  }
+  if (empNos.size === 0) return out;
+
+  const queryFn = deps.queryObjectsFn ?? queryObjects;
+  const hierarchyFqn = `\`${config.projectId}.${config.directoryEmployeeHierarchy.datasetId}.${config.directoryEmployeeHierarchy.tableId}\``;
+  const list = [...empNos];
+
+  for (let i = 0; i < list.length; i += 500) {
+    const chunk = list.slice(i, i + 500);
+    const inList = chunk.map((v) => `'${escapeSqlString(v)}'`).join(", ");
+    const sql = `
+      SELECT DISTINCT CAST(manager_employee_id AS STRING) AS emp_no, manager_title
+      FROM ${hierarchyFqn}
+      WHERE CAST(manager_employee_id AS STRING) IN (${inList})
+        AND manager_title IS NOT NULL AND TRIM(manager_title) != ''
+    `;
+    let queried;
+    try {
+      queried = await queryFn(sql, chunk.length);
+    } catch (err) {
+      logDetail(
+        `[enriched sync] authoritative hierarchy title lookup failed (non-fatal): ${String(err?.message || err).slice(0, 200)}`
+      );
+      return out;
+    }
+    // emp-no -> set of columns its titles resolve to; ambiguous (>1) is dropped below.
+    const columnsByEmp = new Map();
+    for (const r of queried || []) {
+      const emp = r?.emp_no == null ? "" : String(r.emp_no).trim();
+      if (emp === "") continue;
+      const column = resolveHierarchyColumnForTitle(r?.manager_title);
+      if (column == null) continue;
+      if (!columnsByEmp.has(emp)) columnsByEmp.set(emp, new Set());
+      columnsByEmp.get(emp).add(column);
+    }
+    for (const [emp, columns] of columnsByEmp) {
+      if (columns.size === 1) out.set(emp, [...columns][0]);
+    }
+  }
+
+  return out;
+}
+
+function vacateDuplicatePersonHierarchyRoles(row, titleColumnByEmpNo = null) {
   const vacatedColumns = [];
   if (!row || typeof row !== "object") return { row, changed: false, vacatedColumns };
 
@@ -5398,6 +5869,12 @@ function vacateDuplicatePersonHierarchyRoles(row) {
     if (heldName === "" || heldName === HIERARCHY_ROLE_VACANT.toLowerCase()) continue;
     const empNo = normalizeHierarchyEmpNo(row[target.empNoColumn]);
     if (empNo === "" || empNo === HIERARCHY_ROLE_VACANT) continue;
+    // Live directory title wins outright over seniority when it names one of this row's columns.
+    const authoritative = titleColumnByEmpNo?.get?.(empNo) ?? null;
+    if (authoritative != null) {
+      mostSeniorByEmpNo.set(empNo, authoritative);
+      continue;
+    }
     const incumbent = mostSeniorByEmpNo.get(empNo);
     if (
       incumbent == null ||
@@ -5703,6 +6180,13 @@ async function applyDealRecruiterHierarchyForInsertRows(rows, options = {}, deps
   let selfReferenceVacatedCount = 0;
   let duplicatePersonVacatedCount = 0;
 
+  // Live directory designation per emp-no — overrides seniority when the two disagree.
+  const authoritativeColumnByEmpNo = await fetchAuthoritativeHierarchyColumnByEmpNo(
+    rows,
+    options,
+    deps
+  );
+
   const out = rows.map((row) => {
     const key = String(row.PLACEMENT_ID).trim();
     if (!eligibleSet.has(key)) return row;
@@ -5726,7 +6210,7 @@ async function applyDealRecruiterHierarchyForInsertRows(rows, options = {}, deps
 
     // One person in two manager columns — see vacateDuplicatePersonHierarchyRoles. The directory
     // chain alone can produce this when a stale hierarchy value is already on the row.
-    const deduped = vacateDuplicatePersonHierarchyRoles(current);
+    const deduped = vacateDuplicatePersonHierarchyRoles(current, authoritativeColumnByEmpNo);
     if (deduped.changed) {
       current = deduped.row;
       duplicatePersonVacatedCount += deduped.vacatedColumns.length;
@@ -8641,9 +9125,14 @@ module.exports = {
   applyMoveRunrateAppendOverride,
   applyIsRejectedResetForChangedUpdate,
   applyContractIdCarryForward,
+  revalidateDealContractIdAgainstRunrate,
+  repairStoredContractIdForPlacement,
+  fetchRunrateWindowForContractId,
+  legacyInheritedColumnsForDealRow,
   vacateSelfReferencedHierarchyRoles,
   normalizeHierarchyPersonName,
   applyManualColumnsCarryForward,
+  legacyWindowCoversAnyOwnDate,
   applyTentativeDateFreeze,
   applyNewHireDateFreeze,
   applyOfferTimeStartDateFreeze,
@@ -8666,6 +9155,8 @@ module.exports = {
   normalizeClientIdKeyPart,
   skuAllowedForPlacementStatus,
   legacyDealManualColumns,
+  legacyCarryColumns,
+  legacyExtensionHierarchyColumns,
   fetchEmployeeDirectoryByEmails,
   buildActiveDealSheetsUnionSql,
   formatDateOnlyForSql,
@@ -8730,6 +9221,7 @@ module.exports = {
   fetchContractSegmentRateChangePairsFromActive,
   buildRecruiterHandoverOwnershipLogRows,
   vacateDuplicatePersonHierarchyRoles,
+  fetchAuthoritativeHierarchyColumnByEmpNo,
   buildOwnershipChangeLogRows,
   buildContractOwnershipChangeLogRows,
   fetchLatestOwnershipRowsForContractIds,

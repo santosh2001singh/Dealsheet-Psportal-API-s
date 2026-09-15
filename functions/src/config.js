@@ -72,8 +72,46 @@ const config = {
    * An explicit env var still wins — see resolveDomainTuning.
    */
   domainTuning: {
-    canada: { fetchAllMax: 5, batchDelayMs: 500, maxRetries: 5 },
+    canada: { fetchAllMax: 5, batchDelayMs: 500, maxRetries: 5, placementConcurrency: 2 },
+    /**
+     * Health hits the same edge limit from the other direction. Its start-date bound keeps any one
+     * enrich wave small, but the UPDATE trigger used to reuse fetchAllMax as its per-placement
+     * concurrency (see syncService), so 20 placements refreshed in parallel and each fired its own
+     * submittal GET. On 2026-09-03 that put ~60 requests into a 0.4s window and the edge answered
+     * HTML 403s; the run logged not_found=1006 of 1200 checked and appended only 1 row. The same
+     * placement ids returned 200 JSON on a direct call, confirming a throttle rather than a
+     * permission problem. Dropping fetchAllMax to 10 halved the burst but did not clear it — see
+     * placementConcurrency below, which is the knob that actually bounds the update trigger.
+     *
+     * Health's volume is far larger than Canada's, so it is paced less aggressively than canada
+     * above — enough headroom to stay under the limit without stretching the run past its timeout.
+     */
+    health: { fetchAllMax: 10, batchDelayMs: 250, maxRetries: 5, placementConcurrency: 3 },
   },
+  /**
+   * How many placements the UPDATE trigger refreshes in parallel.
+   *
+   * This is deliberately NOT fetchAllMax. fetchAllMax means "how many URLs go out in one chunk of a
+   * single enrich wave" — it bounds a flat list of URLs. The update trigger's loop is a different
+   * shape: each unit of work is one whole placement, and refreshing one placement costs ~13 Nexus
+   * requests, not one:
+   *
+   *     1  /api/job-submittals/      (fetchSubmittalByPlacementId, resolveRefreshSeed)
+   *     1  /api/deal-sheet-candidates/?job_id=...   (resolveRefreshSeed)
+   *    11  wave1 enrich (deal-sheets, hours, revenue, rates, additionalCosts, travelAllowances,
+   *        clientCosts, rateChanges, jobs, candidates, candidateTypes)
+   *
+   * So running the loop at fetchAllMax=10 did not mean 10 concurrent requests — it meant ~130, and
+   * the first two of those 13 are issued BEFORE the enrich wave, so fetchAllMax's own chunking never
+   * bounded them at all. That is the burst the edge answered with HTML 403s on 2026-09-11: six
+   * distinct job_ids all 403-ing inside the same second, then the identical URLs returning 200 once
+   * the backoff had spread them out (wave2 came back in 408ms in the same run).
+   *
+   * 3 placements x ~13 requests = ~39 in flight, which sits under the edge limit while keeping the
+   * run well inside its timeout. Canada is already the throttle-sensitive domain (it runs unfiltered
+   * over full history) so it gets 2.
+   */
+  updatePlacementConcurrency: parseInt(process.env.UPDATE_PLACEMENT_CONCURRENCY || "3", 10),
   /**
    * Per-request Nexus timeout. Without one, axios waits forever on a hung socket: a run on Aug 19
    * 2026 processed 9 submittal pages in 28 min at a steady ~3 min/page, then sat on page 10 for 22+
@@ -206,6 +244,7 @@ const TUNING_BASELINE = Object.freeze({
   fetchAllMax: config.fetchAllMax,
   batchDelayMs: config.batchDelayMs,
   maxRetries: config.maxRetries,
+  placementConcurrency: config.updatePlacementConcurrency,
 });
 
 /**
@@ -238,6 +277,10 @@ function resolveDomainTuning(domain) {
     batchDelayMs:
       fromEnv("BATCH_DELAY_MS") ?? perDomain.batchDelayMs ?? TUNING_BASELINE.batchDelayMs,
     maxRetries: fromEnv("MAX_RETRIES") ?? perDomain.maxRetries ?? TUNING_BASELINE.maxRetries,
+    placementConcurrency:
+      fromEnv("UPDATE_PLACEMENT_CONCURRENCY") ??
+      perDomain.placementConcurrency ??
+      TUNING_BASELINE.placementConcurrency,
   };
 }
 
@@ -259,6 +302,7 @@ function applyDomainTuning(domain) {
   config.fetchAllMax = t.fetchAllMax;
   config.batchDelayMs = t.batchDelayMs;
   config.maxRetries = t.maxRetries;
+  config.updatePlacementConcurrency = t.placementConcurrency;
   return t;
 }
 

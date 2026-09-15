@@ -4,8 +4,44 @@
  */
 
 const axios = require("axios");
+const https = require("https");
 const config = require("./config");
 const { logLine } = require("./logger");
+
+/**
+ * Shared keep-alive agent for every Nexus request.
+ *
+ * Node's default agent runs with keepAlive:false, so axios opened a fresh TCP connection and a fresh
+ * TLS handshake for EVERY call — thousands per run. On Cloud Run that churn is fatal in two ways:
+ * each closed socket sits in TIME_WAIT until the ephemeral port pool runs dry (EPIPE on connect),
+ * and the instance's egress NAT saturates on concurrent connection setups, so new sockets die
+ * *before* the handshake completes — exactly the "Client network socket disconnected before secure
+ * TLS connection was established" / "socket hang up" / 45s ECONNABORTED wall seen on 2026-09-05.
+ *
+ * The give-away that this was never a load or throttle problem: that run logged concurrency=8 with
+ * deal_sheets=1 jobs=1 candidates=1 and still burned 5 retries on a single job_id, while the same
+ * URLs answered 200 in 400-500ms from a laptop. One request, 45s timeout, no server-side pressure.
+ *
+ * Reusing connections removes the handshake per request entirely. maxSockets caps concurrent
+ * connections below what the NAT will bear; maxFreeSockets keeps a warm pool between waves.
+ */
+const nexusHttpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 15000,
+  // Above the highest fan-out any domain uses (fetchAllMax 20 / candidate fetch 20) so the agent
+  // never becomes the bottleneck, while still bounding what one instance opens at once.
+  maxSockets: 25,
+  maxFreeSockets: 10,
+  // Drop an idle pooled socket before Nexus/the LB would close it from its side; a server-closed
+  // socket handed back out is what surfaces as ECONNRESET on the next request.
+  timeout: 60000,
+});
+
+/**
+ * Every Nexus call goes through this instance so the keep-alive agent can never be missed at a call
+ * site. Per-request options (timeout, validateStatus, headers) still override as usual.
+ */
+const nexusHttp = axios.create({ httpsAgent: nexusHttpsAgent });
 
 let cachedAccessToken = null;
 let cachedAccessTokenExp = 0;
@@ -29,7 +65,7 @@ function buildUrl(baseUrl, params = {}) {
  */
 async function authNexusToken(username, password) {
   const url = `${config.nexus.baseUrl}/api/auth/token/`;
-  const response = await axios.post(
+  const response = await nexusHttp.post(
     url,
     { username, password },
     {
@@ -59,7 +95,7 @@ async function authNexusToken(username, password) {
  */
 async function refreshNexusToken(refreshToken) {
   const url = `${config.nexus.baseUrl}/api/auth/token/refresh/`;
-  const response = await axios.post(
+  const response = await nexusHttp.post(
     url,
     { refresh: refreshToken },
     {
@@ -115,20 +151,51 @@ async function getNexusAccessToken() {
 }
 
 /**
+ * Log a FAILED Nexus request.
+ *
+ * Failures only, and always on — no env var to remember, because the lines that matter are rare by
+ * definition. A healthy run prints nothing from here; a run in trouble prints exactly the requests
+ * that are in trouble, which is what the logs are read for.
+ *
+ * Successes are deliberately NOT logged. They carry candidate PII (names, emails, phone numbers,
+ * pay rates) that would then sit in Cloud Logging under the project's retention policy, and one
+ * update run makes ~5000 of them — the failures would be buried in their own noise.
+ *
+ * The error BODY is included and is the whole point of the line: it is what separates an
+ * edge-throttle HTML 403 ("<!doctype html>...", a rate limit, retryable) from a genuine Django JSON
+ * 403 ({"detail": "You do not have permission..."}, a real refusal that retrying will never fix).
+ * See isEdgeThrottle403. Error bodies carry no candidate data.
+ *
+ * @param {string} url
+ * @param {number} ms - wall time before the failure
+ * @param {*} err - axios error, or a synthetic one from the parallel path
+ */
+function logNexusFailure(url, ms, err) {
+  const ax = rootAxiosError(err) || err;
+  logLine(`[nexus] GET ${shortUrlForLog(url)} -> FAILED ${ms}ms ${formatNexusRequestError(ax, url)}`);
+}
+
+/**
  * Make a GET request to Nexus API
  */
 async function nexusGetJson(url, accessToken) {
-  const response = await axios.get(url, {
-    headers: {
-      accept: "application/json",
-      Authorization: `Bearer ${accessToken}`,
-    },
-    // A hung socket would otherwise wait forever and drain the whole run's time budget — see
-    // config.requestTimeoutMs. ECONNABORTED from a timeout is already treated as transient by
-    // isTransientNexusError, so the retry wrapper picks it up.
-    timeout: config.requestTimeoutMs,
-  });
-  return response.data;
+  const startedMs = Date.now();
+  try {
+    const response = await nexusHttp.get(url, {
+      headers: {
+        accept: "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      // A hung socket would otherwise wait forever and drain the whole run's time budget — see
+      // config.requestTimeoutMs. ECONNABORTED from a timeout is already treated as transient by
+      // isTransientNexusError, so the retry wrapper picks it up.
+      timeout: config.requestTimeoutMs,
+    });
+    return response.data;
+  } catch (err) {
+    logNexusFailure(url, Date.now() - startedMs, err);
+    throw err;
+  }
 }
 
 /**
@@ -226,8 +293,12 @@ function isNotFoundNexusError(err) {
 async function nexusFetchAllJson(urls, accessToken) {
   if (!urls || urls.length === 0) return [];
 
+  // One timing for the whole wave: these requests are issued together, so a per-request duration
+  // would just restate the wave's own elapsed time.
+  const waveStartMs = Date.now();
+
   const requests = urls.map((url) =>
-    axios.get(url, {
+    nexusHttp.get(url, {
       headers: {
         accept: "application/json",
         Authorization: `Bearer ${accessToken}`,
@@ -242,6 +313,26 @@ async function nexusFetchAllJson(urls, accessToken) {
   const responses = await Promise.all(
     requests.map((p) => p.catch((e) => ({ error: e })))
   );
+
+  // Log EVERY failure in the wave before the map below throws on the first one. Without this pass a
+  // wave where 4 of 11 URLs 403'd would surface a single error line, hiding the other three — and
+  // the shape of a throttle (how many of the wave it hit) is exactly what you need to see.
+  const waveMs = Date.now() - waveStartMs;
+  responses.forEach((resp, i) => {
+    if (resp && resp.error) {
+      logNexusFailure(urls[i], waveMs, resp.error);
+      return;
+    }
+    // validateStatus is `() => true` on this path, so a 4xx/5xx arrives as a normal response rather
+    // than a rejection — it still has to be logged as the failure it is.
+    if (resp && resp.status >= 400) {
+      logNexusFailure(urls[i], waveMs, {
+        isAxiosError: true,
+        message: resp.statusText,
+        response: { status: resp.status, statusText: resp.statusText, data: resp.data },
+      });
+    }
+  });
 
   return responses.map((resp, i) => {
     if (resp.error) {

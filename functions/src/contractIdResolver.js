@@ -32,7 +32,7 @@ const {
   fetchMaxContractIdSeqForTable,
   fetchLegacyContractIdentityForDealRows,
   buildLegacyContractLookupKey,
-  legacyDealManualColumns,
+  legacyCarryColumns,
 } = require("./bigQueryClient");
 const {
   resolveActiveDealSheetTableId,
@@ -409,6 +409,8 @@ function skuEligibleForLegacyFill(row) {
  * @param {object[]} dealRows - DEAL rows still without a CONTRACT_ID
  * @param {object} [deps]
  * @param {string} [deps.tableId]
+ * @param {boolean} [deps.includeHierarchy=false] - carry the hierarchy name/_EMP_NO columns too.
+ *   Passed for EXTENSION rows only; a DEAL row's hierarchy comes from the employee directory.
  * @param {Function} [deps.fetchLegacyContractIdentityFn]
  * @returns {Promise<number>} rows that took a legacy CONTRACT_ID
  */
@@ -421,12 +423,18 @@ async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
   // Which run-rate table this domain reads decides the manual-column list: Canada carries five
   // columns health does not have (see RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE).
   const runrateTableId = resolveRunrateTableIdForDealSheetTable(tableId || undefined);
+  // EXTENSION rows carry the hierarchy off the matched row as well. This match is the only tier that
+  // knows WHICH of the candidate's contracts the row belongs to, so leaving hierarchy to the
+  // identity-only tiers downstream let one row take its CONTRACT_ID from the right contract and its
+  // hierarchy from the previous one — see legacyExtensionHierarchyColumns for the live case.
+  const includeHierarchy = deps.includeHierarchy === true;
 
   let identityByRowKey;
   try {
     identityByRowKey = await fetchLegacyContractIdentityFn(dealRows, {
       tableId: tableId || undefined,
       datasetId: deps.datasetId,
+      includeHierarchy,
     });
   } catch (err) {
     logDetail(
@@ -503,7 +511,7 @@ async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
     // what EXTENSION rows already inherit. Not gated on PLACEMENT_STATUS: only the SKU above is
     // withheld from DID NOT START / DID NOT ACCEPT rows, since these describe the contract rather
     // than an assignment that ran.
-    for (const col of legacyDealManualColumns(runrateTableId)) {
+    for (const col of legacyCarryColumns(runrateTableId, includeHierarchy)) {
       const legacyValue = identity?.[col];
       if (legacyValue == null || String(legacyValue).trim() === "") continue;
       if (row[col] != null && String(row[col]).trim() !== "") continue;
@@ -659,7 +667,11 @@ async function allocateContractIdsForInsertableRows(rowsToInsert, deps = {}) {
   // distinction, so they run as a FALLBACK for extensions this rule cannot place — see
   // applyExtensionInheritForInsertRows.
   if (pendingExtensionRows.length > 0) {
-    await applyLegacyContractIdentityToDealRows(pendingExtensionRows, { tableId, ...deps });
+    await applyLegacyContractIdentityToDealRows(pendingExtensionRows, {
+      tableId,
+      ...deps,
+      includeHierarchy: true,
+    });
   }
 
   /** @type {Map<string, object[]>} */

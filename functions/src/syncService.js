@@ -10,7 +10,6 @@ const { logLine, logDetail, setPipelineDetailQuiet, formatDuration } = require("
 const {
   buildUrl,
   getNexusAccessToken,
-  nexusGetJson,
   nexusGetJsonWithRetry,
   normalizePagedResponse,
   normalizeNexusResourceId,
@@ -63,6 +62,8 @@ const {
   finalizeDealSheetRowForResponse,
   hasBusinessColumnChanges,
   applyDidNotAcceptDateOverrides,
+  revalidateDealContractIdAgainstRunrate,
+  repairStoredContractIdForPlacement,
   normalizeForCompare,
   resolveFirstInsertPlacementAllowlist,
   placementStatusAllowsFirstInsert,
@@ -778,17 +779,36 @@ function computeChangedFields(incomingRow, existingRow, ignoreFields) {
   return out.sort();
 }
 
+/**
+ * Fetch one job-submittal detail row for a placement id.
+ *
+ * Uses the retrying GET, not the bare one: an edge-throttle HTML 403 (Cloud Armor answering for
+ * Nexus under a request burst) is transient, and isTransientNexusError already classifies it — but
+ * only the retry wrapper acts on that. Verified 2026-09-04: placement ids logged as 403 during the
+ * health update run returned 200 JSON on a direct call moments later, so these are throttles, not
+ * permission decisions.
+ *
+ * Returns null ONLY for a genuine 404 (the submittal really is gone) — that is a real NOT_FOUND.
+ * Every other failure THROWS after its retries are exhausted. Swallowing them into null used to
+ * make the caller resolve no job/deal-sheet and report action NOT_FOUND, so a run that lost 1006
+ * placements to 403s still logged errors=15 and exited green while those BigQuery rows silently
+ * went stale. A throw surfaces as action ERROR instead.
+ */
 async function fetchSubmittalByPlacementId(accessToken, placementId) {
   const pid = normalizeNexusResourceId(placementId);
   if (!pid) return null;
   const url = `${config.nexus.baseUrl}/api/job-submittals/${encodeURIComponent(pid)}/`;
   try {
-    return await nexusGetJson(url, accessToken);
+    return await nexusGetJsonWithRetry(url, accessToken);
   } catch (err) {
+    if (isNotFoundNexusError(err)) {
+      logLine(`[placement refresh] submittal not found placement_id=${pid}`);
+      return null;
+    }
     logLine(
       `[placement refresh] submittal detail lookup failed placement_id=${pid}: ${String(err?.message || err).slice(0, 180)}`
     );
-    return null;
+    throw err;
   }
 }
 
@@ -1002,7 +1022,80 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   // consistent. EXTENSION rows are NOT date-overridden from a prior ended placement any more, so
   // there is nothing further to pre-apply here.
   const [didNotAcceptRow] = applyDidNotAcceptDateOverrides([row]);
-  const compareRow = didNotAcceptRow || row;
+  let compareRow = didNotAcceptRow || row;
+
+  // Contract-identity repair (DEAL rows only).
+  //
+  // A DEAL's CONTRACT_ID can become wrong AFTER it was assigned. The run-rate window it was matched
+  // against is START_DATE .. COALESCE(END_DATE, TENTATIVE_END_DATE), so while the previous placement
+  // is still running its END_DATE is null and the window reaches the tentative end; when the client
+  // ends that assignment the real END_DATE lands and the window shrinks. A booking that sat inside
+  // the optimistic window can then be outside the real one — Juan M Silva's DEAL 1464679 was matched
+  // on 2026-08-31 while placement 1455761 was STARTED, and on 2026-09-08 that placement ended and
+  // left CHC19805 spanning only 2026-06-07..2026-09-05, five weeks before the booking starts.
+  //
+  // applyContractIdCarryForward makes the id immutable, so nothing in the normal flow revisits it.
+  // The refresh endpoint is exactly where a user asks for it to be revisited, so the check runs here
+  // and the correction is written in place: the row was wrong, so the placement should end up with
+  // the rows it should always have had rather than carrying the bad id on as its history.
+  //
+  // The replacement id is minted BEFORE the write, so the row moves old -> new in one step. Clearing
+  // it first and letting the insert path re-allocate does NOT work: hasBusinessColumnChanges reads
+  // "incoming null vs baseline null" as no change, so the row is filtered out and simply stays
+  // unidentified.
+  let contractRevalidation = null;
+  try {
+    const verdict = await revalidateDealContractIdAgainstRunrate(compareRow, baseline, {
+      datasetId: effectiveDatasetId,
+      tableId: effectiveTableId,
+    });
+    if (verdict.needsRepair) {
+      if (applyUpdate) {
+        const repaired = await repairStoredContractIdForPlacement(
+          {
+            dealSheetId: compareRow.DEAL_SHEET_ID,
+            placementId: compareRow.PLACEMENT_ID,
+            newContractId: verdict.newContractId,
+            clearColumns: verdict.clearedColumns,
+          },
+          { datasetId: effectiveDatasetId, tableId: effectiveTableId }
+        );
+        // Carry the repair into this run: the row about to be compared/inserted and the baseline it
+        // is compared against must both reflect what the table now holds, or the next append would
+        // reinstate the old id and the old inherited values.
+        compareRow = { ...compareRow, CONTRACT_ID: verdict.newContractId };
+        if (baseline && typeof baseline === "object") {
+          baseline = { ...baseline, CONTRACT_ID: verdict.newContractId };
+          for (const col of verdict.clearedColumns) baseline[col] = null;
+          if (compareRow.START_DATE != null) baseline.INITIAL_START_DATE = compareRow.START_DATE;
+        }
+        contractRevalidation = {
+          repaired: true,
+          previous_contract_id: verdict.previousContractId,
+          new_contract_id: verdict.newContractId,
+          cleared_columns: verdict.clearedColumns,
+          initial_start_date_reset_to: compareRow.START_DATE ?? null,
+          stored_rows_updated: repaired.updatedRows,
+        };
+      } else {
+        contractRevalidation = {
+          repaired: false,
+          preview_only: true,
+          previous_contract_id: verdict.previousContractId,
+          new_contract_id: verdict.newContractId,
+          cleared_columns: verdict.clearedColumns,
+          initial_start_date_reset_to: compareRow.START_DATE ?? null,
+          stored_rows_updated: 0,
+        };
+      }
+    }
+  } catch (revalErr) {
+    logDetail(
+      `[refreshDealSheetByPlacementId] contract revalidation failed (non-fatal): ${String(revalErr?.message || revalErr).slice(0, 200)}`
+    );
+  }
+
+
   const changed = hasBusinessColumnChanges(compareRow, baseline, new Set(compareIgnoreFields));
   const diffFields = computeChangedFields(compareRow, baseline, compareIgnoreFields);
   const allowFirstInsert = placementStatusAllowsFirstInsert(
@@ -1146,6 +1239,9 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     action,
     reason,
     inserted: insertResult.inserted,
+    // Present only when this refresh repaired a CONTRACT_ID that no longer matches its run-rate
+    // window (see revalidateDealContractIdAgainstRunrate). Null on every ordinary refresh.
+    contract_id_revalidation: contractRevalidation,
     ownership_handover_log: ownershipHandoverLog,
     inorganic_scan: inorganicScanLog
       ? { inserted: inorganicScanLog.inserted, recruiterHierarchyDivergences: inorganicScanLog.recruiterHierarchyDivergences }
@@ -2890,7 +2986,7 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
   // Same per-domain Nexus pacing as the insert path.
   const updateTuning = applyDomainTuning(syncDomain);
   logLine(
-    `[update sync] Nexus pacing domain=${syncDomain || "all"} fetchAllMax=${updateTuning.fetchAllMax} batchDelayMs=${updateTuning.batchDelayMs} maxRetries=${updateTuning.maxRetries}`
+    `[update sync] Nexus pacing domain=${syncDomain || "all"} fetchAllMax=${updateTuning.fetchAllMax} batchDelayMs=${updateTuning.batchDelayMs} maxRetries=${updateTuning.maxRetries} placementConcurrency=${updateTuning.placementConcurrency}`
   );
   const domainTableId = resolveActiveDealSheetTableIdForDomain(syncDomain);
   const allTargets = await fetchActiveDealSheetUpdateTargets({
@@ -2948,7 +3044,16 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
     `[update sync] === syncExistingActiveDealSheetUpdatesFromBigQuery START === dataset=${effectiveDatasetId} maxPairsPerRun=${maxPairsPerRun} checkpointKey=${checkpointKey} resume=${resumeFromCheckpoint ? "yes" : "no"} priority=${priorityTotal} batch=${batchTotal} staleCutoffDays=${staleCutoffDays} batchStaleSkipped=${batchStaleSkipped} batchOffset=${batchOffset} slice=${slice.length} (priorityAll=${priorityCheckedPlanned} batchThisRun=${batchCheckedPlanned})`
   );
 
-  const concurrency = Math.max(1, Math.min(Number(config.fetchAllMax) || 20, 20));
+  // NOT fetchAllMax. Each unit here is one whole placement, and refreshPlacementRecordToBigQuery
+  // costs ~13 Nexus requests per placement (1 job-submittals + 1 deal-sheet-candidates in
+  // resolveRefreshSeed, then an 11-URL enrich wave). Driving this loop at fetchAllMax=10 therefore
+  // put ~130 requests in flight, not 10, and the seed's two requests are issued before the enrich
+  // wave so fetchAllMax's chunking never bounded them at all — that is the burst the edge answered
+  // with HTML 403s. See config.updatePlacementConcurrency for the full accounting.
+  const concurrency = Math.max(1, Math.min(Number(config.updatePlacementConcurrency) || 3, 20));
+  logLine(
+    `[update sync] placement concurrency=${concurrency} (~${concurrency * 13} Nexus requests in flight per batch)`
+  );
 
   let checked = 0;
   let appended = 0;
@@ -3002,6 +3107,10 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
   setPipelineDetailQuiet(true);
   try {
     for (let i = 0; i < slice.length; i += concurrency) {
+      // Gap between placement batches, mirroring nexusFetchAllJsonBatched's inter-chunk delay on the
+      // insert path. Without it the batches run back-to-back and the edge sees one continuous burst
+      // even at a low concurrency.
+      if (i > 0 && config.batchDelayMs > 0) await sleep(config.batchDelayMs);
       const batch = slice.slice(i, i + concurrency);
       const results = await Promise.all(batch.map(processTarget));
       for (const r of results) {
