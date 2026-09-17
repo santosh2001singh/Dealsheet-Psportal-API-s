@@ -2953,6 +2953,46 @@ function buildActiveUpdateRefreshParams(target, baseParams = {}) {
 }
 
 /**
+ * Wall-clock budget for the update trigger's placement loop, in ms.
+ *
+ * Default 1320000 (22 min) against the function's 1800s (30 min) timeout. The ~8 minute margin is
+ * not padding for its own sake — after the loop stops, the run still has to write its checkpoint and
+ * then run the audit-log scans (inorganic hierarchy, ownership change, ownership date sync) that
+ * follow it in runDealSheetUpdateSyncForDomain. Those need room to finish too.
+ *
+ * Override with UPDATE_LOOP_BUDGET_MS. Raising it above the function timeout would defeat the whole
+ * mechanism, so it is clamped to 90% of that.
+ *
+ * @returns {number}
+ */
+function resolveUpdateLoopBudgetMs() {
+  const raw = process.env.UPDATE_LOOP_BUDGET_MS;
+  const n = parseInt(String(raw != null && raw !== "" ? raw : "1320000").trim(), 10);
+  const requested = Number.isFinite(n) && n > 0 ? n : 1320000;
+  // 1800s is the deployed timeoutSeconds (SCHEDULE_TIMEOUT_SEC in index.js).
+  const ceiling = Math.floor(1800 * 1000 * 0.9);
+  return Math.min(requested, ceiling);
+}
+
+/**
+ * Share of the loop budget reserved for the PRIORITY tier, as a percentage.
+ *
+ * Default 70. The remaining 30% is the batch tier's guaranteed slot — guaranteed because priority
+ * runs first and, left unbounded, takes everything (health's 970 priority placements are ~4 hours of
+ * work at the speeds seen on 2026-09-16, against a 22-minute budget).
+ *
+ * Clamped to 10..90 so neither tier can ever be starved to nothing by a bad override.
+ *
+ * @returns {number}
+ */
+function resolvePriorityBudgetSharePct() {
+  const raw = process.env.UPDATE_PRIORITY_BUDGET_SHARE_PCT;
+  const n = parseInt(String(raw != null && raw !== "" ? raw : "70").trim(), 10);
+  if (!Number.isFinite(n)) return 70;
+  return Math.min(90, Math.max(10, n));
+}
+
+/**
  * Scheduled update path: load latest row per DEAL_SHEET_ID from active BigQuery tables (placement fallback),
  * refresh via Nexus, append when business columns differ from latest deal-sheet row in BQ.
  */
@@ -3007,6 +3047,18 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
   const targetTotal = priorityTotal + batchTotal;
 
   let batchOffset = 0;
+  // Where the PRIORITY tier resumes from.
+  //
+  // Priority used to restart at 0 on every run, on the assumption that the whole tier fits in one
+  // run. At health's real size it does not: 970 priority placements at the ~15s/placement Nexus was
+  // serving on 2026-09-16 is ~4 hours of work against a 22-minute budget. So every run re-refreshed
+  // the same leading ~88 placements and nothing else ever got a turn — BigQuery showed 894 of 970
+  // priority rows untouched for days, and the batch tier sat at offset 0 permanently because the
+  // loop never reached it.
+  //
+  // Rotating priority as well means each run picks up where the last stopped, so every placement
+  // comes round on a predictable cycle instead of a lucky few being refreshed forever.
+  let priorityOffset = 0;
   const checkpointRef = resumeFromCheckpoint ? getCheckpointRef(checkpointKey) : null;
   if (checkpointRef) {
     try {
@@ -3029,20 +3081,78 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
             `[update sync] checkpoint ignored (stale batchTotal/offset savedBatchTotal=${data.batchTotal} savedBatchOffset=${data.batchOffset} currentBatchTotal=${batchTotal})`
           );
         }
+        // Priority resumes on a LOOSER rule than batch above: only that the offset is in range.
+        //
+        // Batch demands savedBatchTotal === batchTotal because its membership is filtered by a
+        // staleness cutoff, so a changed total means the list was re-cut and an old offset would
+        // point somewhere else entirely. Priority's membership changes constantly and benignly — a
+        // placement goes BOOKED -> STARTED, a new one is added — and requiring an exact total match
+        // would discard the offset on nearly every run, putting us straight back to "always restart
+        // at 0". Drifting by a placement or two is harmless here: the cycle still advances, and
+        // anything skipped is picked up on the next lap.
+        const savedPriorityOffset = Number(data.priorityOffset);
+        if (
+          Number.isFinite(savedPriorityOffset) &&
+          savedPriorityOffset > 0 &&
+          savedPriorityOffset < priorityTotal
+        ) {
+          priorityOffset = Math.trunc(savedPriorityOffset);
+          logLine(
+            `[update sync] checkpoint resume priorityOffset=${priorityOffset} priorityTotal=${priorityTotal}`
+          );
+        } else if (data.priorityOffset != null) {
+          // Out of range means the tier shrank past the saved point, or a lap just completed.
+          logLine(
+            `[update sync] priority offset reset to 0 (savedPriorityOffset=${data.priorityOffset} priorityTotal=${priorityTotal})`
+          );
+        }
       }
     } catch (err) {
       logLine(`[update sync] checkpoint read failed (non-fatal): ${err?.message || err}`);
     }
   }
 
+  // Split the run's time between the two tiers instead of letting priority consume all of it.
+  //
+  // Priority runs first and, at 970 placements, would use the entire budget by itself — which is
+  // exactly why batchOffset was frozen at 0 while 3731 batch rows went 14+ days without a refresh.
+  // Giving priority a share (default 70%) guarantees the batch tier gets time on EVERY run, so both
+  // cycles advance every hour rather than one starving the other.
+  //
+  // Priority keeps the larger share because those are the live placements whose fields actually
+  // change; the batch tier is terminal statuses that change rarely.
+  const prioritySharePct = resolvePriorityBudgetSharePct();
+
+  // Priority is now windowed like batch. maxPairsPerRun stays a batch-only cap (its long-standing
+  // meaning); priority is bounded by its own time share, so the window here is deliberately wide and
+  // the deadline does the real limiting.
+  const prioritySlice = priorityTargets.slice(priorityOffset);
   const batchSlice = batchTargets.slice(batchOffset, batchOffset + maxPairsPerRun);
-  const slice = [...priorityTargets, ...batchSlice];
-  const priorityCheckedPlanned = priorityTotal;
+  const slice = [...prioritySlice, ...batchSlice];
+  const priorityCheckedPlanned = prioritySlice.length;
   const batchCheckedPlanned = batchSlice.length;
 
   logLine(
     `[update sync] === syncExistingActiveDealSheetUpdatesFromBigQuery START === dataset=${effectiveDatasetId} maxPairsPerRun=${maxPairsPerRun} checkpointKey=${checkpointKey} resume=${resumeFromCheckpoint ? "yes" : "no"} priority=${priorityTotal} batch=${batchTotal} staleCutoffDays=${staleCutoffDays} batchStaleSkipped=${batchStaleSkipped} batchOffset=${batchOffset} slice=${slice.length} (priorityAll=${priorityCheckedPlanned} batchThisRun=${batchCheckedPlanned})`
   );
+
+  // Wall-clock budget for the placement loop, well under the function's own timeoutSeconds (1800).
+  //
+  // Cloud Run kills an over-running instance with SIGKILL: no exception is raised, no catch block
+  // runs, no checkpoint is written, and the logs simply stop mid-line. That is exactly what the
+  // health update trigger did every hour on 2026-09-15/16 — ~30 minutes of clean work, then silence
+  // and a "Function crashed, timed out, or ran out of memory" alert. Worse, because the checkpoint
+  // was never written, the next run restarted from the SAME offset and re-did the same placements,
+  // so the batch tier never advanced at all.
+  //
+  // Stopping voluntarily fixes both: the loop leaves itself enough time to persist its checkpoint
+  // and log a real summary, so every run makes forward progress no matter how slow Nexus is.
+  //
+  // This is a TIME bound, not a count bound, and that is the point — max_pairs_per_run has been
+  // guessed three times (500, then 300) and each guess broke as soon as Nexus changed speed:
+  // placements ran at ~1.7s each on 2026-09-11 and ~15s each on 2026-09-16, a 9x swing. A deadline
+  // adapts to both without anyone re-tuning a number.
+  const loopBudgetMs = resolveUpdateLoopBudgetMs();
 
   // NOT fetchAllMax. Each unit here is one whole placement, and refreshPlacementRecordToBigQuery
   // costs ~13 Nexus requests per placement (1 job-submittals + 1 deal-sheet-candidates in
@@ -3105,14 +3215,67 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
   // [update sync] progress + the trigger-level summaries (in index.js) stay visible. Reset in finally
   // so the end-of-run scans and any later work log normally.
   setPipelineDetailQuiet(true);
+  // Placements actually processed this run. NOT the same as slice.length once the loop can stop
+  // early — the checkpoint below is derived from this, so a partial run resumes at the right offset
+  // instead of skipping whatever it never got to.
+  let processedFromSlice = 0;
+  let budgetExhausted = false;
+  // Set when priority hit its time share and the loop jumped to the batch tier. Both are needed to
+  // work out how far each tier's cursor advanced, since processedFromSlice alone can no longer tell
+  // priority work from batch work once a gap has been skipped.
+  let priorityStoppedEarly = false;
+  let priorityProcessed = 0;
+  let skippedPriorityCount = 0;
+
+  // Absolute deadline for the priority tier, as a share of the whole loop budget.
+  const priorityBudgetMs = Math.floor((loopBudgetMs * prioritySharePct) / 100);
+  logLine(
+    `[update sync] budget ${formatDuration(loopBudgetMs)} split priority=${prioritySharePct}% (${formatDuration(priorityBudgetMs)}) batch=${100 - prioritySharePct}% — priority ${priorityOffset}..${priorityOffset + priorityCheckedPlanned} of ${priorityTotal}, batch ${batchOffset}..${batchOffset + batchCheckedPlanned} of ${batchTotal}`
+  );
   try {
     for (let i = 0; i < slice.length; i += concurrency) {
+      // Stop before starting a batch we may not be able to finish. Checked per batch rather than per
+      // placement because a batch is the atomic unit here: its results are counted together, and
+      // abandoning one mid-flight would lose the placements already in flight.
+      const elapsedMs = Date.now() - startMs;
+      if (elapsedMs >= loopBudgetMs) {
+        budgetExhausted = true;
+        logLine(
+          `[update sync] BUDGET REACHED after ${formatDuration(elapsedMs)} (budget ${formatDuration(loopBudgetMs)}): stopping at ${processedFromSlice}/${slice.length} of this run's slice. Checkpoint below resumes the remainder next run — this is a clean stop, not a failure.`
+        );
+        break;
+      }
+
+      // Hand the rest of the run to the batch tier once priority has used its share.
+      //
+      // `slice` is [...prioritySlice, ...batchSlice], so every index below priorityCheckedPlanned is
+      // priority work. Skipping straight to the batch section is what guarantees the batch tier runs
+      // at all: before this, priority alone outlasted the whole budget and batchOffset never left 0
+      // while thousands of batch rows went unrefreshed for weeks.
+      if (i < priorityCheckedPlanned && elapsedMs >= priorityBudgetMs && batchCheckedPlanned > 0) {
+        logLine(
+          `[update sync] priority share used (${formatDuration(elapsedMs)} of ${formatDuration(priorityBudgetMs)}): processed ${processedFromSlice}/${priorityCheckedPlanned} priority, switching to batch tier`
+        );
+        priorityStoppedEarly = true;
+        // Jump to the first batch index. The loop's `i += concurrency` runs after this iteration, so
+        // set i to (boundary - concurrency) and let the increment land exactly on the boundary.
+        //
+        // Do NOT round the boundary down to a concurrency multiple: when priorityCheckedPlanned is
+        // not a multiple (97 with concurrency 3 rounds to 96, and the increment then lands on 99)
+        // the first two batch placements are silently skipped and never refreshed.
+        i = priorityCheckedPlanned - concurrency;
+        priorityProcessed = processedFromSlice;
+        skippedPriorityCount = priorityCheckedPlanned - processedFromSlice;
+        continue;
+      }
+
       // Gap between placement batches, mirroring nexusFetchAllJsonBatched's inter-chunk delay on the
       // insert path. Without it the batches run back-to-back and the edge sees one continuous burst
       // even at a low concurrency.
       if (i > 0 && config.batchDelayMs > 0) await sleep(config.batchDelayMs);
       const batch = slice.slice(i, i + concurrency);
       const results = await Promise.all(batch.map(processTarget));
+      processedFromSlice += batch.length;
       for (const r of results) {
         checked++;
         if (r.action === "INSERTED") appended++;
@@ -3125,7 +3288,7 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
       }
       if (checked > 0 && checked % 100 === 0) {
         logLine(
-          `[update sync] progress checked=${checked}/${slice.length} appended=${appended} no_change=${no_change} not_found=${not_found} no_baseline=${no_baseline} skipped_date=${skipped_date} errors=${errors}`
+          `[update sync] progress checked=${checked}/${slice.length} appended=${appended} no_change=${no_change} not_found=${not_found} no_baseline=${no_baseline} skipped_date=${skipped_date} errors=${errors} elapsed=${formatDuration(Date.now() - startMs)}/${formatDuration(loopBudgetMs)}`
         );
       }
     }
@@ -3133,28 +3296,96 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
     setPipelineDetailQuiet(false);
   }
 
-  const batchOffsetEnd = batchOffset + batchSlice.length;
+  // How far into the BATCH tier this run actually got.
+  //
+  // The slice is [...priorityTargets, ...batchSlice], and priority always runs first, so anything
+  // processed beyond priorityCheckedPlanned came out of the batch tier. On a full run this equals
+  // batchSlice.length and the offset advances exactly as before; on a budget-stopped run it is
+  // smaller, and the checkpoint records where the batch tier really stopped rather than claiming the
+  // whole slice was done. Getting this wrong would silently skip placements — they would sit
+  // un-refreshed until the batch pass wrapped all the way around again.
+  // Split processedFromSlice back into the two tiers.
+  //
+  // Once priority can stop early, processedFromSlice is the SUM of two disjoint runs of work with a
+  // skipped gap between them, so it no longer maps to a position in `slice`. priorityProcessed is
+  // captured at the moment of the switch, and everything after that point is batch work.
+  const priorityProcessedThisRun = priorityStoppedEarly
+    ? priorityProcessed
+    : Math.min(processedFromSlice, priorityCheckedPlanned);
+  const batchProcessedThisRun = Math.max(0, processedFromSlice - priorityProcessedThisRun);
+
+  // Advance the priority cursor, wrapping to 0 when the tier is exhausted.
+  //
+  // Wrapping is what makes this a rotation rather than a one-way scan: reaching the end means every
+  // priority placement has had a turn, and the next lap starts over. Without the wrap the offset
+  // would pin at the end and priority would stop being refreshed entirely.
+  const priorityOffsetEndRaw = priorityOffset + priorityProcessedThisRun;
+  const priorityLapComplete = priorityOffsetEndRaw >= priorityTotal;
+  const priorityOffsetEnd = priorityLapComplete ? 0 : priorityOffsetEndRaw;
+
+  const batchOffsetEnd = batchOffset + batchProcessedThisRun;
   const hasMore = batchOffsetEnd < batchTotal;
-  const priorityChecked = Math.min(checked, priorityCheckedPlanned);
+  const priorityChecked = Math.min(checked, priorityProcessedThisRun);
   const batchCheckedThisRun = Math.max(0, checked - priorityChecked);
 
   if (checkpointRef) {
     try {
-      if (!hasMore && clearCheckpointOnComplete) {
-        await checkpointRef.delete();
-        logLine(`[update sync] checkpoint deleted key=${checkpointKey} (batch pass complete)`);
+      // Deleting the checkpoint declares "the batch pass finished" and sends the next run back to
+      // offset 0. A run that stopped on its time budget has NOT finished — it may not even have
+      // reached the batch tier (a large enough priority tier can consume the whole budget on its
+      // own, leaving batchProcessedThisRun at 0 and hasMore false when batchTotal is 0). Deleting
+      // then would throw away a perfectly good offset and restart the pass from the beginning, which
+      // is the same "never makes progress" loop the SIGKILL was causing. Keep the checkpoint
+      // whenever the stop was involuntary.
+      if (!hasMore && clearCheckpointOnComplete && !budgetExhausted) {
+        // A finished batch pass resets the BATCH cursor to 0 — but deleting the document would take
+        // the PRIORITY cursor with it, and the two tiers run on independent cycles: batch wrapping
+        // says nothing about how far priority has rotated. Overwrite the batch fields instead of
+        // deleting, so the priority rotation survives.
+        await checkpointRef.set(
+          {
+            key: checkpointKey,
+            batchOffset: 0,
+            batchTotal,
+            priorityOffset: priorityOffsetEnd,
+            priorityTotal,
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+        logLine(
+          `[update sync] batch pass complete key=${checkpointKey} batchOffset reset to 0, priorityOffset=${priorityOffsetEnd}/${priorityTotal} preserved`
+        );
+      } else if (!hasMore && budgetExhausted) {
+        // The batch pass is done but the run was cut short, so the batch offset must not be cleared.
+        // The priority cursor still has to be persisted — it is the only record of where the
+        // priority rotation reached, and losing it restarts that tier at 0 next run.
+        await checkpointRef.set(
+          {
+            key: checkpointKey,
+            priorityOffset: priorityOffsetEnd,
+            priorityTotal,
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+        logLine(
+          `[update sync] checkpoint kept key=${checkpointKey} batchOffset=${batchOffsetEnd} priorityOffset=${priorityOffsetEnd} (budget-stopped run; pass is not complete)`
+        );
       } else if (hasMore) {
         await checkpointRef.set(
           {
             key: checkpointKey,
             batchOffset: batchOffsetEnd,
             batchTotal,
+            priorityOffset: priorityOffsetEnd,
+            priorityTotal,
             updatedAt: new Date().toISOString(),
           },
           { merge: true }
         );
         logLine(
-          `[update sync] checkpoint saved key=${checkpointKey} batchOffset=${batchOffsetEnd} batchTotal=${batchTotal}`
+          `[update sync] checkpoint saved key=${checkpointKey} batchOffset=${batchOffsetEnd} batchTotal=${batchTotal} priorityOffset=${priorityOffsetEnd}/${priorityTotal}${priorityLapComplete ? " (priority lap complete, wrapped to 0)" : ""}`
         );
       }
     } catch (err) {
@@ -3164,7 +3395,7 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
 
   const elapsed = formatDuration(Date.now() - startMs);
   logLine(
-    `[update sync] === DONE === checked=${checked} appended=${appended} no_change=${no_change} not_found=${not_found} no_baseline=${no_baseline} skipped_date=${skipped_date} errors=${errors} priorityTotal=${priorityTotal} priorityChecked=${priorityChecked} batchTotal=${batchTotal} batchStaleSkipped=${batchStaleSkipped} batchCheckedThisRun=${batchCheckedThisRun} batchOffset=${batchOffset} batchOffsetEnd=${batchOffsetEnd} targetTotal=${targetTotal} hasMore=${hasMore ? "yes" : "no"} elapsed=${elapsed}`
+    `[update sync] === DONE === checked=${checked} appended=${appended} no_change=${no_change} not_found=${not_found} no_baseline=${no_baseline} skipped_date=${skipped_date} errors=${errors} priorityTotal=${priorityTotal} priorityChecked=${priorityChecked} batchTotal=${batchTotal} batchStaleSkipped=${batchStaleSkipped} batchCheckedThisRun=${batchCheckedThisRun} batchOffset=${batchOffset} batchOffsetEnd=${batchOffsetEnd} targetTotal=${targetTotal} hasMore=${hasMore ? "yes" : "no"} budgetExhausted=${budgetExhausted ? "yes" : "no"} priorityOffset=${priorityOffset}->${priorityOffsetEnd}/${priorityTotal} priorityStoppedEarly=${priorityStoppedEarly ? "yes" : "no"} prioritySkipped=${skippedPriorityCount} elapsed=${elapsed}`
   );
 
   return {
@@ -3175,6 +3406,16 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
     no_baseline,
     skipped_date,
     errors,
+    // True when the loop stopped on its wall-clock budget rather than finishing the slice. The
+    // trigger logs it so a short run is visibly a deliberate stop, not a silent truncation.
+    budgetExhausted,
+    // Priority rotation state, so a run's forward progress is visible without reading Firestore.
+    priorityOffset,
+    priorityOffsetEnd,
+    priorityLapComplete,
+    priorityStoppedEarly,
+    priorityProcessedThisRun,
+    batchProcessedThisRun,
     syncDomain: syncDomain,
     priorityTotal,
     priorityChecked,
@@ -3189,14 +3430,18 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
     pairOffset: batchOffset,
     targetOffsetEnd: batchOffsetEnd,
     pairOffsetEnd: batchOffsetEnd,
-    targetsProcessedThisRun: slice.length,
-    pairsProcessedThisRun: slice.length,
+    // What this run actually got through — slice.length is only the PLAN, and a budget-stopped run
+    // processes less than it planned.
+    targetsProcessedThisRun: processedFromSlice,
+    pairsProcessedThisRun: processedFromSlice,
     hasMore,
     elapsed,
   };
 }
 
 module.exports = {
+  resolveUpdateLoopBudgetMs,
+  resolvePriorityBudgetSharePct,
   ENRICH_LOG_WRITES_DISABLED_DOMAINS,
   domainWritesEnrichLogs,
   syncEnrichedDealSheetCandidatesToBigQuery,

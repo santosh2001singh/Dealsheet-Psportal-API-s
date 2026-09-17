@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const {
   EXTENSION_RUNRATE_HIERARCHY_COLUMNS,
   EXTENSION_RUNRATE_MANUAL_COLUMNS,
+  RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS,
   EXTENSION_RUNRATE_ELIGIBLE_PLACEMENT_STATUSES,
   isExtensionRunrateEligiblePlacementStatus,
   buildRunrateEligiblePlacementStatusSqlPredicate,
@@ -1308,4 +1309,118 @@ test("prior-EXTENSION tier stays fill-if-empty and cannot overwrite parent DEAL 
 
   // Parent DEAL wins outright; the prior-extension tier must not overwrite it afterwards.
   assert.equal(out[0].ASSOCIATE_DELIVERY_DIRECTOR, "Correct Parent Director");
+});
+
+// --- Location-scoped narrative columns (Patrick Kennedy, PLACEMENT_ID 1463269, Sep 2026) ---
+// The run-rate match tiers degrade to identity-only at the bottom (EMAIL_VMS_JOB_ID and
+// NEXUS_LATEST_BEFORE_EXT check no client at all), so an extension inserted before its own
+// run-rate row exists matches a row from a DIFFERENT hospital. Pushback / termination / comments
+// describe one booking at one location and must not ride along on such a match.
+
+test("RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS holds exactly the booking-narrative columns", () => {
+  assert.deepEqual(
+    [...RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS].sort(),
+    ["BACKOUT_OR_TERMINATION", "COMMENTS", "ST_DT_PUSHBACK_REASON"]
+  );
+});
+
+test("location-scoped columns are a strict subset of the manual columns they gate", () => {
+  for (const col of RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS) {
+    assert.ok(
+      EXTENSION_RUNRATE_MANUAL_COLUMNS.includes(col),
+      `${col} must be one of EXTENSION_RUNRATE_MANUAL_COLUMNS to be gated`
+    );
+  }
+});
+
+test("contract-scoped ops columns stay ungated (they follow the candidate, not the building)", () => {
+  for (const col of [
+    "CLIENT_RECRUITER",
+    "CREDENTIALING_SPECIALIST",
+    "PRIMARY_SALES_PERSON",
+    "CLIENT_PAYMENT_TERMS",
+    "CANDIDATE_PAYMENT_TERMS",
+    "ENTITY",
+    "TYPE_OF_CLIENT",
+    "PO_RECEIVED",
+  ]) {
+    assert.equal(
+      RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS.has(col),
+      false,
+      `${col} must not be location-gated`
+    );
+  }
+});
+
+test("wrong-hospital run-rate match cannot supply pushback / termination / comments", async () => {
+  // What the gated SQL yields when same_location_by_id is false: the three narrative columns
+  // arrive as NULL, everything else on the matched row still comes through.
+  const clevelandMatchWithGate = {
+    CONTRACT_ID: "CHC20448",
+    SKU_NUMBER: "H14054",
+    ST_DT_PUSHBACK_REASON: null,
+    BACKOUT_OR_TERMINATION: null,
+    COMMENTS: null,
+    TYPE_OF_CLIENT: "Commercial",
+  };
+
+  const ext = {
+    DEAL_TYPE: "EXTENSION",
+    PLACEMENT_ID: "1463269",
+    CANDIDATE_ID: "26592850",
+    PLACEMENT_STATUS: "BOOKED",
+    CONTRACT_ID: null,
+    ST_DT_PUSHBACK_REASON: null,
+    BACKOUT_OR_TERMINATION: null,
+    COMMENTS: null,
+    TYPE_OF_CLIENT: null,
+  };
+
+  const [out] = await applyExtensionInheritForInsertRows([ext], {}, {
+    parentFetchFn: noParentFetch,
+    priorExtensionFetchFn: noPriorExtensionFetch,
+    runrateFetchFn: async () => new Map([["1463269", clevelandMatchWithGate]]),
+    resolveContractIdsFn: noContractIdResolution,
+  });
+
+  assert.equal(out.ST_DT_PUSHBACK_REASON, null);
+  assert.equal(out.BACKOUT_OR_TERMINATION, null);
+  assert.equal(out.COMMENTS, null);
+  // The rest of the matched row is unaffected by the gate.
+  assert.equal(out.CONTRACT_ID, "CHC20448");
+  assert.equal(out.TYPE_OF_CLIENT, "Commercial");
+});
+
+test("same-location run-rate match still supplies the narrative columns", async () => {
+  // same_location_by_id true -> SQL passes the values through unchanged.
+  const weirtonMatch = {
+    CONTRACT_ID: "CHC22077",
+    SKU_NUMBER: "H15256",
+    ST_DT_PUSHBACK_REASON: "Delay by Cred",
+    BACKOUT_OR_TERMINATION: "Termination - Contract Ended",
+    COMMENTS: "Eligible for OT",
+  };
+
+  const ext = {
+    DEAL_TYPE: "EXTENSION",
+    PLACEMENT_ID: "1463269",
+    CANDIDATE_ID: "26592850",
+    PLACEMENT_STATUS: "BOOKED",
+    CONTRACT_ID: null,
+    ST_DT_PUSHBACK_REASON: null,
+    BACKOUT_OR_TERMINATION: null,
+    COMMENTS: null,
+  };
+
+  const [out] = await applyExtensionInheritForInsertRows([ext], {}, {
+    parentFetchFn: noParentFetch,
+    priorExtensionFetchFn: noPriorExtensionFetch,
+    runrateFetchFn: async () => new Map([["1463269", weirtonMatch]]),
+    resolveContractIdsFn: noContractIdResolution,
+  });
+
+  assert.equal(out.ST_DT_PUSHBACK_REASON, "Delay by Cred");
+  assert.equal(out.BACKOUT_OR_TERMINATION, "Termination - Contract Ended");
+  assert.equal(out.COMMENTS, "Eligible for OT");
+  assert.equal(out.CONTRACT_ID, "CHC22077");
 });

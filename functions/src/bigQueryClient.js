@@ -3596,6 +3596,36 @@ function legacyDealManualColumns(runrateTableId) {
 }
 
 /**
+ * Manual columns that describe WHAT HAPPENED ON ONE BOOKING AT ONE LOCATION, not the contract
+ * chain as a whole. A run-rate row only gets to supply these when it is the same placement
+ * location as the extension, judged on NEXUS_PARENT_CLIENT_ID + CLIENT_ID (see
+ * `same_location_by_id` in fetchExtensionRunrateBackfillByPlacementId) — never on facility or
+ * parent-client NAME, which are spelled differently across the two tables.
+ *
+ * Why: the run-rate match tiers degrade to identity-only at the bottom (EMAIL_VMS_JOB_ID and
+ * NEXUS_LATEST_BEFORE_EXT check no client at all), so a candidate who moved between health
+ * systems matches a row from the WRONG hospital whenever their own row is not in run-rate yet.
+ *
+ * Live case (CANDIDATE_ID 26592850 "Patrick Kennedy", PLACEMENT_ID 1463269, Sep 2026): the
+ * Weirton / WVU Medicine extension was inserted 2026-07-10, two months before its own run-rate
+ * row (START_DATE 2026-09-13) existed. The only rows available that day were West Penn and
+ * Cleveland Clinic, both matching on NEXUS_LATEST_BEFORE_EXT; Cleveland won the
+ * `runrate_start_date DESC` tiebreak and the extension came up carrying "Delay by Client" and
+ * "Termination - Client Terminated - Negative" from a hospital it never worked at — on an
+ * assignment that is still running and has no END_DATE. Its own run-rate row has both fields
+ * null, and backfill runs once at insert (`__CARRIED_FORWARD_UPDATE`), so it never self-corrected.
+ *
+ * Everything else in EXTENSION_RUNRATE_MANUAL_COLUMNS stays ungated: sales / credentialing /
+ * payment terms / ENTITY and friends follow the candidate and the contract, not the building.
+ */
+const RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS = new Set([
+  "ST_DT_PUSHBACK_REASON",
+  "BACKOUT_OR_TERMINATION",
+  "COMMENTS",
+]);
+Object.freeze(RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS);
+
+/**
  * Hierarchy name + `_EMP_NO` columns an EXTENSION row takes from its matched legacy run-rate row.
  *
  * The run-rate window match is the ONLY tier that can tell one of a candidate's contracts from the
@@ -5067,8 +5097,17 @@ async function fetchExtensionRunrateBackfillByPlacementId(rows, options = {}) {
   const runrateSelectHierarchy = runrateSelectColumnsUnique
     .map((col) => `      ${col} AS ${runrateAliasForColumn(col)}`)
     .join(",\n");
+  // Location-scoped narrative columns are nulled out unless the matched run-rate row is the same
+  // placement location by id (see RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS). Everything else is
+  // projected straight through.
   const bestMatchHierarchySelect = runrateSelectColumnsUnique
-    .map((col) => `        b.${runrateAliasForColumn(col)} AS ${proposedAliasForColumn(col)}`)
+    .map((col) => {
+      const src = `b.${runrateAliasForColumn(col)}`;
+      const alias = proposedAliasForColumn(col);
+      return RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS.has(col)
+        ? `        IF(b.same_location_by_id, ${src}, NULL) AS ${alias}`
+        : `        ${src} AS ${alias}`;
+    })
     .join(",\n");
 
   const chunkSize = 100;
@@ -5292,7 +5331,24 @@ ${runrateSelectHierarchy}
         WHERE j.match_method IS NOT NULL
       ),
       best_match AS (
-        SELECT * FROM ranked WHERE rn = 1
+        SELECT
+          r.*,
+          -- Is the matched run-rate row the SAME placement location as this extension, judged on
+          -- IDs only? Names are spelled differently across the two tables and a facility can be
+          -- renamed, so NEXUS_PARENT_CLIENT_ID + CLIENT_ID are the only trustworthy test.
+          -- Both ids must be present on both sides and both must agree; anything else is "unknown
+          -- or different location", never "same".
+          (
+            NULLIF(e2.deal_parent_client_id, '') IS NOT NULL
+            AND r.runrate_parent_client_id IS NOT NULL
+            AND CAST(r.runrate_parent_client_id AS STRING) = e2.deal_parent_client_id
+            AND NULLIF(e2.deal_facility_id, '') IS NOT NULL
+            AND r.runrate_client_id IS NOT NULL
+            AND CAST(r.runrate_client_id AS STRING) = e2.deal_facility_id
+          ) AS same_location_by_id
+        FROM ranked r
+        JOIN extensions e2 ON e2.placement_id = r.placement_id
+        WHERE r.rn = 1
       )
       SELECT
         CAST(e.placement_id AS STRING) AS placement_id,
@@ -9162,6 +9218,7 @@ module.exports = {
   formatDateOnlyForSql,
   EXTENSION_RUNRATE_HIERARCHY_COLUMNS,
   EXTENSION_RUNRATE_MANUAL_COLUMNS,
+  RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS,
   DEAL_SHEET_MISSING_COLUMNS_BY_TABLE,
   resolveDealSheetMissingColumns,
   RATE_CHANGE_LOG_EXCLUDED_TABLE_IDS,
