@@ -17,9 +17,9 @@ test("scope is the cynet health active table", () => {
   assert.deepEqual([...EXTENSION_PARENT_BACKFILL_TABLE_IDS], ["cynet_health_deal_sheet"]);
 });
 
-test("all 62 inherited columns are filled, contract identity included", () => {
+test("all 64 inherited columns are filled, contract identity included", () => {
   const cols = parentBackfillColumns();
-  assert.equal(cols.length, 62);
+  assert.equal(cols.length, 64);
   for (const expected of [
     "CONTRACT_ID",
     "SKU_NUMBER",
@@ -114,9 +114,41 @@ test("the parent must start on or before the extension", () => {
   assert.match(sql, /d\.START_DATE <= e\.START_DATE/);
 });
 
-test("the earliest qualifying parent wins", () => {
+// DESC, matching fetchExtensionParentDealInheritByPlacementId. This pass ordered ASC, so on every
+// run it handed a candidate's FIRST-EVER deal to an extension of a much later contract — the exact
+// "earliest-wins" bug the insert path had already fixed. It is also what decides the parent while an
+// extension has no CONTRACT_ID for the guard below to compare.
+test("the latest qualifying parent wins, as on the insert path", () => {
   const { sql } = buildExtensionParentBackfillSql(OPTS);
-  assert.match(sql, /ORDER BY d\.START_DATE ASC NULLS LAST/);
+  assert.match(sql, /ORDER BY d\.START_DATE DESC NULLS LAST/);
+  assert.ok(
+    !/ORDER BY d\.START_DATE ASC/.test(sql),
+    "earliest-wins ordering must not come back"
+  );
+});
+
+// The START_DATE guard only rejects LATER deals. A candidate's PREVIOUS, already-ended contract
+// predates the extension and sails through it, and the 4-field identity cannot tell the two apart
+// because successive contracts at one client share all four. Live case (CANDIDATE_ID 21472994):
+// CHC22011's extensions inherited ended contract CHC18361's INITIAL_START_DATE,
+// BACKOUT_OR_TERMINATION, COMMENTS and ST_DT_PUSHBACK_REASON.
+test("the parent must belong to the same contract", () => {
+  const { sql } = buildExtensionParentBackfillSql(OPTS);
+  assert.match(
+    sql,
+    /AND \(e\.ext_contract_id IS NULL OR d\.parent_contract_id = e\.ext_contract_id\)/
+  );
+});
+
+// Both sides alias CONTRACT_ID: the parent's is already projected by the inherit column list, and a
+// second bare mention makes BigQuery reject the whole script with "Name CONTRACT_ID is ambiguous
+// inside d" — the failure ACC_DIR_OR_VERT_HEAD caused on the insert path in Aug 2026.
+test("the contract guard reads aliased columns, never a bare duplicate CONTRACT_ID", () => {
+  const { sql } = buildExtensionParentBackfillSql(OPTS);
+  assert.match(sql, /NULLIF\(TRIM\(IFNULL\(CONTRACT_ID, ''\)\), ''\) AS ext_contract_id/);
+  assert.match(sql, /NULLIF\(TRIM\(IFNULL\(CONTRACT_ID, ''\)\), ''\) AS parent_contract_id/);
+  // The alias is projected only to be compared, so it must not reach the temp table / SET list.
+  assert.match(sql, /EXCEPT\(CANDIDATE_ID, CLIENT_ID, START_DATE, LAST_UPDATED, em, ph, parent_contract_id\)/);
 });
 
 // The deal sheet is append-only: without one-row-per-id the UPDATE dies with "UPDATE/MERGE must match

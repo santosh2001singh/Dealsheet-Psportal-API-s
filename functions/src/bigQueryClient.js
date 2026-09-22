@@ -1530,20 +1530,75 @@ function applyExtensionStartDatesForInsertRows(rows) {
 }
 
 /**
+ * Placement statuses that mean the candidate has actually started (mirrors extensionRehire.js's
+ * STARTED_PLACEMENT_STATUSES). Anything else — BOOKED, OFFERED, DID NOT START, DID NOT ACCEPT —
+ * is still pre-start.
+ */
+const STARTED_PLACEMENT_STATUS_SET_FOR_ORIGINAL_START = new Set([
+  "STARTED",
+  "ACTIVE",
+  "ENDED",
+  "ENDED<30",
+]);
+
+/** @returns {boolean} true once the placement has actually started. */
+function hasPlacementStarted(row) {
+  const key = row?.PLACEMENT_STATUS == null ? "" : String(row.PLACEMENT_STATUS).trim().toUpperCase();
+  return key !== "" && STARTED_PLACEMENT_STATUS_SET_FOR_ORIGINAL_START.has(key);
+}
+
+/**
  * For DEAL rows, INITIAL_START_DATE = START_DATE (a DEAL is the first placement, so its start IS
- * the original). Fills only when INITIAL_START_DATE is empty — a value already carried forward
- * from baseline (frozen, MANUAL_COLUMN) or hand-edited is left untouched, so it never drifts if
- * START_DATE is later corrected. EXTENSION rows are untouched here (they inherit INITIAL_START_DATE
- * from the parent DEAL / runrate). A later extension's parent-DEAL inherit picks this up via
+ * the original). EXTENSION rows are untouched here (they inherit INITIAL_START_DATE from the parent
+ * DEAL / runrate). A later extension's parent-DEAL inherit picks this up via
  * COALESCE(parent.INITIAL_START_DATE, parent.START_DATE) — no repeated runrate lookup needed.
+ *
+ * Empty -> filled from START_DATE.
+ *
+ * Non-empty -> frozen ONCE THE PLACEMENT HAS STARTED. The freeze is what makes the column a stable
+ * contract lineage anchor: extensions attach to their parent by it, and the legacy run-rate repair
+ * matches a DEAL's START_DATE against its extension's INITIAL_START_DATE. Letting it drift after
+ * the fact would break both.
+ *
+ * Before the candidate starts, though, a START_DATE change is not drift — it is the contract's real
+ * start being settled. A pre-start pushback moves the booking wholesale, so the frozen value is
+ * simply a date the assignment never had. Live case (PLACEMENT_ID 1467701, Sep 2026): booked for
+ * 2026-09-14, pushed to 2026-09-28 for pending compliance ("Delay by Cred"); the row kept
+ * INITIAL_START_DATE 2026-09-14, a start that never happened.
+ *
+ * Re-syncing it while pre-start is safe precisely because nothing can depend on it yet: a placement
+ * that has not started has no extensions, so no lineage is anchored to the old value. The moment it
+ * reaches STARTED / ACTIVE / ENDED the value freezes for good.
+ *
+ * ONLY a LATER value is re-synced. An INITIAL_START_DATE EARLIER than the row's own START_DATE is
+ * not stale — it is the contract's real start, and this placement is a later segment of it. That is
+ * exactly what applyLegacyContractIdentityToDealRows writes from the matched run-rate row's
+ * START_DATE (see contractIdResolver.js), which runs BEFORE this function in the insert path: a
+ * DEAL re-tracked against run-rate history legitimately begins after the contract it belongs to.
+ * Overwriting it here would undo that lookup on every pre-start row and put each placement back on
+ * its own start — the split-contract problem that lookup exists to fix.
+ *
+ * So the rule is directional: earlier than START_DATE means lineage (keep); later than START_DATE
+ * is impossible for a real initial start and means the booking moved (re-sync).
+ *
+ * A hand-edit still wins in the lineage direction; a hand-edit that sets a date after the row's own
+ * start is self-contradictory and is corrected, the same way the run-rate lookup rejects one.
  */
 function applyOriginalStartDateForDealRows(rows) {
   if (!rows || rows.length === 0) return rows;
   return rows.map((row) => {
     if (!row || typeof row !== "object") return row;
     if (normalizeDealTypeKey(row.DEAL_TYPE) !== "DEAL") return row;
-    if (!isEmptyDateFieldValue(row.INITIAL_START_DATE)) return row;
     if (isEmptyDateFieldValue(row.START_DATE)) return row;
+    if (isEmptyDateFieldValue(row.INITIAL_START_DATE)) {
+      return { ...row, INITIAL_START_DATE: row.START_DATE };
+    }
+    // Started -> frozen, whichever way it points.
+    if (hasPlacementStarted(row)) return row;
+    const initial = String(row.INITIAL_START_DATE).trim().slice(0, 10);
+    const start = String(row.START_DATE).trim().slice(0, 10);
+    // Earlier (or equal) -> contract lineage, keep. Later -> the booking moved, re-sync.
+    if (initial <= start) return row;
     return { ...row, INITIAL_START_DATE: row.START_DATE };
   });
 }
@@ -4811,6 +4866,22 @@ ${parentDealJoinedSelect},
          -- Only a DEAL that already carries the contract identity can pass it on; an unresolved
          -- parent would otherwise "match" and hand down nulls.
          AND d.CONTRACT_ID IS NOT NULL AND TRIM(d.CONTRACT_ID) != ''
+         -- ...and it must be the SAME contract. The date guard above only rejects LATER deals, so a
+         -- candidate's PREVIOUS, already-ended contract predates the extension and sails through it,
+         -- and the 4-field identity cannot tell the two apart because successive contracts at one
+         -- client share all four. Live case (CANDIDATE_ID 21472994, Sep 2026): CHC18361 ran
+         -- 2025-05-07 to 2026-05-07, CHC22011 started 2026-06-17, and CHC22011's extensions took
+         -- CHC18361's INITIAL_START_DATE.
+         --
+         -- A row whose CONTRACT_ID is not resolved yet inherits NOTHING here, rather than falling
+         -- back to a guess. Every proxy for "same contract" that does not read the id itself is an
+         -- estimate: a date gap picks an arbitrary cutoff and wrongly rejects a genuine extension
+         -- that resumed after a long break, and a job id identifies a POSTING, not a contract. The
+         -- row simply stays empty until its id is resolved, and backfillExtensionParentInherit --
+         -- which runs post-sync, when the id IS known, and matches on it -- fills it in then. An
+         -- empty column that gets filled correctly beats a populated one that is wrong.
+         AND ext.resolved_contract_id != ''
+         AND d.CONTRACT_ID = ext.resolved_contract_id
       )
       SELECT
         CAST(placement_id AS STRING) AS placement_id,
@@ -4969,9 +5040,17 @@ ${dateSkuJoinedSelect},
          -- the START_DATE guard above only rejects LATER rows, so the candidate's previous contract
          -- sailed through it. Live case (CANDIDATE_ID 22101746, PLACEMENT_ID 1462717, Aug 2026): the
          -- row was already on CHC22685 and still took ASSOCIATE_DELIVERY_DIRECTOR off the CHC19540
-         -- extension. Inert when the row has no id yet ('' below), which is what makes this tier a
-         -- genuine fallback for extensions the window match could not place.
-         AND (ext.resolved_contract_id = '' OR p.CONTRACT_ID = ext.resolved_contract_id)
+         -- extension.
+         -- Written as a required match, NOT as "resolved_contract_id = '' OR ...": that form left the
+         -- guard INERT exactly when it was needed most, because a brand-new extension has no
+         -- CONTRACT_ID yet, so '' disabled it and the previous contract walked back in
+         -- (CANDIDATE_ID 21472994, Sep 2026: CHC22011's rows took ended contract CHC18361's
+         -- BACKOUT_OR_TERMINATION / COMMENTS / ST_DT_PUSHBACK_REASON). An unresolved row now
+         -- inherits NOTHING here instead of falling back to a guess -- see the parent-DEAL tier for
+         -- why every such proxy (date gap, job id) is an estimate -- and picks its detail up from
+         -- backfillExtensionParentInherit once its id is known.
+         AND ext.resolved_contract_id != ''
+         AND p.CONTRACT_ID = ext.resolved_contract_id
       ),
       hierarchy_ranked AS (
         SELECT
@@ -4995,9 +5074,17 @@ ${hierarchyJoinedSelect},
          -- the START_DATE guard above only rejects LATER rows, so the candidate's previous contract
          -- sailed through it. Live case (CANDIDATE_ID 22101746, PLACEMENT_ID 1462717, Aug 2026): the
          -- row was already on CHC22685 and still took ASSOCIATE_DELIVERY_DIRECTOR off the CHC19540
-         -- extension. Inert when the row has no id yet ('' below), which is what makes this tier a
-         -- genuine fallback for extensions the window match could not place.
-         AND (ext.resolved_contract_id = '' OR p.CONTRACT_ID = ext.resolved_contract_id)
+         -- extension.
+         -- Written as a required match, NOT as "resolved_contract_id = '' OR ...": that form left the
+         -- guard INERT exactly when it was needed most, because a brand-new extension has no
+         -- CONTRACT_ID yet, so '' disabled it and the previous contract walked back in
+         -- (CANDIDATE_ID 21472994, Sep 2026: CHC22011's rows took ended contract CHC18361's
+         -- BACKOUT_OR_TERMINATION / COMMENTS / ST_DT_PUSHBACK_REASON). An unresolved row now
+         -- inherits NOTHING here instead of falling back to a guess -- see the parent-DEAL tier for
+         -- why every such proxy (date gap, job id) is an estimate -- and picks its detail up from
+         -- backfillExtensionParentInherit once its id is known.
+         AND ext.resolved_contract_id != ''
+         AND p.CONTRACT_ID = ext.resolved_contract_id
       )
       SELECT
         CAST(ds.placement_id AS STRING) AS placement_id,

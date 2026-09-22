@@ -14,10 +14,19 @@
  *
  * Parent identity is the SAME 4-field match the insert path uses
  * (fetchExtensionParentDealInheritByPlacementId): CANDIDATE_ID + CANDIDATE_EMAIL + CELL_PHONE +
- * CLIENT_ID, taking the earliest matching DEAL. One condition is ADDED here that the insert path does
- * not have: the parent must start on or before the extension (`d.START_DATE <= e.START_DATE`).
- * Without it a LATER deal for the same candidate is picked as "parent" — e.g. an extension starting
- * 2026-04-01 was matched to a deal starting 2026-07-01, which is not its parent at all.
+ * CLIENT_ID, taking the LATEST qualifying DEAL. Two conditions narrow it, and both are needed
+ * because that identity is identical across a candidate's successive contracts at one client:
+ *   - The parent must start on or before the extension (`d.START_DATE <= e.START_DATE`). Without it
+ *     a LATER deal is picked as "parent" — an extension starting 2026-04-01 was matched to a deal
+ *     starting 2026-07-01, which is not its parent at all.
+ *   - The parent must carry the SAME CONTRACT_ID. The date guard only rejects LATER deals, so a
+ *     PREVIOUS, already-ended contract passes it untouched. CANDIDATE_ID 21472994 (Sep 2026):
+ *     CHC18361 ran 2025-05-07 to 2026-05-07, CHC22011 started 2026-06-17, and CHC22011's extensions
+ *     inherited CHC18361's INITIAL_START_DATE, BACKOUT_OR_TERMINATION, COMMENTS and
+ *     ST_DT_PUSHBACK_REASON.
+ * Ordering is DESC (nearest preceding DEAL), matching the insert path. It had been ASC here, which
+ * re-applied on every run the exact "earliest-wins" bug the insert path had already fixed, and it is
+ * what decides the parent while an extension still has no CONTRACT_ID for the guard to compare.
  *
  * SAFETY (why this cannot corrupt a CONTRACT_ID):
  *   - FILL-IF-EMPTY only. Every assignment is `IFNULL(existing, parent)`, so a populated column is
@@ -180,6 +189,9 @@ WITH latest AS (
 ),
 ext AS (
   SELECT DEAL_SHEET_ID, CANDIDATE_ID, CLIENT_ID, START_DATE,
+         -- The extension's OWN contract id, used below to reject a parent from a different
+         -- contract. Aliased so it cannot collide with the parent's CONTRACT_ID.
+         NULLIF(TRIM(IFNULL(CONTRACT_ID, '')), '') AS ext_contract_id,
          LOWER(TRIM(IFNULL(CANDIDATE_EMAIL, ''))) AS em,
          TRIM(IFNULL(CELL_PHONE, ''))             AS ph
   FROM latest
@@ -187,6 +199,11 @@ ext AS (
 ),
 deal AS (
   SELECT CANDIDATE_ID, CLIENT_ID, START_DATE, LAST_UPDATED,
+         -- ALIASED, never bare CONTRACT_ID: the parent column list below already projects it
+         -- (it is in EXTENSION_PARENT_DEAL_INHERIT_COLUMNS), and naming it twice makes BigQuery
+         -- reject the whole script with "Name CONTRACT_ID is ambiguous inside d" -- the same
+         -- failure ACC_DIR_OR_VERT_HEAD caused on the insert path in Aug 2026.
+         NULLIF(TRIM(IFNULL(CONTRACT_ID, '')), '') AS parent_contract_id,
          LOWER(TRIM(IFNULL(CANDIDATE_EMAIL, ''))) AS em,
          TRIM(IFNULL(CELL_PHONE, ''))             AS ph,
 ${parentSelect}
@@ -196,10 +213,17 @@ ${parentSelect}
 SELECT * EXCEPT(rn) FROM (
   SELECT
     e.DEAL_SHEET_ID,
-    d.* EXCEPT(CANDIDATE_ID, CLIENT_ID, START_DATE, LAST_UPDATED, em, ph),
+    d.* EXCEPT(CANDIDATE_ID, CLIENT_ID, START_DATE, LAST_UPDATED, em, ph, parent_contract_id),
+    -- LATEST qualifying DEAL, not the earliest -- the same ordering the insert path
+    -- (fetchExtensionParentDealInheritByPlacementId) settled on. The 4-field identity cannot tell
+    -- one contract from another, because a candidate's successive contracts at the same client
+    -- share all four fields, so the extension's own START_DATE is what separates them: the parent
+    -- is the most recent DEAL that had already begun. This pass still ordered ASC, which re-applied
+    -- the exact bug the insert path had already fixed -- a candidate's FIRST-EVER deal was handed
+    -- to an extension of a much later contract on every run.
     ROW_NUMBER() OVER (
       PARTITION BY e.DEAL_SHEET_ID
-      ORDER BY d.START_DATE ASC NULLS LAST, d.LAST_UPDATED DESC NULLS LAST
+      ORDER BY d.START_DATE DESC NULLS LAST, d.LAST_UPDATED DESC NULLS LAST
     ) AS rn
   FROM ext e
   JOIN deal d
@@ -210,6 +234,16 @@ SELECT * EXCEPT(rn) FROM (
    -- The parent must PREDATE the extension. Without this a later deal for the same candidate is
    -- picked as "parent" (an extension starting 2026-04-01 matched a deal starting 2026-07-01).
    AND d.START_DATE <= e.START_DATE
+   -- ...and the parent must belong to the SAME contract. The START_DATE guard above only rejects
+   -- LATER deals; a candidate's PREVIOUS, already-ended contract predates the extension and sails
+   -- straight through it. Live case (CANDIDATE_ID 21472994, Sep 2026): contract CHC18361 ran
+   -- 2025-05-07 to 2026-05-07, the replacement CHC22011 started 2026-06-17, and CHC22011's
+   -- extensions took CHC18361's INITIAL_START_DATE, BACKOUT_OR_TERMINATION ("Termination -
+   -- Contract Ended", on a contract that is still running), COMMENTS and ST_DT_PUSHBACK_REASON --
+   -- BACKOUT_OR_TERMINATION and COMMENTS being gate columns, they are what pulled the row in.
+   -- Inert while the extension has no id of its own, which is when the DESC ordering above carries
+   -- the decision: the nearest preceding DEAL wins rather than the oldest the identity can reach.
+   AND (e.ext_contract_id IS NULL OR d.parent_contract_id = e.ext_contract_id)
 ) WHERE rn = 1;
 
 -- Counted BEFORE the UPDATE: \`SET x = @@row_count\` is itself a statement, so it would report the
