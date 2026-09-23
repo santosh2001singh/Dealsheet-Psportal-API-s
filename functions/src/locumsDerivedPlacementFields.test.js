@@ -90,8 +90,10 @@ test("margins: net and gross from bill rate minus pay/cost", () => {
   assert.equal(out.FINAL_BILL_RATE, 149.19);
   assert.equal(out.FINAL_PAY_RATE, 109);
   assert.equal(out.FINAL_COST, 109);
-  assert.equal(out.NET_MARGIN, 40.19);
-  assert.equal(out.MARGIN, 40.19);
+  assert.equal(out.CALCULATED_MARGIN, 40.19);
+  // MARGIN is retired on Locums: GROSS_MARGIN carries Nexus's hourly revenue instead.
+  assert.equal("MARGIN" in out, false);
+  assert.equal("NET_MARGIN" in out, false);
 });
 
 test("FT placement yields zero margins", () => {
@@ -102,8 +104,7 @@ test("FT placement yields zero margins", () => {
     PLACEMENT_TYPE: "FT",
     START_DATE: "2025-01-01",
   }));
-  assert.equal(out.NET_MARGIN, 0);
-  assert.equal(out.MARGIN, 0);
+  assert.equal(out.CALCULATED_MARGIN, 0);
 });
 
 test("PAYMENT_TYPE blank uses 1.14 W2 burden", () => {
@@ -178,7 +179,11 @@ test("sanitizeLocumsDealSheetRow leaves non-locums rows unchanged", () => {
 
 test("LOCUMS_EXCLUDED_API_OWNED_COLUMNS includes NEW rate fields", () => {
   assert.equal(LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has("W2_PAY_RATE_NEW"), true);
-  assert.equal(LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has("CALCULATED_MARGIN"), true);
+  assert.equal(LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has("FINAL_BILL_RATE_NEW"), true);
+  // Both are real Locums columns now — CALCULATED_MARGIN from the derived step, GROSS_MARGIN from
+  // the API's hourly revenue — so neither may be stripped on insert.
+  assert.equal(LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has("CALCULATED_MARGIN"), false);
+  assert.equal(LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has("GROSS_MARGIN"), false);
 });
 
 test("1099 OT: FINAL_OT_PAY_RATE = OT_RATE x 1.09", () => {
@@ -259,4 +264,111 @@ test("health recruiter does not get premium pay rates from computeDerivedPlaceme
   assert.equal(out.FINAL_OT_PAY_RATE, undefined);
   assert.equal(out.FINAL_HOLIDAY_PAY_RATE, undefined);
   assert.equal(out.FINAL_CALL_BACK_PAY_RATE, undefined);
+});
+
+// --- LOADING_COST_EXCEPTION (manual per-row loading override) -------------------------------
+// Sheet: FINAL_PAY_RATE = W2 * IF(DP<>"", 1+DP, IF(type="",1.08, IF(start<2024-05-01, 1, 1.09)))
+// A filled DP replaces the whole ladder, so the type-blank and pre-May-2024 branches never stack
+// on top of it. Base row below lands on the 1.09 branch when DP is empty.
+function loadingRow(overrides = {}) {
+  return baseRow({
+    PAY_RATE: 240,
+    BILL_RATE: 425,
+    CLIENT_MSP_FEE: 6,
+    PAYMENT_TYPE: "1099",
+    START_DATE: "2025-12-23",
+    PLACEMENT_TYPE: "CT",
+    ...overrides,
+  });
+}
+
+test("no LOADING_COST_EXCEPTION keeps the 1.09 ladder", () => {
+  const out = computeLocumsDerivedPlacementFields(loadingRow());
+  assert.equal(out.W2_PAY_RATE, 240);
+  assert.equal(out.FINAL_PAY_RATE, 261.6);
+  assert.equal(out.FINAL_COST, 261.6);
+  assert.equal(out.FINAL_BILL_RATE, 399.5);
+  assert.equal(out.CALCULATED_MARGIN, 137.9);
+});
+
+test("LOADING_COST_EXCEPTION sets the multiplier to 1 + fraction", () => {
+  const out = computeLocumsDerivedPlacementFields(loadingRow({ LOADING_COST_EXCEPTION: 0.15 }));
+  assert.equal(out.FINAL_PAY_RATE, 276);
+  assert.equal(out.FINAL_COST, 276);
+  // FINAL_BILL_RATE and W2_PAY_RATE are upstream of the override and must not move.
+  assert.equal(out.W2_PAY_RATE, 240);
+  assert.equal(out.FINAL_BILL_RATE, 399.5);
+  assert.equal(out.CALCULATED_MARGIN, 123.5);
+});
+
+test("LOADING_COST_EXCEPTION beats the blank-PAYMENT_TYPE 1.08 branch", () => {
+  const out = computeLocumsDerivedPlacementFields(loadingRow({
+    PAYMENT_TYPE: "",
+    LOADING_COST_EXCEPTION: 0.15,
+  }));
+  // W2 carries the 1.14 blank-type burden, then DP — not 1.08 — scales it.
+  assert.equal(out.W2_PAY_RATE, 273.6);
+  assert.equal(out.FINAL_PAY_RATE, 314.64);
+});
+
+test("LOADING_COST_EXCEPTION beats the pre-May-2024 carve-out", () => {
+  const out = computeLocumsDerivedPlacementFields(loadingRow({
+    START_DATE: "2023-01-01",
+    LOADING_COST_EXCEPTION: 0.15,
+  }));
+  assert.equal(out.FINAL_PAY_RATE, 276);
+});
+
+test("LOADING_COST_EXCEPTION of 0 is set, and means no loading", () => {
+  const out = computeLocumsDerivedPlacementFields(loadingRow({ LOADING_COST_EXCEPTION: 0 }));
+  assert.equal(out.FINAL_PAY_RATE, 240);
+  assert.notEqual(out.FINAL_PAY_RATE, 261.6);
+});
+
+test("a blank-string LOADING_COST_EXCEPTION falls back to the ladder", () => {
+  const out = computeLocumsDerivedPlacementFields(loadingRow({ LOADING_COST_EXCEPTION: "  " }));
+  assert.equal(out.FINAL_PAY_RATE, 261.6);
+});
+
+test("Gainwell exception outranks LOADING_COST_EXCEPTION", () => {
+  const out = computeLocumsDerivedPlacementFields(loadingRow({
+    ENTITY: "",
+    PARENT_CLIENT_NAME: "Gainwell Technologies",
+    SPECIALTY: "CRNA",
+    LOADING_COST_EXCEPTION: 0.15,
+  }));
+  assert.equal(out.FINAL_PAY_RATE, out.FINAL_BILL_RATE);
+  assert.equal(out.FINAL_PAY_RATE, 399.5);
+});
+
+test("FT placement zeroes both margins even with LOADING_COST_EXCEPTION", () => {
+  const out = computeLocumsDerivedPlacementFields(loadingRow({
+    PLACEMENT_TYPE: "FT",
+    LOADING_COST_EXCEPTION: 0.15,
+  }));
+  assert.equal(out.CALCULATED_MARGIN, 0);
+});
+
+test("blank PAYMENT_TYPE: DP still moves CALCULATED_MARGIN", () => {
+  const withDp = computeLocumsDerivedPlacementFields(loadingRow({
+    PAYMENT_TYPE: "",
+    LOADING_COST_EXCEPTION: 0.15,
+  }));
+  const withoutDp = computeLocumsDerivedPlacementFields(loadingRow({ PAYMENT_TYPE: "" }));
+  assert.notEqual(withDp.CALCULATED_MARGIN, withoutDp.CALCULATED_MARGIN);
+});
+
+test("the derived step writes CALCULATED_MARGIN and never MARGIN / NET_MARGIN", () => {
+  // GROSS_MARGIN is Nexus's hourly_revenue (mapDealSheetRevenueDetailsToBq), so the derived step
+  // must leave it alone too — otherwise the API figure would be overwritten on every sync.
+  const out = computeLocumsDerivedPlacementFields(loadingRow());
+  assert.equal("CALCULATED_MARGIN" in out, true);
+  assert.equal("MARGIN" in out, false);
+  assert.equal("NET_MARGIN" in out, false);
+  assert.equal("GROSS_MARGIN" in out, false);
+});
+
+test("LOADING_COST_EXCEPTION is a manual column so the sync never blanks it", () => {
+  const { MANUAL_COLUMNS } = require("./columnMappings");
+  assert.equal(MANUAL_COLUMNS.has("LOADING_COST_EXCEPTION"), true);
 });

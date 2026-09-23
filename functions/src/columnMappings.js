@@ -673,14 +673,18 @@ function mapDealSheetHoursDetailsToBq(hoursRow, clientState) {
 /**
  * Map deal sheet revenue details to BigQuery schema
  */
-function mapDealSheetRevenueDetailsToBq(revenueRow) {
+function mapDealSheetRevenueDetailsToBq(revenueRow, recruiterEmail) {
   if (!revenueRow) return {};
   // MARGIN is the deal sheet's hourly revenue straight from the API — not a computed margin.
   // (Canada relies on this: its derived step fills CALCULATED_MARGIN and leaves MARGIN alone.)
-  return {
-    GP_PERCENTAGE: toNumberOrNull(revenueRow.gross_margin_percentage),
-    MARGIN: toNumberOrNull(revenueRow.hourly_revenue),
-  };
+  const hourlyRevenue = toNumberOrNull(revenueRow.hourly_revenue);
+  const gpPercentage = toNumberOrNull(revenueRow.gross_margin_percentage);
+  // Locums retired MARGIN in favour of Canada's naming: the same hourly revenue lands in
+  // GROSS_MARGIN, while its derived step fills CALCULATED_MARGIN.
+  if (isCynetLocumsRecruiter(recruiterEmail)) {
+    return { GP_PERCENTAGE: gpPercentage, GROSS_MARGIN: hourlyRevenue };
+  }
+  return { GP_PERCENTAGE: gpPercentage, MARGIN: hourlyRevenue };
 }
 
 /**
@@ -1868,6 +1872,10 @@ const MANUAL_COLUMNS = new Set([
   "HOURLY_GP",
   "INVOICE_CYCLE_TO_CLIENT",
   "IS_DELETED",
+  // Locums-only manual override (cynet_locums_deal_sheet). When set, it replaces the
+  // 1.08 / 1.00 / 1.09 FINAL_PAY_RATE ladder with (1 + LOADING_COST_EXCEPTION). Manual so the sync
+  // never blanks what the user typed — see computeLocumsFinalPayRate.
+  "LOADING_COST_EXCEPTION",
   "ONB_CAND_DOB",
   "ONB_E_VERIFY",
   "ONB_I9_RECIEVED",

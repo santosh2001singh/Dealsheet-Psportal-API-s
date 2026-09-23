@@ -80,16 +80,20 @@ function filterEnrichedRowsByDealSheetMinStartDate(rows) {
 /**
  * Sync domains exempt from the START_DATE >= 2026-01-01 lower bound.
  *
- * Cynet Health Canada is being loaded from scratch and needs its FULL Nexus history — every deal and
- * placement, however old — so all three layers of the date filter are switched off for it:
+ * Cynet Health Canada and Cynet Locums are each loaded from scratch and need their FULL Nexus
+ * history — every deal and placement, however old — so all three layers of the date filter are
+ * switched off for them:
  *   1. submittal_start_date_from  (the Nexus list's server-side lower bound)
  *   2. transform_rows_fn          (the post-enrich row filter)
  *   3. min_start_date_ms          (the final gate inside the insert pipeline)
  *
- * cynet health and locums keep the 2026-01-01 bound exactly as before — the constants above are
- * untouched, only Canada reads them as absent.
+ * Locums joined in Sep 2026: its run-rate history starts in 2023, so the 2026-01-01 bound was
+ * hiding most of the domain's deals.
+ *
+ * cynet health keeps the 2026-01-01 bound exactly as before — the constants above are untouched,
+ * only the domains in this set read them as absent.
  */
-const SYNC_DOMAINS_WITHOUT_MIN_START_DATE = new Set(["canada"]);
+const SYNC_DOMAINS_WITHOUT_MIN_START_DATE = new Set(["canada", "locums"]);
 
 /** True when `domain` should apply the START_DATE lower bound. */
 function domainUsesDealSheetMinStartDate(domain) {
@@ -101,15 +105,15 @@ function domainUsesDealSheetMinStartDate(domain) {
  * Sync domains whose triggers skip the shared audit-log scans (ownership_change_logs,
  * inorganic_hierarchy_logs and the ownership effective-date reconciliation).
  *
- * Canada is still being validated: its deal sheet rows are deleted and re-synced repeatedly, and
- * every scan run writes log rows keyed on those placements that then have to be cleaned up too.
- * Remove "canada" here once the data is trusted and the logs should start accumulating.
+ * Canada and Locums are still being validated: their deal sheet rows are deleted and re-synced
+ * repeatedly, and every scan run writes log rows keyed on those placements that then have to be
+ * cleaned up too. Remove a domain here once its data is trusted and the logs should accumulate.
  *
  * This only gates the table-WIDE scans run from the scheduled triggers. Per-row log writes that
  * happen inside the enrich pipeline (ch_additional_cost_logs, ch_termination_reason_logs) are
  * separate — see ENRICH_LOG_WRITES_DISABLED_DOMAINS in syncService.js.
  */
-const SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS = new Set(["canada"]);
+const SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS = new Set(["canada", "locums"]);
 
 /** True when `domain`'s trigger should run the shared audit-log scans. */
 function domainRunsAuditLogScans(domain) {
@@ -701,8 +705,8 @@ async function runDealSheetInsertSyncForDomain(domain, label) {
     // this is the real cut to the socket-hangup / timeout load. No upper bound (future starts).
     // filterEnrichedRowsByDealSheetMinStartDate stays below as the in-code safety net.
     //
-    // Canada is exempt (see SYNC_DOMAINS_WITHOUT_MIN_START_DATE): it needs its full Nexus history,
-    // so all three layers are omitted and the scan covers every submittal page.
+    // Canada and locums are exempt (see SYNC_DOMAINS_WITHOUT_MIN_START_DATE): each needs its full
+    // Nexus history, so all three layers are omitted and the scan covers every submittal page.
     ...(useMinStartDate
       ? {
         submittal_start_date_from: DEAL_SHEET_MIN_START_DATE_ISO,
@@ -733,10 +737,10 @@ async function runDealSheetInsertSyncForDomain(domain, label) {
   // idempotent — they only insert rows for changes not already logged), and it keeps every domain's
   // logs current even while another domain's schedule is paused.
   //
-  // EXCEPT while a domain is still being validated: canada is loading from scratch and its rows are
-  // being deleted and re-synced repeatedly, so writing audit logs for them just creates rows that
+  // EXCEPT while a domain is still being validated: canada and locums load from scratch and their
+  // rows are deleted and re-synced repeatedly, so writing audit logs for them just creates rows that
   // have to be cleaned up again (see sql/cleanup_canada_test_rows.sql). Skipped entirely for the
-  // domains in SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS; health and locums are unaffected.
+  // domains in SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS; health is unaffected.
   if (!domainRunsAuditLogScans(domain)) {
     logLine(
       `[${label}] audit-log scans SKIPPED for domain=${domain} (ownership / inorganic / effective-date)`
@@ -898,7 +902,7 @@ async function runDealSheetUpdateSyncForDomain(domain, label) {
         checkpoint_key: checkpointKey,
         clear_checkpoint_on_complete: true,
         max_pairs_per_run: maxPairsPerRun,
-        // Canada is exempt from the 2026-01-01 lower bound (full history); health/locums keep it.
+        // Canada and locums are exempt from the 2026-01-01 lower bound (full history); health keeps it.
         ...(useMinStartDate ? { min_start_date_ms: DEAL_SHEET_MIN_START_DATE_MS } : {}),
         generated_uuid_field: "ID",
         compare_ignore_fields: ["ID", "LAST_UPDATED", "IS_REJECTED"],

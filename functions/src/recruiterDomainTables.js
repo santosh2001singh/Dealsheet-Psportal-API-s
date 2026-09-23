@@ -59,9 +59,9 @@ function isLocumsOffering(row) {
  * cynet_health_deal_sheet, where locums-specific derivations (pay/bill/margin) do not apply and the
  * health reporting counts business that is not health's.
  *
- * OFFERING wins over the email for the US pair only. A @cynethealth.ca recruiter stays on the Canada
- * table: Canada is a separate legal entity, so its rows must not be pulled into a US table by the
- * kind of work they describe.
+ * OFFERING wins over the recruiter email in every case: locums business belongs in the locums table
+ * whoever recruited it. CLIENT_STATE is the one authority above it — a Canadian province means a
+ * Canadian legal entity, so locums work done in a province stays on the Canada table.
  *
  * @param {Record<string, *>|null|undefined} row
  * @returns {string} BigQuery table id for rr_project_data

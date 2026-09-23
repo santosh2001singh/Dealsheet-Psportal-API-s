@@ -17,11 +17,15 @@ test("all_locums_runrate has AVP registered as a known schema gap", () => {
   assert.ok(RUNRATE_HIERARCHY_MISSING_COLUMNS_BY_TABLE.get("all_locums_runrate")?.has("AVP"));
 });
 
-test("resolveExtensionRunrateHierarchyColumns drops AVP for all_locums_runrate only", () => {
+test("resolveExtensionRunrateHierarchyColumns drops the four names all_locums_runrate lacks", () => {
+  // The Locums run-rate keeps its own names for the top of the delivery chain (VP_SRVP,
+  // GRP_DIR_ASSOC_GRP_DIR), so the shared ones are absent and must not reach the SELECT.
   const locumsCols = resolveExtensionRunrateHierarchyColumns("all_locums_runrate");
-  assert.ok(!locumsCols.includes("AVP"));
-  // Every other confirmed-present column stays.
-  for (const col of ["TEAM_LEAD", "ATL", "RM", "ACCOUNT_MANAGER", "SECONDARY_AM", "ASSOCIATE_AM", "ASSOCIATE_DELIVERY_DIRECTOR", "DELIVERY_DIRECTOR", "VP"]) {
+  for (const col of ["AVP", "VP", "DELIVERY_DIRECTOR", "ASSOCIATE_DELIVERY_DIRECTOR"]) {
+    assert.ok(!locumsCols.includes(col), `all_locums_runrate has no ${col}`);
+  }
+  // Every confirmed-present column stays.
+  for (const col of ["TEAM_LEAD", "ATL", "RM", "ACCOUNT_MANAGER", "SECONDARY_AM", "ASSOCIATE_AM"]) {
     assert.ok(locumsCols.includes(col), `expected ${col} to remain for all_locums_runrate`);
   }
 });

@@ -90,12 +90,33 @@ test("a real locums recruiter is unaffected", () => {
   );
 });
 
-test("a Canada recruiter is NEVER pulled into the US locums table", () => {
-  // Canada is a separate legal entity, so the kind of work must not move a row across it.
+test("OFFERING=LOCUMS wins over a .ca recruiter when the work is not in a province", () => {
+  // OFFERING is the authority on the KIND of business, so locums work lands in the locums table
+  // whoever recruited it. A .ca recruiter placing outside the nine provinces is not Canada business.
   assert.equal(
     resolveActiveDealSheetTableIdForRow({
       ASSIGNMENT_RECRUITER_EMAIL: "y@cynethealth.ca",
       OFFERING: "LOCUMS",
+    }),
+    TABLE_CYNET_LOCUMS
+  );
+  assert.equal(
+    resolveEndedDealSheetTableIdForRow({
+      ASSIGNMENT_RECRUITER_EMAIL: "y@cynethealth.ca",
+      OFFERING: "LOCUMS",
+    }),
+    TABLE_ENDED_CYNET_LOCUMS
+  );
+});
+
+test("CLIENT_STATE still keeps real Canada business in the Canada table", () => {
+  // The province is the authority on the legal entity, so it outranks OFFERING: locums work done in
+  // a Canadian province stays on the Canada table.
+  assert.equal(
+    resolveActiveDealSheetTableIdForRow({
+      ASSIGNMENT_RECRUITER_EMAIL: "y@cynethealth.ca",
+      OFFERING: "LOCUMS",
+      CLIENT_STATE: "ON",
     }),
     TABLE_CYNET_HEALTH_CANADA
   );
@@ -103,6 +124,7 @@ test("a Canada recruiter is NEVER pulled into the US locums table", () => {
     resolveEndedDealSheetTableIdForRow({
       ASSIGNMENT_RECRUITER_EMAIL: "y@cynethealth.ca",
       OFFERING: "LOCUMS",
+      CLIENT_STATE: "ON",
     }),
     TABLE_ENDED_CYNET_HEALTH_CANADA
   );

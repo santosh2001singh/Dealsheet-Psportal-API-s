@@ -6,15 +6,16 @@ const path = require("node:path");
 /**
  * index.js wires the scheduled triggers to firebase-functions at require time, so these assertions
  * read the source rather than importing it. The three layers of the START_DATE lower bound must all
- * sit behind the same `useMinStartDate` guard, and Canada must be the only exempt domain.
+ * sit behind the same `useMinStartDate` guard, and only the from-scratch domains may be exempt.
  */
 const SRC = fs.readFileSync(path.join(__dirname, "index.js"), "utf8");
 
-test("canada is the only domain exempt from the min start date", () => {
+test("canada and locums are exempt from the min start date; health is not", () => {
   const m = /const SYNC_DOMAINS_WITHOUT_MIN_START_DATE = new Set\(\[([^\]]*)\]\)/.exec(SRC);
   assert.ok(m, "SYNC_DOMAINS_WITHOUT_MIN_START_DATE must exist");
   const domains = m[1].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
-  assert.deepEqual(domains, ["canada"], "health and locums must keep the bound");
+  assert.deepEqual(domains.sort(), ["canada", "locums"]);
+  assert.ok(!domains.includes("health"), "cynet health must keep the 2026-01-01 bound");
 });
 
 test("the min-start-date constants are unchanged (health still starts 2026-01-01)", () => {

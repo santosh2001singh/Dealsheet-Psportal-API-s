@@ -192,10 +192,31 @@ function isStartBeforeMay2024(startRaw) {
   return ms != null && ms < MAY_2024_UTC_MS;
 }
 
+/**
+ * Manual per-row loading cost override, as a fraction (0.15 = 15% loading).
+ *
+ * A stored 0 counts as set — it means "no loading", multiplier 1.0 — matching the sheet's DP<>""
+ * test, which is about the cell being filled rather than non-zero.
+ *
+ * @param {Record<string, *>|null|undefined} row
+ * @returns {number|null} the fraction, or null when the column is empty
+ */
+function loadingCostExceptionFraction(row) {
+  const raw = row?.LOADING_COST_EXCEPTION;
+  if (raw === null || raw === undefined || String(raw).trim() === "") return null;
+  return toNumberOrNull(raw);
+}
+
 function computeLocumsFinalPayRate(row, w2PayRate, finalBillRate) {
   if (isGainwellException(row)) return finalBillRate;
   if (w2PayRate == null) return null;
   if (toNumberOrNull(row?.PAY_RATE) == null) return null;
+
+  // A filled LOADING_COST_EXCEPTION replaces the whole burden ladder below, exactly as the sheet's
+  // IF(DP<>"", 1+DP, ...) does: the manual loading is the agreed rate for this row, so neither the
+  // blank-type 1.08 nor the pre-May-2024 carve-out applies on top of it.
+  const loadingFraction = loadingCostExceptionFraction(row);
+  if (loadingFraction != null) return round2(w2PayRate * (1 + loadingFraction));
 
   if (isTypeBlank(row)) return round2(w2PayRate * 1.08);
   if (isStartBeforeMay2024(row?.START_DATE)) return round2(w2PayRate);
@@ -207,7 +228,14 @@ function computeLocumsFinalCost(finalPayRate) {
   return round2(finalPayRate);
 }
 
-function computeLocumsNetMargin(row, finalBillRate, finalCost) {
+/**
+ * CALCULATED_MARGIN = FINAL_BILL_RATE - FINAL_COST.
+ *
+ * The sheet calls this "Net Margin", but the Locums table now follows the Canada naming: the
+ * computed figure lives in CALCULATED_MARGIN, and GROSS_MARGIN carries Nexus's own hourly_revenue
+ * (see mapDealSheetRevenueDetailsToBq). FT placements are 0.
+ */
+function computeLocumsCalculatedMargin(row, finalBillRate, finalCost) {
   const placementType = row?.PLACEMENT_TYPE == null ? "" : String(row.PLACEMENT_TYPE).trim().toUpperCase();
   if (placementType === "FT") return 0;
   if (finalBillRate == null || finalBillRate === 0) return null;
@@ -215,7 +243,15 @@ function computeLocumsNetMargin(row, finalBillRate, finalCost) {
   return round2(finalBillRate - finalCost);
 }
 
-function computeLocumsGrossMargin(row, finalBillRate, w2PayRate, finalPayRate) {
+/**
+ * The sheet's gross margin: FINAL_BILL_RATE minus the pay figure that applies to this row.
+ *
+ * NOT written to GROSS_MARGIN — that column holds Nexus's hourly_revenue. Kept because the value is
+ * still the sheet's own gross margin; it is no longer stored, so the derived step leaves both
+ * GROSS_MARGIN and the retired MARGIN column alone.
+ */
+// eslint-disable-next-line no-unused-vars
+function computeLocumsSheetGrossMargin(row, finalBillRate, w2PayRate, finalPayRate) {
   const placementType = row?.PLACEMENT_TYPE == null ? "" : String(row.PLACEMENT_TYPE).trim().toUpperCase();
   if (placementType === "FT") return 0;
   if (finalBillRate == null || finalBillRate === 0) return null;
@@ -316,8 +352,9 @@ function computeLocumsDerivedPlacementFields(row) {
     FINAL_PAY_RATE: finalPayRate,
     FINAL_BILL_RATE: finalBillRate,
     FINAL_COST: finalCost,
-    NET_MARGIN: computeLocumsNetMargin(row, finalBillRate, finalCost),
-    MARGIN: computeLocumsGrossMargin(row, finalBillRate, w2PayRate, finalPayRate),
+    // MARGIN and NET_MARGIN are retired on Locums: the computed figure is CALCULATED_MARGIN, and
+    // GROSS_MARGIN is Nexus's hourly_revenue, written by mapDealSheetRevenueDetailsToBq.
+    CALCULATED_MARGIN: computeLocumsCalculatedMargin(row, finalBillRate, finalCost),
     GM_OT: computeGmOt(row),
     DAYS_WORKED: computeDaysWorked(row),
     ENTITY: LOCUMS_ENTITY,
@@ -334,8 +371,6 @@ const LOCUMS_EXCLUDED_API_OWNED_COLUMNS = new Set([
   "W2_PAY_RATE_NEW",
   "FINAL_PAY_RATE_NEW",
   "FINAL_COST_NEW",
-  "CALCULATED_MARGIN",
-  "GROSS_MARGIN",
   "FINAL_BILL_RATE_NEW",
   "FIRST_WEEK_HOURS",
   "SECOND_WEEK_HOURS",

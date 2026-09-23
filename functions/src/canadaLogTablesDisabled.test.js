@@ -26,9 +26,12 @@ test("canada does not write the per-row enrich logs", () => {
   assert.equal(domainWritesEnrichLogs({ sync_domain: "canada" }), false);
 });
 
-test("health and locums still write the per-row enrich logs", () => {
+test("locums does not write the per-row enrich logs either", () => {
+  assert.equal(domainWritesEnrichLogs({ sync_domain: "locums" }), false);
+});
+
+test("health still writes the per-row enrich logs", () => {
   assert.equal(domainWritesEnrichLogs({ sync_domain: "health" }), true);
-  assert.equal(domainWritesEnrichLogs({ sync_domain: "locums" }), true);
 });
 
 test("a run with no domain keeps writing logs", () => {
@@ -44,8 +47,8 @@ test("the canada check is case- and whitespace-insensitive", () => {
   }
 });
 
-test("only canada is disabled", () => {
-  assert.deepEqual([...ENRICH_LOG_WRITES_DISABLED_DOMAINS], ["canada"]);
+test("canada and locums are the disabled domains", () => {
+  assert.deepEqual([...ENRICH_LOG_WRITES_DISABLED_DOMAINS].sort(), ["canada", "locums"]);
 });
 
 // --------------------------------------------------------------------------
@@ -54,11 +57,11 @@ test("only canada is disabled", () => {
 
 const INDEX_SRC = fs.readFileSync(path.join(__dirname, "index.js"), "utf8");
 
-test("canada is the only domain skipping the audit-log scans", () => {
+test("canada and locums are the domains skipping the audit-log scans", () => {
   const m = /const SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS = new Set\(\[([^\]]*)\]\)/.exec(INDEX_SRC);
   assert.ok(m, "SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS must exist");
   const domains = m[1].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
-  assert.deepEqual(domains, ["canada"]);
+  assert.deepEqual(domains.sort(), ["canada", "locums"]);
 });
 
 test("both scheduled triggers gate their audit scans", () => {
@@ -108,8 +111,12 @@ test("insert-time ownership logs filter canada rows out", () => {
 
 test("the insertAll gate filters on rows, not on a caller flag", () => {
   assert.ok(
-    BQ_SRC.includes("rowsToInsert.filter((row) => !isCanadaDealSheetRow(row))"),
+    BQ_SRC.includes("if (LOG_WRITES_DISABLED_FOR_CANADA && isCanadaDealSheetRow(row)) return false;"),
     "the ownership-log row set must be filtered by CLIENT_STATE"
+  );
+  assert.ok(
+    BQ_SRC.includes("isCynetLocumsRecruiter(row?.ASSIGNMENT_RECRUITER_EMAIL)"),
+    "the ownership-log row set must also drop locums rows, by recruiter email"
   );
   assert.ok(
     BQ_SRC.includes("ownershipLogRows.length > 0"),
@@ -140,9 +147,14 @@ test("the rate-change scan excludes both canada tables", () => {
   assert.ok(RATE_CHANGE_LOG_EXCLUDED_TABLE_IDS.has("cynet_health_canada_ended_deal_sheet"));
 });
 
-test("the rate-change scan still covers health and locums", () => {
+test("the rate-change scan excludes both locums tables too", () => {
+  assert.ok(RATE_CHANGE_LOG_EXCLUDED_TABLE_IDS.has("cynet_locums_deal_sheet"));
+  assert.ok(RATE_CHANGE_LOG_EXCLUDED_TABLE_IDS.has("cynet_locums_ended_deal_sheet"));
+});
+
+test("the rate-change scan still covers health", () => {
   assert.ok(!RATE_CHANGE_LOG_EXCLUDED_TABLE_IDS.has("cynet_health_deal_sheet"));
-  assert.ok(!RATE_CHANGE_LOG_EXCLUDED_TABLE_IDS.has("cynet_locums_deal_sheet"));
+  assert.ok(!RATE_CHANGE_LOG_EXCLUDED_TABLE_IDS.has("cynet_health_ended_deal_sheet"));
 });
 
 test("both rate-change union call sites pass the exclusion", () => {

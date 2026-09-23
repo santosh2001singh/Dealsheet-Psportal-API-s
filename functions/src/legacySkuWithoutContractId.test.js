@@ -154,11 +154,11 @@ const path = require("node:path");
 const BQ_SRC = fs.readFileSync(path.join(__dirname, "bigQueryClient.js"), "utf8");
 
 test("the legacy lookup accepts a run-rate row with a SKU but no contract id", () => {
-  // Both tiers (span-key and nexus-key) must allow it.
+  // All three tiers (span-key, nexus-key and the locums VMS_JOB_ID fallback) must allow it.
   const guarded = BQ_SRC.match(
     /\(r\.CONTRACT_ID IS NOT NULL AND TRIM\(r\.CONTRACT_ID\) != ''\)\s*\n\s*OR \(r\.SKU_NUMBER IS NOT NULL AND TRIM\(r\.SKU_NUMBER\) != ''\)/g
   );
-  assert.equal(guarded?.length, 2, "both lookup tiers must accept SKU-only rows");
+  assert.equal(guarded?.length, 3, "every lookup tier must accept SKU-only rows");
 });
 
 test("no lookup tier still requires a contract id on its own", () => {

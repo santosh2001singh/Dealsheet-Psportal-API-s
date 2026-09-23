@@ -29,6 +29,7 @@ const {
 } = require("./columnMappings");
 const { isCynetHealthCanadaRecruiter, isCanadaDealSheetRow, sanitizeCanadaDealSheetRow, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
 const { isCynetLocumsRecruiter, sanitizeLocumsDealSheetRow, LOCUMS_EXCLUDED_API_OWNED_COLUMNS } = require("./locumsDerivedPlacementFields");
+const { buildLocumsContractLookupKey } = require("./locumsRunrateLookup");
 
 /**
  * While Cynet Health Canada is being validated, no log table should accumulate rows keyed on its
@@ -40,9 +41,18 @@ const { isCynetLocumsRecruiter, sanitizeLocumsDealSheetRow, LOCUMS_EXCLUDED_API_
  * companion switches live in index.js (SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS, for the table-wide
  * scans) and syncService.js (ENRICH_LOG_WRITES_DISABLED_DOMAINS, for the per-row enrich logs).
  *
- * Set to false once Canada's data is trusted; cynet health and locums are unaffected either way.
+ * Set to false once Canada's data is trusted; cynet health is unaffected either way.
  */
 const LOG_WRITES_DISABLED_FOR_CANADA = true;
+
+/**
+ * Same kill-switch for Locums, on for the same reason (Sep 2026): while the domain is validated its
+ * rows are deleted and re-synced repeatedly, so the scheduled trigger must write the deal sheet
+ * table ONLY — no ownership, inorganic, additional-cost, termination-reason or rate-change logs.
+ *
+ * Set to false to let locums back into the log tables; cynet health is unaffected either way.
+ */
+const LOG_WRITES_DISABLED_FOR_LOCUMS = true;
 
 /**
  * Deal sheet tables left OUT of the ch_rate_change_logs scan.
@@ -54,9 +64,14 @@ const LOG_WRITES_DISABLED_FOR_CANADA = true;
  *
  * Empty this set (or remove the option at the call sites) to let canada back in.
  */
-const RATE_CHANGE_LOG_EXCLUDED_TABLE_IDS = LOG_WRITES_DISABLED_FOR_CANADA
-  ? new Set(["cynet_health_canada_deal_sheet", "cynet_health_canada_ended_deal_sheet"])
-  : new Set();
+const RATE_CHANGE_LOG_EXCLUDED_TABLE_IDS = new Set([
+  ...(LOG_WRITES_DISABLED_FOR_CANADA
+    ? ["cynet_health_canada_deal_sheet", "cynet_health_canada_ended_deal_sheet"]
+    : []),
+  ...(LOG_WRITES_DISABLED_FOR_LOCUMS
+    ? ["cynet_locums_deal_sheet", "cynet_locums_ended_deal_sheet"]
+    : []),
+]);
 
 /**
  * Columns each DEAL SHEET table does not have — the single source of truth for every query that
@@ -2487,14 +2502,19 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
   // until a later run — a visible gap where the deal exists but its ownership log does not. Non-fatal
   // and idempotent (the log batch dedupes), so the scheduled scan stays as the safety net.
   //
-  // Canada rows are excluded while that domain is being validated: its deal sheet is deleted and
-  // re-synced repeatedly, and each run would otherwise seed ownership_change_logs rows keyed on
-  // placements that are about to disappear. Filtered on the ROWS (CLIENT_STATE province), not on a
-  // caller flag, so no insert path can miss the gate. See LOG_WRITES_DISABLED_FOR_CANADA.
+  // Canada and Locums rows are excluded while those domains are being validated: their deal sheets
+  // are deleted and re-synced repeatedly, and each run would otherwise seed ownership_change_logs
+  // rows keyed on placements that are about to disappear. Filtered on the ROWS themselves (Canada by
+  // CLIENT_STATE province, Locums by recruiter email), not on a caller flag, so no insert path can
+  // miss the gate. See LOG_WRITES_DISABLED_FOR_CANADA / LOG_WRITES_DISABLED_FOR_LOCUMS.
   let contractChainOwnershipLog = null;
-  const ownershipLogRows = LOG_WRITES_DISABLED_FOR_CANADA
-    ? rowsToInsert.filter((row) => !isCanadaDealSheetRow(row))
-    : rowsToInsert;
+  const ownershipLogRows = rowsToInsert.filter((row) => {
+    if (LOG_WRITES_DISABLED_FOR_CANADA && isCanadaDealSheetRow(row)) return false;
+    if (LOG_WRITES_DISABLED_FOR_LOCUMS && isCynetLocumsRecruiter(row?.ASSIGNMENT_RECRUITER_EMAIL)) {
+      return false;
+    }
+    return true;
+  });
   if (
     options.skipInsertTimeContractChainOwnershipLogs !== true &&
     result.inserted > 0 &&
@@ -3758,6 +3778,8 @@ function normalizeClientIdKeyPart(value) {
  * Both are returned whenever the row can form them — which one actually decides the match is
  * settled in fetchLegacyContractIdentityForDealRows, not here.
  *
+ * Cynet Locums does NOT use this key at all — see buildLocumsContractLookupKey.
+ *
  * @returns {{rowKey: string, spanKey: object|null, nexusKey: string|null}|null}
  */
 function buildLegacyContractLookupKey(row) {
@@ -4217,6 +4239,155 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
 }
 
 /**
+ * Cynet Locums run-rate lookup — its OWN two tiers, never the shared span/nexus ones above.
+ *
+ * The shared lookup cannot work here: all_locums_runrate carries no client ids at all (CLIENT_ID and
+ * NEXUS_PARENT_CLIENT_ID are null on all 913 rows), so the id half of its span key never forms, and
+ * the two sides spell facilities differently ("HCA Florida Gulf Coast Hospital - HP" against "Gulf
+ * Coast Regional Medical Center") so the name half misses too.
+ *
+ * Measured on live data (446 distinct deals):
+ *   Tier 1  candidate + START_DATE    378
+ *   Tier 2  candidate + VMS_JOB_ID    +31   -> 409 / 446 (91.7%)
+ *
+ * Tier 2 exists because the locums desk books one candidate onto several short assignments at once,
+ * so a START_DATE that slipped a few days leaves the row unmatched though the JOB is the same. The
+ * candidate half is mandatory in both: VMS_JOB_ID identifies the job POSTING, not the placement, and
+ * on its own it put 32 of 50 hits on a different candidate.
+ *
+ * @param {Array<Record<string, *>>} rows
+ * @param {{datasetId?: string, runrateTableId?: string, includeHierarchy?: boolean}} [options]
+ * @returns {Promise<Map<string, Record<string, *>>>} rowKey -> carried identity
+ */
+async function fetchLocumsRunrateIdentityForDealRows(rows, options = {}) {
+  const out = new Map();
+  if (!rows || rows.length === 0) return out;
+
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+  const runrateTableId =
+    typeof options.runrateTableId === "string" && options.runrateTableId.trim() !== ""
+      ? options.runrateTableId.trim()
+      : config.runrateLocumsTableId;
+  const runrateFqn = `\`${config.projectId}.${datasetId}.${runrateTableId}\``;
+  const includeHierarchy = options.includeHierarchy === true;
+
+  const keyed = [];
+  const dateKeys = new Map();
+  const vmsKeys = new Map();
+  for (const row of rows) {
+    const key = buildLocumsContractLookupKey(row);
+    if (!key) continue;
+    keyed.push(key);
+    if (key.dateKey && !dateKeys.has(key.dateKey)) dateKeys.set(key.dateKey, key);
+    if (key.vmsKey && !vmsKeys.has(key.vmsKey)) vmsKeys.set(key.vmsKey, key);
+  }
+  if (keyed.length === 0) return out;
+
+  const { cols: manualCols, select: manualSelect } =
+    buildLegacyManualColumnSql("r", runrateTableId, includeHierarchy);
+  const manualOut = manualCols.map((c) => c.toLowerCase()).join(", ");
+  // Either identifier satisfies the candidate half — some run-rate rows carry only one.
+  const CANDIDATE_PREDICATE = `(
+           (w.cand != '' AND CAST(r.CANDIDATE_ID AS STRING) = w.cand)
+        OR (w.em != '' AND LOWER(TRIM(r.CANDIDATE_EMAIL)) = w.em)
+      )`;
+  // A SKU-only run-rate row still carries the manual ops columns, so it is worth matching.
+  const WORTH_MATCHING = `(
+          (r.CONTRACT_ID IS NOT NULL AND TRIM(r.CONTRACT_ID) != '')
+       OR (r.SKU_NUMBER IS NOT NULL AND TRIM(r.SKU_NUMBER) != '')
+      )`;
+  // ROW_NUMBER picks the LATEST run-rate row per key; CONTRACT_ID then ID break ties so repeated
+  // runs always resolve identically.
+  const RANK = "ORDER BY r.START_DATE DESC, r.CONTRACT_ID ASC, r.ID ASC";
+
+  const runTier = async (keyMap, joinPredicate, structFn) => {
+    const found = new Map();
+    if (keyMap.size === 0) return found;
+    const wanted = [...keyMap.entries()].map(([k, v]) => structFn(k, v));
+    const sql = `
+      WITH wanted AS (SELECT * FROM UNNEST([${wanted.join(", ")}])),
+      ranked AS (
+        SELECT
+          w.k AS k,
+          r.CONTRACT_ID AS contract_id,
+          r.SKU_NUMBER AS sku_number,
+          r.START_DATE AS initial_start_date,
+          ${manualSelect},
+          ROW_NUMBER() OVER (PARTITION BY w.k ${RANK}) AS rn
+        FROM ${runrateFqn} r
+        JOIN wanted w ON ${joinPredicate} AND ${CANDIDATE_PREDICATE}
+        WHERE ${WORTH_MATCHING}
+      )
+      SELECT k, contract_id, sku_number, initial_start_date, ${manualOut} FROM ranked WHERE rn = 1
+    `;
+    for (const r of await queryObjects(sql, keyMap.size)) {
+      found.set(
+        r.k,
+        assignLegacyManualColumns(
+          {
+            CONTRACT_ID: normalizeContractIdOrNull(r.contract_id),
+            SKU_NUMBER: normalizeLegacySkuOrNull(r.sku_number),
+            INITIAL_START_DATE: normalizeLegacyDateOnlyOrNull(r.initial_start_date),
+          },
+          r,
+          runrateTableId,
+          includeHierarchy
+        )
+      );
+    }
+    return found;
+  };
+
+  const byDateKey = await runTier(
+    dateKeys,
+    "r.START_DATE = PARSE_DATE('%Y-%m-%d', w.sd)",
+    (k, v) =>
+      `STRUCT('${escapeSqlString(k)}' AS k, '${escapeSqlString(v.candidateId)}' AS cand, ` +
+      `'${escapeSqlString(v.email)}' AS em, '${escapeSqlString(v.startDate)}' AS sd)`
+  );
+  // Only the rows tier 1 could not place are probed on VMS, so tier 1 always wins a tie.
+  const unresolvedVms = new Map();
+  for (const key of keyed) {
+    if (key.vmsKey && !(key.dateKey && byDateKey.has(key.dateKey)) && !unresolvedVms.has(key.vmsKey)) {
+      unresolvedVms.set(key.vmsKey, key);
+    }
+  }
+  // The run-rate side prefixes some ids with the MSP ("AHSA/65803", "HealthTrust/ 968157"); the deal
+  // sheet carries the bare id. Stripped the same way normalizeVmsJobIdKeyPart does in JS.
+  const byVmsKey = await runTier(
+    unresolvedVms,
+    "UPPER(TRIM(REGEXP_REPLACE(r.VMS_JOB_ID, r'^[^/]*/\\s*', ''))) = w.vms",
+    (k, v) =>
+      `STRUCT('${escapeSqlString(k)}' AS k, '${escapeSqlString(v.candidateId)}' AS cand, ` +
+      `'${escapeSqlString(v.email)}' AS em, '${escapeSqlString(v.vmsJobId)}' AS vms)`
+  );
+
+  let dateHits = 0;
+  let vmsHits = 0;
+  for (const key of keyed) {
+    const tier1 = key.dateKey ? byDateKey.get(key.dateKey) : null;
+    const tier2 = tier1 ? null : key.vmsKey ? byVmsKey.get(key.vmsKey) : null;
+    const hit = tier1 ?? tier2;
+    if (!hit) continue;
+    const hasContract = hit.CONTRACT_ID != null;
+    const hasSku = hit.SKU_NUMBER != null && String(hit.SKU_NUMBER).trim() !== "";
+    if (!hasContract && !hasSku) continue;
+    if (tier1) dateHits++;
+    else vmsHits++;
+    out.set(key.rowKey, hit);
+  }
+
+  logDetail(
+    `[locums runrate lookup] runrate=${runrateTableId} dealRows=${rows.length} keyed=${keyed.length} matched=${out.size} (startDate=${dateHits} vmsJobId=${vmsHits})`
+  );
+
+  return out;
+}
+
+/**
  * Does the matched run-rate window cover ANY of THIS row's own dates?
  *
  * The tier-1 lookup key is identity-only (candidate + client) and the probe dates of every row
@@ -4372,7 +4543,10 @@ Object.freeze(EXTENSION_RUNRATE_MANUAL_COLUMNS);
  * run-rate table turns out to be missing a different column.
  */
 const RUNRATE_HIERARCHY_MISSING_COLUMNS_BY_TABLE = new Map([
-  ["all_locums_runrate", new Set(["AVP"])],
+  // all_locums_runrate keeps its own names for most of the delivery chain (VP_SRVP,
+  // GRP_DIR_ASSOC_GRP_DIR, DELIVERY_POC), so the shared hierarchy names below are absent from it.
+  // Re-confirmed against the recreated table's schema, Sep 2026.
+  ["all_locums_runrate", new Set(["AVP", "VP", "DELIVERY_DIRECTOR", "ASSOCIATE_DELIVERY_DIRECTOR"])],
   // Cynet Health Canada has no AVP role — the hierarchy tops out at VP / Sr. VP — so neither the
   // Canada run-rate table nor the Canada deal sheet tables carry AVP / AVP_EMP_NO. Selecting it
   // would fail the extension backfill query with "Unrecognized name: AVP".
@@ -4408,6 +4582,28 @@ const RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE = new Map([
       "CLIENT_DT_RATE",
     ]),
   ],
+  [
+    // Sep 2026. Three ops columns only the Locums pair has on both sides — the run-rate table
+    // carries them and the deal sheet gained matching columns in the same change. Measured on live
+    // data (913 run-rate rows / 623 deal sheet rows, joined on candidate + START_DATE):
+    //   DIRECT_MANAGER     551 populated on the run-rate side, 0 on the deal sheet
+    //   SHIFTS              68                                  0
+    //   CREDENTIALED_DATE   12                                  0
+    // Adding them to the shared EXTENSION_RUNRATE_MANUAL_COLUMNS would break health's SELECT with
+    // "Unrecognized name", so they ride here.
+    "all_locums_runrate",
+    Object.freeze([
+      "DIRECT_MANAGER",
+      "CREDENTIALED_DATE",
+      "SHIFTS",
+      // The manual loading fraction the locums sheet already agreed for this contract (20 of the
+      // 913 run-rate rows carry one, e.g. 0.06). Carried fill-if-empty like the rest, so a value
+      // typed in the tool always wins. Because it is an INPUT to FINAL_PAY_RATE rather than an
+      // output, the derived rate/margin fields are recomputed after the carry — see
+      // recomputeLocumsDerivedFieldsAfterCarry in contractIdResolver.js.
+      "LOADING_COST_EXCEPTION",
+    ]),
+  ],
 ]);
 
 /**
@@ -4425,6 +4621,20 @@ const RUNRATE_MANUAL_MISSING_COLUMNS_BY_TABLE = new Map([
       "CLIENT_NAME_IN_CONREP",
       "FIFTYTWO_TENURE_RTO_LASTDATE",
       "FIFTYTWO_TENURE_CANDIDATE_STATUS",
+    ]),
+  ],
+  [
+    // Confirmed against all_locums_runrate's schema (Sep 2026): these are the members of
+    // EXTENSION_RUNRATE_MANUAL_COLUMNS it does not have, so selecting one fails the whole backfill
+    // with "Unrecognized name: <col>".
+    "all_locums_runrate",
+    new Set([
+      "INVOICE_CYCLE_TO_CLIENT",
+      "CLIENT_PAYMENT_TERMS",
+      "CANDIDATE_PAYMENT_TERMS",
+      "FIFTYTWO_TENURE_RTO_LASTDATE",
+      "FIFTYTWO_TENURE_CANDIDATE_STATUS",
+      "PAYLOCITY_ID",
     ]),
   ],
 ]);
@@ -9294,6 +9504,7 @@ module.exports = {
   fetchMaxContractIdSeqForTable,
   fetchContractIdsForExtensions,
   fetchLegacyContractIdentityForDealRows,
+  fetchLocumsRunrateIdentityForDealRows,
   buildLegacyContractLookupKey,
   normalizeClientIdKeyPart,
   skuAllowedForPlacementStatus,

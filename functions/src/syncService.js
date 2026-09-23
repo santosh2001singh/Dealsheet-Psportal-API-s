@@ -219,13 +219,13 @@ function dedupeLogRowsByCompositeKey(rows, getKey) {
  * Sync domains whose runs do NOT write the per-row enrich logs (ch_additional_cost_logs,
  * ch_termination_reason_logs).
  *
- * Canada is still being validated: its deal sheet rows get deleted and re-synced repeatedly, and
- * every run would otherwise seed log rows keyed on placements that are about to disappear (see
- * sql/cleanup_canada_test_rows.sql). Remove "canada" once the data is trusted.
+ * Canada and Locums are still being validated: their deal sheet rows get deleted and re-synced
+ * repeatedly, and every run would otherwise seed log rows keyed on placements that are about to
+ * disappear (see sql/cleanup_canada_test_rows.sql). Remove a domain once its data is trusted.
  *
- * cynet health and locums are NOT in this set and keep writing these logs exactly as before.
+ * cynet health is NOT in this set and keeps writing these logs exactly as before.
  */
-const ENRICH_LOG_WRITES_DISABLED_DOMAINS = new Set(["canada"]);
+const ENRICH_LOG_WRITES_DISABLED_DOMAINS = new Set(["canada", "locums"]);
 
 /** True when this run's domain should write the per-row enrich logs. */
 function domainWritesEnrichLogs(params) {

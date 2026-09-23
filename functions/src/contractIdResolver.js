@@ -31,6 +31,7 @@ const {
   fetchContractIdsForExtensions,
   fetchMaxContractIdSeqForTable,
   fetchLegacyContractIdentityForDealRows,
+  fetchLocumsRunrateIdentityForDealRows,
   buildLegacyContractLookupKey,
   legacyCarryColumns,
 } = require("./bigQueryClient");
@@ -38,8 +39,14 @@ const {
   resolveActiveDealSheetTableId,
   resolveActiveDealSheetTableIdForRow,
   resolveRunrateTableIdForDealSheetTable,
+  TABLE_CYNET_LOCUMS,
+  TABLE_ENDED_CYNET_LOCUMS,
 } = require("./recruiterDomainTables");
 const { applyCanadaDefaultEntity } = require("./canadaDerivedPlacementFields");
+const {
+  isCynetLocumsRecruiter,
+  computeLocumsDerivedPlacementFields,
+} = require("./locumsDerivedPlacementFields");
 
 function toInt64OrNull(value) {
   if (value == null || value === "") return null;
@@ -417,9 +424,15 @@ function skuEligibleForLegacyFill(row) {
 async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
   if (!dealRows || dealRows.length === 0) return 0;
 
-  const fetchLegacyContractIdentityFn =
-    deps.fetchLegacyContractIdentityFn ?? fetchLegacyContractIdentityForDealRows;
   const tableId = deps.tableId == null ? "" : String(deps.tableId).trim();
+  // Cynet Locums has its OWN two-tier lookup (candidate + START_DATE, then candidate + VMS_JOB_ID).
+  // The shared one cannot work there — all_locums_runrate carries no client ids at all, so its span
+  // key never forms — and the two must stay separate so neither domain's matching drifts with the
+  // other's. Every other domain keeps the shared lookup exactly as before.
+  const useLocumsLookup = tableId === TABLE_CYNET_LOCUMS || tableId === TABLE_ENDED_CYNET_LOCUMS;
+  const fetchLegacyContractIdentityFn =
+    deps.fetchLegacyContractIdentityFn ??
+    (useLocumsLookup ? fetchLocumsRunrateIdentityForDealRows : fetchLegacyContractIdentityForDealRows);
   // Which run-rate table this domain reads decides the manual-column list: Canada carries five
   // columns health does not have (see RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE).
   const runrateTableId = resolveRunrateTableIdForDealSheetTable(tableId || undefined);
@@ -449,6 +462,10 @@ async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
   let manualFilled = 0;
   let initialStartSet = 0;
   let initialStartRejected = 0;
+  let loadingRecomputed = 0;
+  // Only the locums run-rate carries a loading fraction, so every other domain skips the check.
+  const locumsLoadingCarried = legacyCarryColumns(runrateTableId, includeHierarchy)
+    .includes("LOADING_COST_EXCEPTION");
   for (const row of dealRows) {
     if (row.CONTRACT_ID != null) continue;
     const key = buildLegacyContractLookupKey(row);
@@ -523,11 +540,32 @@ async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
     // a value the run-rate row supplied always wins over the default.
     const withEntity = applyCanadaDefaultEntity(row);
     if (withEntity !== row && withEntity?.ENTITY != null) row.ENTITY = withEntity.ENTITY;
+
+    // Every other carried column is an output the enricher never computed, so writing it is the end
+    // of the story. LOADING_COST_EXCEPTION is different: it is an INPUT to FINAL_PAY_RATE, and the
+    // derived fields were computed back in the enricher, before this carry ran — with the column
+    // still empty. So a row that just took a loading fraction off its run-rate match still carries
+    // rates built from the 1.08 / 1.00 / 1.09 ladder. Recompute them here, for locums rows that
+    // actually gained a value, so the stored rate matches the loading the contract agreed.
+    if (locumsLoadingCarried && isCynetLocumsRecruiter(row.ASSIGNMENT_RECRUITER_EMAIL)) {
+      const before = row.LOADING_COST_EXCEPTION;
+      if (before != null && String(before).trim() !== "") {
+        Object.assign(row, computeLocumsDerivedPlacementFields(row));
+        loadingRecomputed++;
+      }
+    }
   }
 
   if (reused > 0) {
     logDetail(
       `[contractId allocator] legacy run-rate identity applied: dealRows=${dealRows.length} contractIdReused=${reused} skuFilled=${skuFilled} initialStartSet=${initialStartSet} manualFieldsFilled=${manualFilled}`
+    );
+  }
+  // A carried loading fraction changes FINAL_PAY_RATE / FINAL_COST / CALCULATED_MARGIN, so say how
+  // many rows had their rates rebuilt rather than leaving it to be inferred from the data.
+  if (loadingRecomputed > 0) {
+    logDetail(
+      `[contractId allocator] locums rates recomputed from a carried LOADING_COST_EXCEPTION: ${loadingRecomputed}`
     );
   }
   // Surfaced rather than silently dropped: a proposed INITIAL_START_DATE later than the row's own

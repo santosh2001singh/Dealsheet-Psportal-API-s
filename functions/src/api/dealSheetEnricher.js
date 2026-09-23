@@ -940,7 +940,6 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     const hoursRow = hoursByDs.get(String(dealSheetId)) ?? null;
     const hoursPart = mapDealSheetHoursDetailsToBq(hoursRow, clientStateNorm);
     const revenueRow = revByDs.get(String(dealSheetId)) ?? null;
-    const revenuePart = mapDealSheetRevenueDetailsToBq(revenueRow);
     const addCostRows = additionalCostsByDs.get(String(dealSheetId)) ?? [];
     const travelRows = travelAllowancesByDs.get(String(dealSheetId)) ?? [];
     const clientCostRows = clientCostsByDs.get(String(dealSheetId)) ?? [];
@@ -992,6 +991,12 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     // Canada is decided by the placement's province (CLIENT_STATE), not the recruiter's email.
     const isCanadaRecruiter = isCanadaDealSheetRow({ CLIENT_STATE: clientStateNorm });
     const isLocumsRecruiter = isCynetLocumsRecruiter(userPart?.ASSIGNMENT_RECRUITER_EMAIL);
+    // Built here rather than with the other parts above because the target column depends on the
+    // recruiter: Locums takes hourly revenue in GROSS_MARGIN, every other division in MARGIN.
+    const revenuePart = mapDealSheetRevenueDetailsToBq(
+      revenueRow,
+      userPart?.ASSIGNMENT_RECRUITER_EMAIL,
+    );
     const hoursPartForRow = isCanadaRecruiter ? pickCanadaDealSheetHoursPart(hoursPart) : hoursPart;
     const bonusTotalsPart = isCanadaRecruiter
       ? {}

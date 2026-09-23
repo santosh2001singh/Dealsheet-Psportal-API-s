@@ -97,9 +97,37 @@ test("health's manual column list is completely unchanged", () => {
 test("an unknown or absent table id yields the plain shared list", () => {
   const base = legacyDealManualColumns(undefined);
   assert.deepEqual(legacyDealManualColumns(HEALTH_RUNRATE), base);
-  assert.deepEqual(legacyDealManualColumns(LOCUMS_RUNRATE), base);
   assert.deepEqual(legacyDealManualColumns("some_other_table"), base);
   assert.deepEqual(legacyDealManualColumns(null), base);
+});
+
+test("locums drops the six manual columns its run-rate table lacks, and adds its three ops ones", () => {
+  const locums = legacyDealManualColumns(LOCUMS_RUNRATE);
+  for (const c of [
+    "INVOICE_CYCLE_TO_CLIENT",
+    "CLIENT_PAYMENT_TERMS",
+    "CANDIDATE_PAYMENT_TERMS",
+    "FIFTYTWO_TENURE_RTO_LASTDATE",
+    "FIFTYTWO_TENURE_CANDIDATE_STATUS",
+    "PAYLOCITY_ID",
+  ]) {
+    assert.ok(!locums.includes(c), `all_locums_runrate has no ${c}`);
+  }
+  for (const c of ["DIRECT_MANAGER", "CREDENTIALED_DATE", "SHIFTS"]) {
+    assert.ok(locums.includes(c), `locums should carry ${c}`);
+  }
+  assert.equal(new Set(locums).size, locums.length, "no duplicates");
+});
+
+test("health still carries everything locums drops", () => {
+  const health = legacyDealManualColumns(HEALTH_RUNRATE);
+  for (const c of ["INVOICE_CYCLE_TO_CLIENT", "CLIENT_PAYMENT_TERMS", "PAYLOCITY_ID"]) {
+    assert.ok(health.includes(c), `health should still carry ${c}`);
+  }
+  // ...and none of the locums-only ops columns, which its run-rate table does not have.
+  for (const c of ["DIRECT_MANAGER", "CREDENTIALED_DATE", "SHIFTS"]) {
+    assert.ok(!health.includes(c), `health must not carry ${c}`);
+  }
 });
 
 test("the canada list has no duplicates", () => {
@@ -107,9 +135,12 @@ test("the canada list has no duplicates", () => {
   assert.equal(new Set(cols).size, cols.length);
 });
 
-test("only the canada run-rate table has manual-column overrides registered", () => {
-  assert.deepEqual([...RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE.keys()], [CANADA_RUNRATE]);
-  assert.deepEqual([...RUNRATE_MANUAL_MISSING_COLUMNS_BY_TABLE.keys()], [CANADA_RUNRATE]);
+test("canada and locums are the run-rate tables with manual-column overrides", () => {
+  assert.deepEqual([...RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE.keys()].sort(), [CANADA_RUNRATE, LOCUMS_RUNRATE].sort());
+  assert.deepEqual([...RUNRATE_MANUAL_MISSING_COLUMNS_BY_TABLE.keys()].sort(), [CANADA_RUNRATE, LOCUMS_RUNRATE].sort());
+  // cynet health uses the shared list untouched.
+  assert.ok(!RUNRATE_EXTRA_MANUAL_COLUMNS_BY_TABLE.has(HEALTH_RUNRATE));
+  assert.ok(!RUNRATE_MANUAL_MISSING_COLUMNS_BY_TABLE.has(HEALTH_RUNRATE));
 });
 
 // --------------------------------------------------------------------------

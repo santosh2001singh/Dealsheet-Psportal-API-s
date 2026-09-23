@@ -72,12 +72,14 @@ test("GROSS_MARGIN is API-owned", () => {
   assert.ok(API_OWNED_COLUMNS.has("GROSS_MARGIN"));
 });
 
-test("locums rows never carry GROSS_MARGIN", () => {
+// Locums gained a real GROSS_MARGIN column in Sep 2026, carrying the API's hourly revenue that the
+// table used to store in MARGIN — so the sanitizer must let it through, as Canada's does.
+test("locums rows keep GROSS_MARGIN", () => {
   const locums = sanitizeLocumsDealSheetRow({
     ASSIGNMENT_RECRUITER_EMAIL: "recruiter@cynetlocums.com",
     GROSS_MARGIN: 12.5,
   });
-  assert.ok(!Object.prototype.hasOwnProperty.call(locums, "GROSS_MARGIN"));
+  assert.equal(locums.GROSS_MARGIN, 12.5);
 });
 
 // Canada gained a real GROSS_MARGIN column in Aug 2026, so the sanitizer must let it through
