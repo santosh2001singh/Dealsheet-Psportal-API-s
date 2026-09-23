@@ -299,3 +299,22 @@ ALTER TABLE `cynetdatabase.rr_project_data.cynet_locums_deal_sheet`
   ADD COLUMN IF NOT EXISTS FINAL_OT_PAY_RATE FLOAT64,
   ADD COLUMN IF NOT EXISTS FINAL_HOLIDAY_PAY_RATE FLOAT64,
   ADD COLUMN IF NOT EXISTS FINAL_CALL_BACK_PAY_RATE FLOAT64;
+
+-- Locums-only: manual loading fraction (0.15 = 15%) that replaces the FINAL_PAY_RATE burden ladder
+-- with (1 + value). Entered by hand in the tool, so the sync treats it as a MANUAL_COLUMN.
+ALTER TABLE `cynetdatabase.rr_project_data.cynet_locums_deal_sheet`
+  ADD COLUMN IF NOT EXISTS LOADING_COST_EXCEPTION FLOAT64;
+
+-- Sep 2026: Locums adopts Canada's margin naming. CALCULATED_MARGIN carries the computed
+-- bill-minus-cost figure the table used to store in NET_MARGIN, and GROSS_MARGIN carries the API's
+-- hourly revenue it used to store in MARGIN. MARGIN and NET_MARGIN are retired on this table.
+ALTER TABLE `cynetdatabase.rr_project_data.cynet_locums_deal_sheet`
+  ADD COLUMN IF NOT EXISTS GROSS_MARGIN FLOAT64;
+
+-- Sep 2026: three ops columns the Locums run-rate carries but the deal sheet had no home for, so
+-- the extension/manual backfill could not bring them across (DIRECT_MANAGER alone is populated on
+-- 551 of the 913 run-rate rows). See EXTENSION_RUNRATE_MANUAL_COLUMNS_BY_TABLE.
+ALTER TABLE `cynetdatabase.rr_project_data.cynet_locums_deal_sheet`
+  ADD COLUMN IF NOT EXISTS DIRECT_MANAGER STRING,
+  ADD COLUMN IF NOT EXISTS CREDENTIALED_DATE DATE,
+  ADD COLUMN IF NOT EXISTS SHIFTS STRING;

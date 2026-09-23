@@ -1596,17 +1596,44 @@ function isOfferRejectedSubmittalRow(submittalRow) {
 /**
  * Fetch deal-sheet-candidates for multiple job_ids in parallel (tolerates individual failures)
  */
-/** Parallel-fetch concurrency for deal-sheet-candidates (env override, default 8, clamped 1..20).
+/** Parallel-fetch concurrency for deal-sheet-candidates (env override, clamped 1..20).
+ *
  *  Kept low on purpose: 20 simultaneous Nexus connections was breaking sockets (ECONNRESET) once
- *  VERBAL deal sheets multiplied the row volume. Lower fan-out = fewer socket resets at the source. */
-function resolveCandidateFetchConcurrency() {
+ *  VERBAL deal sheets multiplied the row volume. Lower fan-out = fewer socket resets at the source.
+ *
+ *  This is a THIRD fan-out path, separate from config.fetchAllMax (enrich waves) and
+ *  updatePlacementConcurrency (the update trigger's placement loop), and until Sep 2026 it read
+ *  neither — every domain fanned out 8 wide here regardless of its own pacing. That is what failed
+ *  the locums insert trigger on 2026-09-23: with its START_DATE filter removed the page carried 293
+ *  job_ids, 8 of which went out at a time against an edge already throttling the run, and 7 still
+ *  failed after their retries — enough to throw and pause the whole page.
+ *
+ *  So the two unfiltered domains are pinned below the default here. Cynet health keeps the
+ *  historical 8 exactly: it is not in this map, and raising it to its fetchAllMax of 10 would be a
+ *  behaviour change to a domain that never had this problem.
+ *
+ *  @param {string} [domain] - "health" | "canada" | "locums"
+ */
+const CANDIDATE_FETCH_CONCURRENCY_BY_DOMAIN = Object.freeze({ canada: 5, locums: 5 });
+
+function resolveCandidateFetchConcurrency(domain) {
   const raw = process.env.DEAL_SHEET_CANDIDATE_FETCH_CONCURRENCY;
-  const n = parseInt(String(raw != null && raw !== "" ? raw : "8").trim(), 10);
-  if (!Number.isFinite(n) || n < 1) return 8;
-  return Math.min(n, 20);
+  const fromEnv = parseInt(String(raw != null && raw !== "" ? raw : "").trim(), 10);
+  if (Number.isFinite(fromEnv) && fromEnv >= 1) return Math.min(fromEnv, 20);
+
+  const key = domain == null ? "" : String(domain).trim().toLowerCase();
+  const perDomain = CANDIDATE_FETCH_CONCURRENCY_BY_DOMAIN[key];
+  if (Number.isFinite(perDomain) && perDomain >= 1) return Math.min(perDomain, 20);
+
+  return 8;
 }
 
-async function fetchDealSheetCandidatesByJobIdsParallel(jobIds, accessToken, dealSheetStatusCodesCsv = "FINAL") {
+async function fetchDealSheetCandidatesByJobIdsParallel(
+  jobIds,
+  accessToken,
+  dealSheetStatusCodesCsv = "FINAL",
+  syncDomain = null
+) {
   if (!jobIds || jobIds.length === 0) return new Map();
   const requestedCodes = String(dealSheetStatusCodesCsv || "").trim() || "FINAL";
 
@@ -1618,7 +1645,7 @@ async function fetchDealSheetCandidatesByJobIdsParallel(jobIds, accessToken, dea
       per_page: 1000,
     });
 
-  const concurrency = resolveCandidateFetchConcurrency();
+  const concurrency = resolveCandidateFetchConcurrency(syncDomain);
   const result = new Map();
   const persistentFailures = [];
 
@@ -2146,15 +2173,91 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
         }
       }
 
+      // Pre-filter on PLACEMENT_ID before the fetch, not after it.
+      //
+      // The skip-existing filter below runs on `deal_sheet`, which only /api/deal-sheet-candidates/
+      // supplies — so the whole page was fetched just to discover that most of it was already in
+      // BigQuery. On a full-history scan that is nearly all of it: listPage=13 fetched 298 job_ids
+      // (58s) to find 264 already present and 49 worth enriching.
+      //
+      // The submittal row already carries the placement id (the same one the filter reads at
+      // `submittalRow?.id ?? submittalRow?.placement`), so a job whose every submittal is an
+      // already-synced placement can be dropped without fetching it at all.
+      //
+      // This only ever REMOVES work the filter below would have discarded anyway:
+      //   * a job with any unknown placement is kept and fetched;
+      //   * a submittal with no placement id is treated as unknown, so it is kept;
+      //   * DEAL_SHEET_ID dedupe is untouched — it still runs on the rows that are fetched.
+      let jobIdsToFetch = uniqueJobIds;
+      let jobsSkippedAllExisting = 0;
+      if (skipExistingDealSheetOrPlacement && uniqueJobIds.length > 0) {
+        const placementIdsByJob = new Map();
+        const unknownPlacementIdsPre = [];
+        const unknownPlacementSeenPre = new Set();
+        for (const row of submittalsForDomain) {
+          const jobId = normalizeNexusResourceId(row?.job);
+          if (!jobId) continue;
+          const pidRaw = row?.id ?? row?.placement;
+          const pid = pidRaw == null ? "" : String(pidRaw).trim();
+          let set = placementIdsByJob.get(jobId);
+          if (!set) {
+            set = new Set();
+            placementIdsByJob.set(jobId, set);
+          }
+          set.add(pid);
+          if (
+            pid !== ""
+            && !knownExistingPlacementIds.has(pid)
+            && !knownNewPlacementIds.has(pid)
+            && !unknownPlacementSeenPre.has(pid)
+          ) {
+            unknownPlacementSeenPre.add(pid);
+            unknownPlacementIdsPre.push(pid);
+          }
+        }
+
+        if (unknownPlacementIdsPre.length > 0) {
+          const existingPid =
+            explicitBqTable || useEndedDomainRouting
+              ? await fetchExistingPlacementIdsSet(unknownPlacementIdsPre, bqWriteOptions)
+              : await fetchExistingPlacementIdsSetAnyActiveTable(unknownPlacementIdsPre, {
+                datasetId: effectiveDatasetId,
+              });
+          for (const id of unknownPlacementIdsPre) {
+            if (existingPid.has(id)) knownExistingPlacementIds.add(id);
+            else knownNewPlacementIds.add(id);
+          }
+        }
+
+        // A job is worth fetching unless EVERY submittal it has is an already-synced placement.
+        // A blank placement id counts as unknown, so it keeps the job.
+        const kept = uniqueJobIds.filter((jobId) => {
+          const pids = placementIdsByJob.get(jobId);
+          if (!pids || pids.size === 0) return true;
+          for (const pid of pids) {
+            if (pid === "" || !knownExistingPlacementIds.has(pid)) return true;
+          }
+          return false;
+        });
+        jobsSkippedAllExisting = uniqueJobIds.length - kept.length;
+        jobIdsToFetch = kept;
+        if (jobsSkippedAllExisting > 0) {
+          logLine(
+            `[enriched sync] STEP 3/5 PRE-FILTER (PLACEMENT_ID, before fetch): jobIds=${uniqueJobIds.length} skippedAllPlacementsExisting=${jobsSkippedAllExisting} toFetch=${jobIdsToFetch.length}`
+          );
+        }
+      }
+
       logLine(
-        `[enriched sync] STEP 3/5 NEXUS API: fetching deal-sheet-candidates by ${uniqueJobIds.length} unique job_id(s) in PARALLEL from submittal listPage=${nexusListPage ?? "?"} (wave=${pageNum})`
+        `[enriched sync] STEP 3/5 NEXUS API: fetching deal-sheet-candidates by ${jobIdsToFetch.length} unique job_id(s) in PARALLEL from submittal listPage=${nexusListPage ?? "?"} (wave=${pageNum})`
       );
 
       const candFetchStart = Date.now();
       const candidatesByJobId = await fetchDealSheetCandidatesByJobIdsParallel(
-        uniqueJobIds,
+        jobIdsToFetch,
         accessToken,
-        dealSheetStatusCodesCsv
+        dealSheetStatusCodesCsv,
+        normalizeSyncDomain(params?.sync_domain)
       );
       const candFetchMs = Date.now() - candFetchStart;
       logLine(`[enriched sync] STEP 3/5 NEXUS API: parallel fetch completed httpMs=${candFetchMs}`);
@@ -2168,7 +2271,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
       const verbalSamples = [];
       const maxVerbalSamples = 5;
 
-      for (const jobId of uniqueJobIds) {
+      for (const jobId of jobIdsToFetch) {
         const rows = candidatesByJobId.get(jobId) || [];
         for (const item of rows) {
           const statusReason = dealSheetCandidateExcludeReason(item, allowedDealSheetStatusKeys);
@@ -3444,6 +3547,7 @@ module.exports = {
   resolvePriorityBudgetSharePct,
   ENRICH_LOG_WRITES_DISABLED_DOMAINS,
   domainWritesEnrichLogs,
+  resolveCandidateFetchConcurrency,
   syncEnrichedDealSheetCandidatesToBigQuery,
   isOfferRejectedSubmittalRow,
   syncExistingActiveDealSheetUpdatesFromBigQuery,

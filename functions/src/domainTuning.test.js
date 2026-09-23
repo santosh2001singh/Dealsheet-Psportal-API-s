@@ -9,11 +9,11 @@ const CANADA = { fetchAllMax: 5, batchDelayMs: 500, maxRetries: 5, placementConc
 const HEALTH = { fetchAllMax: 10, batchDelayMs: 250, maxRetries: 5, placementConcurrency: 3 };
 
 /**
- * Canada syncs its whole Nexus history (no start-date filter), so one run fires thousands of
- * requests and trips the edge rate limit. Health reaches the same limit by a different route: its
- * UPDATE trigger reuses fetchAllMax as per-placement concurrency, so the 20-wide default refreshed
- * 20 placements at once and burst their submittal GETs (2026-09-03). Both are paced here; locums
- * keeps the defaults.
+ * Canada and Locums sync their whole Nexus history (no start-date filter), so one run fires
+ * thousands of requests and trips the edge rate limit. Health reaches the same limit by a different
+ * route: its UPDATE trigger reuses fetchAllMax as per-placement concurrency, so the 20-wide default
+ * refreshed 20 placements at once and burst their submittal GETs (2026-09-03). All three are paced
+ * here; only an unknown domain keeps the defaults.
  *
  * The pacing lives in code — NOT in per-function env vars — because `gcloud --update-env-vars`
  * truncated NEXUS_PASSWORD at its trailing "#", breaking auth with a 401. With the tuning in code
@@ -55,8 +55,10 @@ test("update placement concurrency is its own knob, well below fetchAllMax", () 
   }
 });
 
-test("locums keeps the fast defaults", () => {
-  assert.deepEqual(resolveDomainTuning("locums"), DEFAULTS);
+test("locums is paced like canada — it lost its start-date filter in Sep 2026", () => {
+  // Its first unfiltered run answered HTML 403s on every wave1 sub-request and logged
+  // "wave1 fallback: skipped=82 successful=344". Same shape as canada, so the same numbers.
+  assert.deepEqual(resolveDomainTuning("locums"), CANADA);
 });
 
 test("an unknown or absent domain gets the defaults", () => {
@@ -77,7 +79,7 @@ test("applying one domain never leaks into the next", () => {
   // baseline — otherwise canada's 5/500/5 would become health's defaults for the rest of the process.
   applyDomainTuning("canada");
   assert.deepEqual(resolveDomainTuning("health"), HEALTH);
-  assert.deepEqual(resolveDomainTuning("locums"), DEFAULTS);
+  assert.deepEqual(resolveDomainTuning(undefined), DEFAULTS);
 
   applyDomainTuning("health");
   assert.equal(config.fetchAllMax, HEALTH.fetchAllMax);
@@ -91,27 +93,27 @@ test("applying one domain never leaks into the next", () => {
   assert.equal(config.maxRetries, CANADA.maxRetries);
   assert.equal(config.updatePlacementConcurrency, CANADA.placementConcurrency);
 
-  // Leave the process on locums (the true defaults) for any later test in the same file.
-  applyDomainTuning("locums");
+  // Leave the process on the true defaults for any later test in the same file.
+  applyDomainTuning(undefined);
 });
 
 test("applyDomainTuning returns what it applied", () => {
   assert.deepEqual(applyDomainTuning("canada"), CANADA);
   assert.deepEqual(applyDomainTuning("health"), HEALTH);
-  assert.deepEqual(applyDomainTuning("locums"), DEFAULTS);
+  assert.deepEqual(applyDomainTuning("locums"), CANADA);
+  assert.deepEqual(applyDomainTuning(undefined), DEFAULTS);
 });
 
 test("repeated application is stable", () => {
   for (let i = 0; i < 3; i++) {
     assert.deepEqual(applyDomainTuning("canada"), CANADA);
     assert.deepEqual(applyDomainTuning("health"), HEALTH);
-    assert.deepEqual(applyDomainTuning("locums"), DEFAULTS);
+    assert.deepEqual(applyDomainTuning("locums"), CANADA);
   }
 });
 
-test("canada and health are tuned; credentials are never domain-scoped", () => {
-  // locums deliberately has no entry: it takes placementConcurrency from the global default.
-  assert.deepEqual(Object.keys(config.domainTuning).sort(), ["canada", "health"]);
+test("all three domains are tuned; credentials are never domain-scoped", () => {
+  assert.deepEqual(Object.keys(config.domainTuning).sort(), ["canada", "health", "locums"]);
   // Nexus credentials are shared across all three domains — the tuning must not touch them.
   for (const k of ["username", "password", "baseUrl", "csrfToken"]) {
     assert.ok(k in config.nexus, k);
@@ -122,4 +124,6 @@ test("canada and health are tuned; credentials are never domain-scoped", () => {
   applyDomainTuning("health");
   assert.deepEqual(config.nexus, before, "domain tuning must not alter credentials");
   applyDomainTuning("locums");
+  assert.deepEqual(config.nexus, before, "domain tuning must not alter credentials");
+  applyDomainTuning(undefined);
 });

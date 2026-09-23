@@ -59,10 +59,10 @@ const config = {
   /**
    * Per-domain Nexus fan-out tuning, applied on top of the values above.
    *
-   * Canada runs with NO start-date filter, so one run enriches its whole Nexus history — a single
-   * wave fired 3222 requests on 2026-08-24 and tripped the edge (Cloud Armor) rate limit, which
-   * answers with an HTML 403 page. Health and locums only fetch from 2026-01-01, so their volume
-   * never reaches that point and they keep the faster defaults.
+   * Canada and Locums run with NO start-date filter, so one run enriches the whole Nexus history —
+   * a single Canada wave fired 3222 requests on 2026-08-24 and tripped the edge (Cloud Armor) rate
+   * limit, which answers with an HTML 403 page. Health still fetches only from 2026-01-01, so its
+   * volume never reaches that point from the insert side.
    *
    * These live in code rather than per-function env vars on purpose: setting them with
    * `gcloud --update-env-vars` truncated NEXUS_PASSWORD at its trailing "#" (shell comment), which
@@ -87,6 +87,22 @@ const config = {
      * above — enough headroom to stay under the limit without stretching the run past its timeout.
      */
     health: { fetchAllMax: 10, batchDelayMs: 250, maxRetries: 5, placementConcurrency: 3 },
+    /**
+     * Locums joined the unfiltered domains in Sep 2026: its START_DATE lower bound was removed so
+     * the sync covers the full Nexus history, and its very first run after that hit exactly the
+     * failure Canada's numbers were written for — dealsheetsynctriggerlocums logging HTML 403s on
+     * every wave1 sub-request (deal-sheets, hours, revenue, rates, additional-costs, travel,
+     * client-costs, rate-changes) for one deal sheet id after another, and finishing
+     * "wave1 fallback: skipped=82 successful=344".
+     *
+     * A 403 there is the edge throttling the burst, not a permission problem: the same URLs return
+     * 200 on a direct call, and the run's own wave2 came back clean once the requests had spread
+     * out. Until that run locums sat on the untuned defaults (fetchAllMax 20, batchDelayMs 100),
+     * which is the fastest fan-out of any domain — the opposite of what an unfiltered history needs.
+     *
+     * Paced like canada, for the same reason: both enrich their whole history in one run.
+     */
+    locums: { fetchAllMax: 5, batchDelayMs: 500, maxRetries: 5, placementConcurrency: 2 },
   },
   /**
    * How many placements the UPDATE trigger refreshes in parallel.
