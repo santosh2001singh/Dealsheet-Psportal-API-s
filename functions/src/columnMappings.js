@@ -9,7 +9,7 @@ const {
   computeCanadaDerivedPlacementFields,
 } = require("./canadaDerivedPlacementFields");
 const {
-  isCynetLocumsRecruiter,
+  isLocumsDealSheetRow,
   computeLocumsDerivedPlacementFields,
 } = require("./locumsDerivedPlacementFields");
 const { normalizeContractIdOrNull } = require("./contractIdFormat");
@@ -673,15 +673,17 @@ function mapDealSheetHoursDetailsToBq(hoursRow, clientState) {
 /**
  * Map deal sheet revenue details to BigQuery schema
  */
-function mapDealSheetRevenueDetailsToBq(revenueRow, recruiterEmail) {
+function mapDealSheetRevenueDetailsToBq(revenueRow, locumsRow) {
   if (!revenueRow) return {};
   // MARGIN is the deal sheet's hourly revenue straight from the API — not a computed margin.
   // (Canada relies on this: its derived step fills CALCULATED_MARGIN and leaves MARGIN alone.)
   const hourlyRevenue = toNumberOrNull(revenueRow.hourly_revenue);
   const gpPercentage = toNumberOrNull(revenueRow.gross_margin_percentage);
   // Locums retired MARGIN in favour of Canada's naming: the same hourly revenue lands in
-  // GROSS_MARGIN, while its derived step fills CALCULATED_MARGIN.
-  if (isCynetLocumsRecruiter(recruiterEmail)) {
+  // GROSS_MARGIN, while its derived step fills CALCULATED_MARGIN. Keyed on the ROW, so a GOV-desk
+  // row (@cynethealth.com with OFFERING=LOCUMS) puts its revenue in the same column as the rest of
+  // the locums table rather than in a MARGIN column that table no longer has.
+  if (isLocumsDealSheetRow(locumsRow)) {
     return { GP_PERCENTAGE: gpPercentage, GROSS_MARGIN: hourlyRevenue };
   }
   return { GP_PERCENTAGE: gpPercentage, MARGIN: hourlyRevenue };
@@ -1111,7 +1113,9 @@ function computeDerivedPlacementFields(row) {
   if (isCanadaDealSheetRow(row)) {
     return computeCanadaDerivedPlacementFields(row);
   }
-  if (isCynetLocumsRecruiter(row?.ASSIGNMENT_RECRUITER_EMAIL)) {
+  // Decided on the ROW, not the recruiter email: OFFERING=LOCUMS routes a GOV-desk row
+  // (@cynethealth.com) into the locums table, so it must take the locums derivations too.
+  if (isLocumsDealSheetRow(row)) {
     return computeLocumsDerivedPlacementFields(row);
   }
 
@@ -1373,13 +1377,30 @@ function mapJobSubmittalToBq(submittalRow, jobObj) {
  * (same states as the regular-hours OT split); all other states use
  * PR_GREATER_THAN_FOURTY / BR_GREATER_THAN_FOURTY.
  */
-function mapDealSheetRatesListToBq(rateRows, clientState) {
-  if (!rateRows || !rateRows.length) return {};
+function mapDealSheetRatesListToBq(rateRows, clientState, jobRateRows = null) {
+  if ((!rateRows || !rateRows.length) && (!jobRateRows || !jobRateRows.length)) return {};
   const byCode = {};
-  for (const r of rateRows) {
+  for (const r of rateRows || []) {
     const code = r?.bill_rate_code;
     if (code == null || String(code).trim() === "") continue;
     const key = String(code);
+    if (byCode[key] === undefined) byCode[key] = toNumberOrNull(r?.rate);
+  }
+  // Client-side (BR_*) fallback from the JOB's rates, for codes the deal sheet does not carry.
+  //
+  // A locums deal sheet routinely lists only a few rates — deal sheet 5161506 had six, none of them
+  // BR_GREATER_THAN_FOURTY or BR_HOLIDAY_RATE — while /api/job-rates/ for the same job carried
+  // BR_GREATER_THAN_FOURTY 338 and BR_HOLIDAY_RATE 390, matching the run-rate row. Without this the
+  // client rates land null and GM_OT, which divides by CLIENT_OT_RATE, never computes.
+  //
+  // Fill-if-absent, never overwrite: a rate the deal sheet states is the agreed one for THIS
+  // placement, and the job's rate is only the posting's default. Pay-side (PR_*) codes are ignored
+  // here — job-rates carries none of them.
+  for (const r of jobRateRows || []) {
+    const code = r?.bill_rate_code;
+    if (code == null || String(code).trim() === "") continue;
+    const key = String(code);
+    if (!key.startsWith("BR_")) continue;
     if (byCode[key] === undefined) byCode[key] = toNumberOrNull(r?.rate);
   }
 

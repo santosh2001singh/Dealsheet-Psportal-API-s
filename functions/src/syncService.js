@@ -84,7 +84,9 @@ const {
   submittalMayBeCanada,
   CANADA_EXCLUDED_API_OWNED_COLUMNS,
 } = require("./canadaDerivedPlacementFields");
-const { isCynetLocumsRecruiter, LOCUMS_EXCLUDED_API_OWNED_COLUMNS } = require("./locumsDerivedPlacementFields");
+const {
+  isLocumsDealSheetRow, LOCUMS_EXCLUDED_API_OWNED_COLUMNS,
+} = require("./locumsDerivedPlacementFields");
 const { computeNewMargin } = require("./w2PayRateNew");
 const {
   resolveActiveDealSheetTableId,
@@ -750,8 +752,9 @@ function resolvePreferredCandidateRow(candidateRows, preferredCandidateId, prefe
  */
 function shouldSkipDomainExcludedApiOwnedColumn(row, key) {
   if (isCanadaDealSheetRow(row) && CANADA_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
-  const email = row?.ASSIGNMENT_RECRUITER_EMAIL;
-  if (isCynetLocumsRecruiter(email) && LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
+  // On the ROW, not the email: a GOV-desk row (@cynethealth.com, OFFERING=LOCUMS) lives in the
+  // locums table, so the same columns must be excluded from its append compare.
+  if (isLocumsDealSheetRow(row) && LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
   return false;
 }
 
@@ -759,8 +762,8 @@ function computeChangedFields(incomingRow, existingRow, ignoreFields) {
   const out = [];
   if (!existingRow) return out;
   const ignore = new Set((ignoreFields || []).map((x) => String(x).trim()).filter(Boolean));
-  const email = incomingRow?.ASSIGNMENT_RECRUITER_EMAIL;
-  const isDomainTypeDerived = isCanadaDealSheetRow(incomingRow) || isCynetLocumsRecruiter(email);
+  const isDomainTypeDerived =
+    isCanadaDealSheetRow(incomingRow) || isLocumsDealSheetRow(incomingRow);
   if (isDomainTypeDerived) {
     if (normalizeForCompare(incomingRow?.PAYMENT_TYPE) !== normalizeForCompare(existingRow?.PAYMENT_TYPE)) {
       out.push("PAYMENT_TYPE");
@@ -1973,6 +1976,8 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
         persistDealSheetStatusFromCandidate: includeVerbalDealSheets,
         skip_contract_id: skipContractId,
         fetchTerminationDetails: true,
+        // Locums alone fetches job rates, to fill the client-side codes its deal sheets omit.
+        syncDomain,
       });
     // Domain-scoped run: drop rows belonging to the other domains before anything touches BigQuery,
     // so a canada/locums run can never write to (or allocate ids against) cynet health.

@@ -69,10 +69,13 @@ const TIERS = [
     label: "prior-EXTENSION tier",
     fn: fetchExtensionPriorExtensionInheritByPlacementId,
     alias: "p",
+    // This tier also accepts SKU_NUMBER as the identity of a row that has no id yet. See the
+    // dedicated tests below for why, and for what that arm must NOT let through.
+    skuFallback: true,
   },
 ];
 
-for (const { label, fn, alias } of TIERS) {
+for (const { label, fn, alias, skuFallback } of TIERS) {
   test(`${label}: the source must carry the row's own resolved CONTRACT_ID`, async () => {
     const [sql] = await captureSql(() =>
       fn([UNRESOLVED_EXTENSION_ROW], { tableId: "cynet_health_deal_sheet" })
@@ -80,13 +83,13 @@ for (const { label, fn, alias } of TIERS) {
 
     assert.match(
       sql,
-      /AND ext\.resolved_contract_id != ''/,
-      "an unresolved row must inherit nothing, not fall through the guard"
+      new RegExp(`${alias}\\.CONTRACT_ID = ext\\.resolved_contract_id`),
+      "the source's contract must match the row's own"
     );
     assert.match(
       sql,
-      new RegExp(`AND ${alias}\\.CONTRACT_ID = ext\\.resolved_contract_id`),
-      "the source's contract must match the row's own"
+      /ext\.resolved_contract_id != ''/,
+      "the id arm must require a resolved id, never treat '' as a match"
     );
     // The pre-fix form: '' disabled the guard on exactly the brand-new rows that needed it.
     assert.ok(
@@ -95,6 +98,15 @@ for (const { label, fn, alias } of TIERS) {
       ).test(sql),
       "the inert \"'' OR id\" form must not come back"
     );
+    if (!skuFallback) {
+      // The struct is shared, so resolved_sku_number appears in every tier's SQL. What must not
+      // appear here is the GUARD arm that acts on it: this tier keeps the strict rule — no id,
+      // no inherit.
+      assert.ok(
+        !new RegExp(`${alias}\\.SKU_NUMBER = ext\\.resolved_sku_number`).test(sql),
+        "only the prior-EXTENSION tier may fall back to SKU_NUMBER"
+      );
+    }
   });
 
   test(`${label}: "same contract" is never inferred from dates`, async () => {
@@ -139,3 +151,104 @@ for (const { label, fn, alias } of TIERS) {
     );
   });
 }
+
+/**
+ * The SKU arm of the prior-EXTENSION guard.
+ *
+ * Requiring a resolved CONTRACT_ID alone shut this tier for the one chain shape it exists to serve:
+ * a contract that only ever appears as EXTENSION rows (no DEAL row anywhere), whose next segment
+ * starts after a gap so the run-rate window cannot place it either. Every tier missed, and the row
+ * minted a second id for a contract that already had one.
+ *
+ * Live case (CANDIDATE_ID 16009590 "Ashley Saunders", PLACEMENT_ID 1469883, Sep 2026): CHC20745 ran
+ * as four EXTENSION segments on SKU H14126 from 2025-11-24. The fourth began 2026-09-21 — nine days
+ * after the third ended 2026-09-12 — and came out as CHC23663 with INITIAL_START_DATE reset to its
+ * own start.
+ *
+ * SKU_NUMBER is per-contract, so it draws the same line CONTRACT_ID would; it is simply available
+ * earlier, since the legacy run-rate lookup fills it on EXTENSION rows before this tier runs.
+ */
+
+/** Ashley's fourth segment: no id yet, but the chain's SKU already on the row. */
+const SKU_ONLY_EXTENSION_ROW = {
+  PLACEMENT_ID: 1469883,
+  CANDIDATE_ID: 16009590,
+  CLIENT_ID: 3640336,
+  CANDIDATE_EMAIL: "anmitchell30@gmail.com",
+  CELL_PHONE: "(336) 420-0180",
+  START_DATE: "2026-09-21",
+  CONTRACT_ID: null,
+  SKU_NUMBER: "H14126",
+};
+
+test("prior-EXTENSION tier: an unresolved row falls back to its SKU, so an EXTENSION-only chain stays on one contract", async () => {
+  const [sql] = await captureSql(() =>
+    fetchExtensionPriorExtensionInheritByPlacementId([SKU_ONLY_EXTENSION_ROW], {
+      tableId: "cynet_health_deal_sheet",
+    })
+  );
+
+  assert.match(
+    sql,
+    /ext\.resolved_contract_id = ''\s*\n?\s*AND ext\.resolved_sku_number != ''/,
+    "the SKU arm engages only where the id is still blank"
+  );
+  assert.match(
+    sql,
+    /p\.SKU_NUMBER = ext\.resolved_sku_number/,
+    "the source's SKU must match the row's own"
+  );
+});
+
+test("prior-EXTENSION tier: the row's SKU reaches the query", async () => {
+  const [sql] = await captureSql(() =>
+    fetchExtensionPriorExtensionInheritByPlacementId([SKU_ONLY_EXTENSION_ROW], {
+      tableId: "cynet_health_deal_sheet",
+    })
+  );
+  assert.match(sql, /'H14126' AS resolved_sku_number/, "SKU_NUMBER must be carried in the struct");
+});
+
+test("prior-EXTENSION tier: a row with NO sku and no id still inherits nothing", async () => {
+  const [sql] = await captureSql(() =>
+    fetchExtensionPriorExtensionInheritByPlacementId([UNRESOLVED_EXTENSION_ROW], {
+      tableId: "cynet_health_deal_sheet",
+    })
+  );
+  // Both arms are unsatisfiable for this row: no id, and '' never equals a real SKU. The Lorena
+  // case (CHC22011 taking ended CHC18361's detail) therefore stays blocked.
+  assert.match(sql, /'' AS resolved_sku_number/, "an absent SKU is an empty string, never NULL");
+  assert.match(
+    sql,
+    /ext\.resolved_sku_number != ''/,
+    "a blank SKU must not satisfy the fallback arm"
+  );
+});
+
+test("prior-EXTENSION tier: the SKU arm cannot fire on a row that already has an id", async () => {
+  const [sql] = await captureSql(() =>
+    fetchExtensionPriorExtensionInheritByPlacementId(
+      [{ ...SKU_ONLY_EXTENSION_ROW, CONTRACT_ID: "CHC20745" }],
+      { tableId: "cynet_health_deal_sheet" }
+    )
+  );
+  // A resolved row is judged by its id alone — the SKU arm is gated on resolved_contract_id = ''.
+  assert.match(sql, /'CHC20745' AS resolved_contract_id/);
+  assert.match(
+    sql,
+    /ext\.resolved_contract_id = ''\s*\n?\s*AND ext\.resolved_sku_number != ''/,
+    "the SKU arm stays gated on an unresolved id"
+  );
+});
+
+test("prior-EXTENSION tier: SKU is a contract key, never a substitute for the identity join", async () => {
+  const [sql] = await captureSql(() =>
+    fetchExtensionPriorExtensionInheritByPlacementId([SKU_ONLY_EXTENSION_ROW], {
+      tableId: "cynet_health_deal_sheet",
+    })
+  );
+  // The 4-field identity and the forward-date guard both still apply on top of the SKU arm.
+  assert.match(sql, /p\.CANDIDATE_ID = ext\.candidate_nexus_id/);
+  assert.match(sql, /p\.CLIENT_ID = ext\.client_id/);
+  assert.match(sql, /p\.START_DATE <= ext\.extension_start_date/);
+});

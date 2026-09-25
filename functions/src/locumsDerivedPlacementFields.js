@@ -122,6 +122,35 @@ function isCynetLocumsRecruiter(email) {
     .endsWith("@cynetlocums.com");
 }
 
+/** OFFERING value that marks a placement as locums business, whoever recruited it. */
+const OFFERING_LOCUMS = "LOCUMS";
+
+/**
+ * Is this ROW locums business?
+ *
+ * The recruiter email alone is not enough. Rows route to cynet_locums_deal_sheet on OFFERING as
+ * well — the GOV desk sits on @cynethealth.com and places locums work — so a row keyed only on the
+ * email lands in the locums table and then takes cynet health's derivations. That is what produced
+ * deal sheet 5161506 (yogesh.t@cynethealth.com, OFFERING=LOCUMS): GROSS_MARGIN was overwritten with
+ * a computed figure instead of Nexus's hourly_revenue (250.25 arrived, 249.25 was stored), and the
+ * *_NEW rate family survived the sanitizer that should have stripped it.
+ *
+ * Mirrors resolveActiveDealSheetTableIdForRow's rule, so what decides the TABLE also decides the
+ * derivations written into it.
+ *
+ * @param {Record<string, *>|null|undefined} row
+ * @returns {boolean}
+ */
+function isLocumsDealSheetRow(row) {
+  if (!row || typeof row !== "object") return false;
+  if (isCynetLocumsRecruiter(row.ASSIGNMENT_RECRUITER_EMAIL)) return true;
+  return (
+    String(row.OFFERING ?? "")
+      .trim()
+      .toUpperCase() === OFFERING_LOCUMS
+  );
+}
+
 /**
  * Locums tax type from Nexus deal sheet ten_ninty_nine_checked.
  * true (1099) -> "1099"; false/null -> null (W2 path).
@@ -264,13 +293,27 @@ function computeLocumsSheetGrossMargin(row, finalBillRate, w2PayRate, finalPayRa
   return round2(finalBillRate - finalPayRate);
 }
 
+/**
+ * GM_OT = CLIENT_OT_RATE x (1 - MSP fee) - ((OT_RATE x 1.14) + 1).
+ *
+ * The sheet's own formula, verbatim:
+ *   IFS(AR="","", AR="NA","NA", AR=$AR$1,"GM (OT)",
+ *       (AR*AS)<>0, (AS*(1-AP)) - ((AR*1.14)+1))
+ * with AR=OT_RATE, AS=CLIENT_OT_RATE, AP=CLIENT_MSP_FEE.
+ *
+ * The burden here is 1.14 — the same W2 burden used elsewhere in the locums sheet — not the 1.15
+ * this once carried. On a 230 OT rate the two differ by 2.30 (OT_RATE x 0.01).
+ *
+ * Both rates must be non-zero: the sheet's (AR*AS)<>0 guard, which leaves GM_OT blank when either
+ * side is missing rather than reporting a margin against a rate that was never agreed.
+ */
 function computeGmOt(row) {
   const otRate = toNumberOrNull(row?.OT_RATE);
   const clientOtRate = toNumberOrNull(row?.CLIENT_OT_RATE);
   const mspFeeFraction = normalizeMspFeeFraction(row?.CLIENT_MSP_FEE);
   if (otRate == null || otRate === 0) return null;
   if (clientOtRate != null && otRate * clientOtRate !== 0) {
-    return round2(clientOtRate * (1 - mspFeeFraction) - (otRate * 1.15 + 1));
+    return round2(clientOtRate * (1 - mspFeeFraction) - (otRate * 1.14 + 1));
   }
   return null;
 }
@@ -390,7 +433,7 @@ Object.freeze(LOCUMS_EXCLUDED_API_OWNED_COLUMNS);
  */
 function sanitizeLocumsDealSheetRow(row) {
   if (!row || typeof row !== "object") return row;
-  if (!isCynetLocumsRecruiter(row.ASSIGNMENT_RECRUITER_EMAIL)) return row;
+  if (!isLocumsDealSheetRow(row)) return row;
   const out = { ...row };
   for (const key of LOCUMS_EXCLUDED_API_OWNED_COLUMNS) {
     delete out[key];
@@ -400,6 +443,7 @@ function sanitizeLocumsDealSheetRow(row) {
 
 module.exports = {
   isCynetLocumsRecruiter,
+  isLocumsDealSheetRow,
   mapLocumsTypeFromTenNintyNine,
   computeLocumsDerivedPlacementFields,
   LOCUMS_ENTITY,

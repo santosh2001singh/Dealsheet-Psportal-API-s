@@ -28,7 +28,10 @@ const {
   effectiveMinFilterDate,
 } = require("./columnMappings");
 const { isCynetHealthCanadaRecruiter, isCanadaDealSheetRow, sanitizeCanadaDealSheetRow, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
-const { isCynetLocumsRecruiter, sanitizeLocumsDealSheetRow, LOCUMS_EXCLUDED_API_OWNED_COLUMNS } = require("./locumsDerivedPlacementFields");
+const {
+  isCynetLocumsRecruiter,
+  isLocumsDealSheetRow, sanitizeLocumsDealSheetRow, LOCUMS_EXCLUDED_API_OWNED_COLUMNS,
+} = require("./locumsDerivedPlacementFields");
 const { buildLocumsContractLookupKey } = require("./locumsRunrateLookup");
 
 /**
@@ -914,15 +917,16 @@ function normalizeForCompare(value) {
  */
 function shouldSkipDomainExcludedApiOwnedColumn(row, key) {
   if (isCanadaDealSheetRow(row) && CANADA_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
-  const email = row?.ASSIGNMENT_RECRUITER_EMAIL;
-  if (isCynetLocumsRecruiter(email) && LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
+  // On the ROW, not the email: a GOV-desk row (@cynethealth.com, OFFERING=LOCUMS) lives in the
+  // locums table, so the same columns must be excluded from its append compare.
+  if (isLocumsDealSheetRow(row) && LOCUMS_EXCLUDED_API_OWNED_COLUMNS.has(key)) return true;
   return false;
 }
 
 function hasBusinessColumnChanges(incomingRow, existingRow, ignoreFieldsSet) {
   if (!existingRow) return true;
-  const email = incomingRow?.ASSIGNMENT_RECRUITER_EMAIL;
-  const isDomainTypeDerived = isCanadaDealSheetRow(incomingRow) || isCynetLocumsRecruiter(email);
+  const isDomainTypeDerived =
+    isCanadaDealSheetRow(incomingRow) || isLocumsDealSheetRow(incomingRow);
   if (isDomainTypeDerived) {
     if (normalizeForCompare(incomingRow?.PAYMENT_TYPE) !== normalizeForCompare(existingRow?.PAYMENT_TYPE)) {
       return true;
@@ -4911,10 +4915,20 @@ function buildExtensionContractMatchStructLiterals(rows) {
       ? "''"
       : `'${escapeSqlString(resolvedContractId)}'`;
 
+    // The contract's SKU, as a stand-in identity for a row that has no CONTRACT_ID yet. A SKU is
+    // per-contract, so where the id is still blank it separates one of the candidate's contracts
+    // from the next exactly as the id would — see the prior-extension tier's guard for why an
+    // unresolved row needs a second key at all. Resolved before this runs: the legacy run-rate
+    // lookup in allocateContractIdsForInsertableRows fills SKU_NUMBER on EXTENSION rows, and that
+    // call precedes applyExtensionInheritForInsertRows in the insert path.
+    const skuNumber = normalizeLegacySkuOrNull(row.SKU_NUMBER);
+    const skuSql = skuNumber == null ? "''" : `'${escapeSqlString(skuNumber)}'`;
+
     structLiterals.push(
       `STRUCT(${Math.trunc(pid)} AS placement_id, ${Math.trunc(cand)} AS candidate_nexus_id, `
       + `'${email}' AS candidate_email, '${phone}' AS phone_number, ${Math.trunc(client)} AS client_id, `
-      + `${startDateSql} AS extension_start_date, ${contractIdSql} AS resolved_contract_id)`
+      + `${startDateSql} AS extension_start_date, ${contractIdSql} AS resolved_contract_id, `
+      + `${skuSql} AS resolved_sku_number)`
     );
   }
 
@@ -5255,12 +5269,22 @@ ${dateSkuJoinedSelect},
          -- guard INERT exactly when it was needed most, because a brand-new extension has no
          -- CONTRACT_ID yet, so '' disabled it and the previous contract walked back in
          -- (CANDIDATE_ID 21472994, Sep 2026: CHC22011's rows took ended contract CHC18361's
-         -- BACKOUT_OR_TERMINATION / COMMENTS / ST_DT_PUSHBACK_REASON). An unresolved row now
-         -- inherits NOTHING here instead of falling back to a guess -- see the parent-DEAL tier for
-         -- why every such proxy (date gap, job id) is an estimate -- and picks its detail up from
-         -- backfillExtensionParentInherit once its id is known.
-         AND ext.resolved_contract_id != ''
-         AND p.CONTRACT_ID = ext.resolved_contract_id
+         -- BACKOUT_OR_TERMINATION / COMMENTS / ST_DT_PUSHBACK_REASON).
+         --
+         -- SKU_NUMBER is the second arm, for the row that has no id YET. Requiring the id alone left
+         -- this tier shut for exactly the chain it exists to serve: an EXTENSION-only contract (no
+         -- DEAL row anywhere) whose next segment starts after a gap, so the run-rate window cannot
+         -- place it either. Live case (CANDIDATE_ID 16009590 "Ashley Saunders", PLACEMENT_ID
+         -- 1469883, Sep 2026): CHC20745 ran as four EXTENSION segments on SKU H14126; the fourth
+         -- began 2026-09-21, nine days after the third ended, matched nothing, and minted CHC23663
+         -- for a contract that already had an id.
+         -- A SKU is per-contract, so it draws the same line the id would: the CHC18361 case above
+         -- stays blocked, because that contract's SKU is not this one's.
+         AND ( ( ext.resolved_contract_id != ''
+                 AND p.CONTRACT_ID = ext.resolved_contract_id )
+            OR ( ext.resolved_contract_id = ''
+                 AND ext.resolved_sku_number != ''
+                 AND p.SKU_NUMBER = ext.resolved_sku_number ) )
       ),
       hierarchy_ranked AS (
         SELECT
@@ -5289,12 +5313,15 @@ ${hierarchyJoinedSelect},
          -- guard INERT exactly when it was needed most, because a brand-new extension has no
          -- CONTRACT_ID yet, so '' disabled it and the previous contract walked back in
          -- (CANDIDATE_ID 21472994, Sep 2026: CHC22011's rows took ended contract CHC18361's
-         -- BACKOUT_OR_TERMINATION / COMMENTS / ST_DT_PUSHBACK_REASON). An unresolved row now
-         -- inherits NOTHING here instead of falling back to a guess -- see the parent-DEAL tier for
-         -- why every such proxy (date gap, job id) is an estimate -- and picks its detail up from
-         -- backfillExtensionParentInherit once its id is known.
-         AND ext.resolved_contract_id != ''
-         AND p.CONTRACT_ID = ext.resolved_contract_id
+         -- BACKOUT_OR_TERMINATION / COMMENTS / ST_DT_PUSHBACK_REASON).
+         -- Same two-arm rule as the date/SKU tier above: the id when the row has one, otherwise the
+         -- SKU, so an EXTENSION-only chain resuming after a gap keeps its hierarchy and ops detail
+         -- instead of starting over. See that guard for the live case.
+         AND ( ( ext.resolved_contract_id != ''
+                 AND p.CONTRACT_ID = ext.resolved_contract_id )
+            OR ( ext.resolved_contract_id = ''
+                 AND ext.resolved_sku_number != ''
+                 AND p.SKU_NUMBER = ext.resolved_sku_number ) )
       )
       SELECT
         CAST(ds.placement_id AS STRING) AS placement_id,

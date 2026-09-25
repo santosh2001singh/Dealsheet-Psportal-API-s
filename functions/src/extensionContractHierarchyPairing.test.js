@@ -178,15 +178,28 @@ test("the prior-extension query carries the row's resolved CONTRACT_ID and guard
   const src = fs.readFileSync(path.join(__dirname, "bigQueryClient.js"), "utf8");
 
   assert.ok(
-    src.includes("AS resolved_contract_id)"),
+    src.includes("AS resolved_contract_id, "),
     "the match struct must carry the row's already-resolved CONTRACT_ID"
   );
 
-  const guard = "AND (ext.resolved_contract_id = '' OR p.CONTRACT_ID = ext.resolved_contract_id)";
-  const occurrences = src.split(guard).length - 1;
+  // The guard is two-armed: the CONTRACT_ID when the row has one, else its SKU. The original
+  // "ext.resolved_contract_id = '' OR <id match>" form is gone — it disabled the guard on exactly
+  // the brand-new rows that needed it. See extensionContractContinuityGuard.test.js for both arms.
+  const idArm = "( ext.resolved_contract_id != ''\n                 AND p.CONTRACT_ID = ext.resolved_contract_id )";
+  const skuArm = "( ext.resolved_contract_id = ''\n                 AND ext.resolved_sku_number != ''\n                 AND p.SKU_NUMBER = ext.resolved_sku_number )";
+
   assert.equal(
-    occurrences,
+    src.split(idArm).length - 1,
     2,
-    "both the date/SKU join and the hierarchy join must carry the contract guard"
+    "both the date/SKU join and the hierarchy join must carry the id arm"
+  );
+  assert.equal(
+    src.split(skuArm).length - 1,
+    2,
+    "both joins must carry the SKU arm for rows with no id yet"
+  );
+  assert.ok(
+    !src.includes("AND (ext.resolved_contract_id = '' OR p.CONTRACT_ID = ext.resolved_contract_id)"),
+    "the inert \"'' OR id\" form must not come back"
   );
 });

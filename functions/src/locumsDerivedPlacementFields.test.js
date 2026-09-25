@@ -372,3 +372,48 @@ test("LOADING_COST_EXCEPTION is a manual column so the sync never blanks it", ()
   const { MANUAL_COLUMNS } = require("./columnMappings");
   assert.equal(MANUAL_COLUMNS.has("LOADING_COST_EXCEPTION"), true);
 });
+
+// --- GM_OT --------------------------------------------------------------------------------
+// The sheet's own formula, verbatim:
+//   IFS(AR="","", AR="NA","NA", AR=$AR$1,"GM (OT)", (AR*AS)<>0, (AS*(1-AP)) - ((AR*1.14)+1))
+// with AR=OT_RATE, AS=CLIENT_OT_RATE, AP=CLIENT_MSP_FEE. The burden is 1.14, not 1.15 — this went
+// untested until Sep 2026, when the live Kirsten Carr row showed the two apart by OT_RATE x 0.01.
+
+test("GM_OT uses the 1.14 burden the sheet states", () => {
+  const out = computeLocumsDerivedPlacementFields(baseRow({
+    OT_RATE: 230,
+    CLIENT_OT_RATE: 338,
+    CLIENT_MSP_FEE: 0.0375,
+  }));
+  // 338 * (1 - 0.0375) - ((230 * 1.14) + 1) = 62.13
+  assert.equal(out.GM_OT, 62.13);
+  // The retired 1.15 would have given 59.82.
+  assert.notEqual(out.GM_OT, 59.82);
+});
+
+test("GM_OT normalises an MSP fee given as a percent", () => {
+  const asPercent = computeLocumsDerivedPlacementFields(baseRow({
+    OT_RATE: 230, CLIENT_OT_RATE: 338, CLIENT_MSP_FEE: 3.75,
+  }));
+  const asFraction = computeLocumsDerivedPlacementFields(baseRow({
+    OT_RATE: 230, CLIENT_OT_RATE: 338, CLIENT_MSP_FEE: 0.0375,
+  }));
+  assert.equal(asPercent.GM_OT, asFraction.GM_OT);
+});
+
+test("GM_OT is blank unless BOTH rates are non-zero", () => {
+  // The sheet's (AR*AS)<>0 guard: no margin is reported against a rate that was never agreed.
+  for (const over of [
+    { OT_RATE: 0, CLIENT_OT_RATE: 338 },
+    { OT_RATE: 230, CLIENT_OT_RATE: 0 },
+    { OT_RATE: null, CLIENT_OT_RATE: 338 },
+    { OT_RATE: 230, CLIENT_OT_RATE: null },
+    {},
+  ]) {
+    assert.equal(
+      computeLocumsDerivedPlacementFields(baseRow({ CLIENT_MSP_FEE: 0.0375, ...over })).GM_OT,
+      null,
+      JSON.stringify(over)
+    );
+  }
+});

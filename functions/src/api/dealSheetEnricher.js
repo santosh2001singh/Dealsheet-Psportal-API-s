@@ -56,7 +56,7 @@ const { computeNewRateFamily } = require("../w2PayRateNew");
 const { sanitizeCanadaDealSheetRow, isCanadaDealSheetRow, pickCanadaDealSheetHoursPart } = require("../canadaDerivedPlacementFields");
 const {
   sanitizeLocumsDealSheetRow,
-  isCynetLocumsRecruiter,
+  isLocumsDealSheetRow,
   mapLocumsTypeFromTenNintyNine,
 } = require("../locumsDerivedPlacementFields");
 const { shouldExcludeRowFromBigQuery } = require("../bqRowExclusions");
@@ -437,6 +437,8 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       .filter(Boolean)
   );
   const hasPreloadedSubmittals = preloadedSubmittals && preloadedSubmittals.size > 0;
+  // Only the locums sync asks for job rates — see the wave1 block below for why.
+  const fetchLocumsJobRates = String(options?.syncDomain ?? "").trim().toLowerCase() === "locums";
 
   const skipClientDetailFetchIds = new Set();
   const skipClientOfferingsFetchIds = new Set();
@@ -511,6 +513,24 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     wave1Ops.push({ k: "job", id });
   }
 
+  // Job rates, for LOCUMS jobs only.
+  //
+  // A locums deal sheet routinely lists only a few of its rates: deal sheet 5161506 carried six,
+  // none of them BR_GREATER_THAN_FOURTY or BR_HOLIDAY_RATE, while /api/job-rates/ for the same job
+  // had 338 and 390 — the figures the run-rate row shows. Without them CLIENT_OT_RATE and
+  // CLIENT_HOLIDAY_RATE land null and GM_OT, which needs CLIENT_OT_RATE, never computes.
+  //
+  // Locums-only on purpose: cynet health's deal sheets carry their own client rates, so adding a
+  // request per job there would cost a call per row against an edge that already throttles this
+  // sync, to fill columns that are not empty. The gate is the ROW (OFFERING or recruiter domain),
+  // the same rule that decides the table — see isLocumsDealSheetRow.
+  if (fetchLocumsJobRates) {
+    for (const id of jobIds) {
+      wave1Urls.push(buildUrl(`${config.nexus.baseUrl}/api/job-rates/`, { job_id: id }));
+      wave1Ops.push({ k: "jobrates", id });
+    }
+  }
+
   for (const id of candIds) {
     wave1Urls.push(`${config.nexus.baseUrl}/api/candidates/${encodeURIComponent(id)}/`);
     wave1Ops.push({ k: "cand", id });
@@ -573,6 +593,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
   const clientCostsByDs = new Map();
   const rateChangesByDs = new Map();
   const jobById = new Map();
+  const jobRatesByJob = new Map();
   const candidateById = new Map();
   const candidateTypesByCand = new Map();
   const clientById = new Map();
@@ -590,6 +611,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     else if (op.k === "clientcost") clientCostsByDs.set(op.id, extractItems(json));
     else if (op.k === "ratechg") rateChangesByDs.set(op.id, extractItems(json));
     else if (op.k === "job") jobById.set(op.id, json);
+    else if (op.k === "jobrates") jobRatesByJob.set(op.id, extractItems(json));
     else if (op.k === "cand") candidateById.set(op.id, json);
     else if (op.k === "candtype") candidateTypesByCand.set(op.id, extractItems(json));
     else if (op.k === "client") clientById.set(op.id, json);
@@ -969,7 +991,12 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     const mspPart = mapMspFromClientOfferingRow(clientOfferingRow);
 
     const ratesList = ratesByDs.get(String(dealSheetId)) ?? [];
-    const ratesPart = mapDealSheetRatesListToBq(ratesList, clientStateNorm);
+    // Job rates fill only the BR_* codes the deal sheet leaves absent, and are fetched for locums
+    // alone — every other domain passes null and behaves exactly as before.
+    const jobRatesList = fetchLocumsJobRates && jobId != null
+      ? jobRatesByJob.get(String(jobId)) ?? null
+      : null;
+    const ratesPart = mapDealSheetRatesListToBq(ratesList, clientStateNorm, jobRatesList);
     const positionPart = mapJobProfessionSpecialtyFromJob(jobObj);
 
     if (!submittalRow && !hasPreloadedSubmittals) {
@@ -990,13 +1017,16 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
 
     // Canada is decided by the placement's province (CLIENT_STATE), not the recruiter's email.
     const isCanadaRecruiter = isCanadaDealSheetRow({ CLIENT_STATE: clientStateNorm });
-    const isLocumsRecruiter = isCynetLocumsRecruiter(userPart?.ASSIGNMENT_RECRUITER_EMAIL);
+    // Decided on the ROW, not the email alone: OFFERING=LOCUMS routes a GOV-desk row
+    // (@cynethealth.com) into the locums table, so it must take the locums shape everywhere.
+    const locumsIdentity = {
+      ASSIGNMENT_RECRUITER_EMAIL: userPart?.ASSIGNMENT_RECRUITER_EMAIL,
+      OFFERING: jobPart?.OFFERING,
+    };
+    const isLocumsRecruiter = isLocumsDealSheetRow(locumsIdentity);
     // Built here rather than with the other parts above because the target column depends on the
-    // recruiter: Locums takes hourly revenue in GROSS_MARGIN, every other division in MARGIN.
-    const revenuePart = mapDealSheetRevenueDetailsToBq(
-      revenueRow,
-      userPart?.ASSIGNMENT_RECRUITER_EMAIL,
-    );
+    // row: Locums takes hourly revenue in GROSS_MARGIN, every other division in MARGIN.
+    const revenuePart = mapDealSheetRevenueDetailsToBq(revenueRow, locumsIdentity);
     const hoursPartForRow = isCanadaRecruiter ? pickCanadaDealSheetHoursPart(hoursPart) : hoursPart;
     const bonusTotalsPart = isCanadaRecruiter
       ? {}
