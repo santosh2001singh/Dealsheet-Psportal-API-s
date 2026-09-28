@@ -37,6 +37,7 @@ const {
   fetchRecruiterHierarchyReconciliation,
   buildOwnershipChangeLogRowsForHierarchyMoves,
   applyRecruiterHierarchyMovesToDealSheet,
+  applyLiveRecruiterHierarchyToDealSheet,
   fetchActiveExtensionRowsForInorganic,
   resolveExtensionInorganicLogRows,
   fetchDealSheetRecruiterChangePairsFromActive,
@@ -83,6 +84,7 @@ const {
   isCanadaDealSheetRow,
   submittalMayBeCanada,
   CANADA_EXCLUDED_API_OWNED_COLUMNS,
+  applyCanadaNlPerDiemCarryForward,
 } = require("./canadaDerivedPlacementFields");
 const {
   isLocumsDealSheetRow, LOCUMS_EXCLUDED_API_OWNED_COLUMNS,
@@ -93,6 +95,7 @@ const {
   normalizeSyncDomain,
   rowMatchesSyncDomain,
   resolveActiveDealSheetTableIdForDomain,
+  resolveSyncDomainForActiveTableId,
   buildActiveDealSheetRoutingSentinel,
   resolveEndedDealSheetTableId,
   resolveActiveDealSheetTableIdForRow,
@@ -228,6 +231,15 @@ function dedupeLogRowsByCompositeKey(rows, getKey) {
  * cynet health is NOT in this set and keeps writing these logs exactly as before.
  */
 const ENRICH_LOG_WRITES_DISABLED_DOMAINS = new Set(["canada", "locums"]);
+
+/**
+ * Domains with NO inorganic hierarchy (business rule, Sep 2026): a person is effective as soon as
+ * they are in the recruiter's chain, so the deal sheet itself carries the current chain
+ * (syncLiveRecruiterHierarchyForDomain) and inorganic_hierarchy_logs never gets their rows.
+ * PERMANENT — unlike ENRICH_LOG_WRITES_DISABLED_DOMAINS this is not a validation switch.
+ * Mirrors usesLiveRecruiterHierarchy in bigQueryClient.js, which applies the same rule per row.
+ */
+const LIVE_RECRUITER_HIERARCHY_DOMAINS = new Set(["canada", "locums"]);
 
 /** True when this run's domain should write the per-row enrich logs. */
 function domainWritesEnrichLogs(params) {
@@ -761,6 +773,8 @@ function shouldSkipDomainExcludedApiOwnedColumn(row, key) {
 function computeChangedFields(incomingRow, existingRow, ignoreFields) {
   const out = [];
   if (!existingRow) return out;
+  // Mirror hasBusinessColumnChanges: a defaulted NL per diem yields to the stored one.
+  incomingRow = applyCanadaNlPerDiemCarryForward(incomingRow, existingRow);
   const ignore = new Set((ignoreFields || []).map((x) => String(x).trim()).filter(Boolean));
   const isDomainTypeDerived =
     isCanadaDealSheetRow(incomingRow) || isLocumsDealSheetRow(incomingRow);
@@ -991,6 +1005,14 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   const effectiveTableId = explicitBqTable
     ? params.bq_table.trim()
     : resolveActiveDealSheetTableIdForRow(row);
+  // Log writes follow the ROW's domain (the table it lands in), not the caller's params: the manual
+  // HTTP endpoint passes no sync_domain, which the log gates read as "no domain -> write", so a
+  // canada placement refreshed by hand used to write canada log rows. Falls back to the caller's
+  // domain only when the table is not one of the three active ones.
+  const logParams = {
+    ...params,
+    sync_domain: resolveSyncDomainForActiveTableId(effectiveTableId) ?? params.sync_domain,
+  };
 
   const baselineScope =
     String(params.baseline_scope || "composite").trim().toLowerCase() === "deal_sheet_id"
@@ -1158,14 +1180,14 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
 
   let additionalCostLogWriteResult = null;
   if (action === "INSERTED" && additionalCostLogRows.length > 0) {
-    additionalCostLogWriteResult = await writeAdditionalCostLogRows(additionalCostLogRows, 0, params, {
+    additionalCostLogWriteResult = await writeAdditionalCostLogRows(additionalCostLogRows, 0, logParams, {
       insertedKeys: insertResult.insertedKeys instanceof Set ? insertResult.insertedKeys : new Set(),
     });
   }
 
   let terminationReasonLogWriteResult = null;
   if (action === "INSERTED" && terminationLogRows.length > 0) {
-    terminationReasonLogWriteResult = await writeTerminationReasonLogRows(terminationLogRows, 0, params, {
+    terminationReasonLogWriteResult = await writeTerminationReasonLogRows(terminationLogRows, 0, logParams, {
       insertedKeys: insertResult.insertedKeys instanceof Set ? insertResult.insertedKeys : new Set(),
     });
   }
@@ -1194,22 +1216,26 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   // The scheduled triggers do this table-wide; the refresh endpoint does it for just this row so the
   // logs appear as soon as the API is hit. Dedupe on the log table makes repeat calls idempotent.
   let ownershipHandoverLog = null;
-  try {
-    const handoverRows = await buildRecruiterHandoverOwnershipLogRows([responseData]);
-    if (handoverRows.length > 0) {
-      const owc = await insertOwnershipChangeLogBatch(handoverRows, 0, {
-        datasetId: config.ownershipChangeLogDatasetId,
-        tableId: config.ownershipChangeLogTableId,
-      });
-      ownershipHandoverLog = { built: handoverRows.length, inserted: owc.inserted, errorBatches: owc.errorBatches };
+  // Same domain gate as the scheduled scans: canada / locums write no ownership logs while they are
+  // being validated. Keyed on the row's domain (logParams), so the manual endpoint obeys it too.
+  if (domainWritesEnrichLogs(logParams)) {
+    try {
+      const handoverRows = await buildRecruiterHandoverOwnershipLogRows([responseData]);
+      if (handoverRows.length > 0) {
+        const owc = await insertOwnershipChangeLogBatch(handoverRows, 0, {
+          datasetId: config.ownershipChangeLogDatasetId,
+          tableId: config.ownershipChangeLogTableId,
+        });
+        ownershipHandoverLog = { built: handoverRows.length, inserted: owc.inserted, errorBatches: owc.errorBatches };
+        logLine(
+          `[refreshDealSheetByPlacementId] recruiter-handover ownership logs built=${handoverRows.length} inserted=${owc.inserted}`
+        );
+      }
+    } catch (ownErr) {
       logLine(
-        `[refreshDealSheetByPlacementId] recruiter-handover ownership logs built=${handoverRows.length} inserted=${owc.inserted}`
+        `[refreshDealSheetByPlacementId] ownership handover log write failed (non-fatal): ${String(ownErr?.message || ownErr).slice(0, 200)}`
       );
     }
-  } catch (ownErr) {
-    logLine(
-      `[refreshDealSheetByPlacementId] ownership handover log write failed (non-fatal): ${String(ownErr?.message || ownErr).slice(0, 200)}`
-    );
   }
 
   // Full inorganic-hierarchy scan (recruiter-change + CSM-divergence + recruiter-hierarchy
@@ -1221,9 +1247,11 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   // exactly once themselves (see dealSheetSyncUpdateTrigger / dealSheetSyncTrigger), so their
   // per-placement refreshes leave it OFF by default. Non-fatal.
   let inorganicScanLog = null;
-  if (params.refresh_run_inorganic_scan === true) {
+  if (params.refresh_run_inorganic_scan === true && domainWritesEnrichLogs(logParams)) {
     try {
       inorganicScanLog = await syncInorganicHierarchyLogsFromBigQuery({
+        // Only the refreshed row's own domain table is scanned.
+        sync_domain: logParams.sync_domain,
         deal_sheet_bq_dataset: effectiveDatasetId,
         bq_dataset: "rr_project_data",
         bq_table: "inorganic_hierarchy_logs",
@@ -1380,6 +1408,14 @@ async function backfillPlacementRecordFromNexus(params = {}) {
   const effectiveTableId = explicitBqTable
     ? params.bq_table.trim()
     : resolveActiveDealSheetTableIdForRow(row);
+  // Log writes follow the ROW's domain (the table it lands in), not the caller's params: the manual
+  // HTTP endpoint passes no sync_domain, which the log gates read as "no domain -> write", so a
+  // canada placement refreshed by hand used to write canada log rows. Falls back to the caller's
+  // domain only when the table is not one of the three active ones.
+  const logParams = {
+    ...params,
+    sync_domain: resolveSyncDomainForActiveTableId(effectiveTableId) ?? params.sync_domain,
+  };
 
   if (!applyUpdate) {
     return {
@@ -1436,14 +1472,14 @@ async function backfillPlacementRecordFromNexus(params = {}) {
 
   let additionalCostLogWriteResult = null;
   if (action === "INSERTED" && additionalCostLogRows.length > 0) {
-    additionalCostLogWriteResult = await writeAdditionalCostLogRows(additionalCostLogRows, 0, params, {
+    additionalCostLogWriteResult = await writeAdditionalCostLogRows(additionalCostLogRows, 0, logParams, {
       insertedKeys: insertResult.insertedKeys instanceof Set ? insertResult.insertedKeys : new Set(),
     });
   }
 
   let terminationReasonLogWriteResult = null;
   if (action === "INSERTED" && terminationLogRows.length > 0) {
-    terminationReasonLogWriteResult = await writeTerminationReasonLogRows(terminationLogRows, 0, params, {
+    terminationReasonLogWriteResult = await writeTerminationReasonLogRows(terminationLogRows, 0, logParams, {
       insertedKeys: insertResult.insertedKeys instanceof Set ? insertResult.insertedKeys : new Set(),
     });
   }
@@ -2645,13 +2681,34 @@ async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
       ? params.deal_sheet_bq_dataset.trim()
       : config.datasetId;
 
+  // The calling trigger's domain. Every source scan below reads ONLY that domain's deal sheet table.
+  // Inorganic hierarchy exists only in cynet health: canada / locums have none
+  // (LIVE_RECRUITER_HIERARCHY_DOMAINS), so their runs skip this scan outright and a call with no
+  // domain (manual HTTP) scans health alone rather than all three tables.
+  const requestedDomain = normalizeSyncDomain(params?.sync_domain);
+  if (requestedDomain != null && LIVE_RECRUITER_HIERARCHY_DOMAINS.has(requestedDomain)) {
+    logLine(
+      `[inorganic hierarchy logs BQ scan] SKIP: domain=${requestedDomain} has no inorganic hierarchy (live chain on the deal sheet instead)`
+    );
+    return {
+      inserted: 0,
+      total: 0,
+      csmDivergences: 0,
+      recruiterHierarchyDivergences: 0,
+      errorBatches: 0,
+      elapsed: "0s",
+      skippedDomain: requestedDomain,
+    };
+  }
+  const domain = requestedDomain ?? "health";
+
   const startMs = Date.now();
   logLine(
-    `[inorganic hierarchy logs BQ scan] === syncInorganicHierarchyLogsFromBigQuery START === dealSheetDataset=${dealSheetDatasetId} logTable=${config.projectId}.${logDatasetId}.${logTableId}`
+    `[inorganic hierarchy logs BQ scan] === syncInorganicHierarchyLogsFromBigQuery START === domain=${domain ?? "all"} dealSheetDataset=${dealSheetDatasetId} logTable=${config.projectId}.${logDatasetId}.${logTableId}`
   );
 
   // (1a) EXTENSION run-rate seed: domain run-rate INORGANIC_* validated via Department_Data.
-  const extensionRows = await fetchActiveExtensionRowsForInorganic({ datasetId: dealSheetDatasetId });
+  const extensionRows = await fetchActiveExtensionRowsForInorganic({ datasetId: dealSheetDatasetId, domain });
   logLine(`[inorganic hierarchy logs BQ scan] active EXTENSION rows=${extensionRows.length}`);
   const runrateRows = await resolveExtensionInorganicLogRows(extensionRows, {
     datasetId: dealSheetDatasetId,
@@ -2661,6 +2718,7 @@ async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
   // (1b) Recruiter-change path (DEAL + EXTENSION): live directory chain vs frozen organic.
   const recruiterChangePairs = await fetchDealSheetRecruiterChangePairsFromActive({
     datasetId: dealSheetDatasetId,
+    domain,
   });
   const recruiterChangeCandidates = [];
   const candidateFrozenLatest = [];
@@ -2696,7 +2754,9 @@ async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
 
   // Reconciliation drives the hierarchy MOVE (RM<->AM interchange) appends and the
   // ownership_change_logs vacate+fill rows below, AND (1c) its newPersons.
-  const reconResults = await fetchRecruiterHierarchyReconciliation({ datasetId: dealSheetDatasetId });
+  // Domain-scoped too, which also scopes the hierarchy MOVES in step (2): they are applied to each
+  // result's srcTable, so only this domain's deal sheet table can be written.
+  const reconResults = await fetchRecruiterHierarchyReconciliation({ datasetId: dealSheetDatasetId, domain });
 
   // (1c) Recruiter-hierarchy newPersons: a manager who appeared in the recruiter's live chain AFTER
   // the placement's hierarchy was frozen. Neither (1a) nor (1b) can see this — (1a) is EXTENSION-only
@@ -2786,6 +2846,33 @@ async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
 }
 
 /**
+ * Canada / Locums: keep each open placement's deal-sheet recruiter hierarchy equal to the recruiter's
+ * CURRENT chain (see applyLiveRecruiterHierarchyToDealSheet). This replaces, for these domains, what
+ * the inorganic scan does for health: no log row, the change lands directly on the deal sheet.
+ *
+ * Runs from both scheduled triggers for its domain. It writes the deal sheet, not a log table, so it
+ * is NOT gated by the log switches (ENRICH_LOG_WRITES_DISABLED_DOMAINS /
+ * SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS). Any other domain (or none) is a no-op.
+ */
+async function syncLiveRecruiterHierarchyForDomain(params = {}) {
+  const domain = normalizeSyncDomain(params?.sync_domain);
+  if (domain == null || !LIVE_RECRUITER_HIERARCHY_DOMAINS.has(domain)) {
+    return { skipped: true, domain, checked: 0, changed: 0, appended: 0 };
+  }
+  const datasetId =
+    typeof params.bq_dataset === "string" && params.bq_dataset.trim() !== ""
+      ? params.bq_dataset.trim()
+      : config.datasetId;
+  const startMs = Date.now();
+  const result = await applyLiveRecruiterHierarchyToDealSheet({ datasetId, domain });
+  const elapsed = formatDuration(Date.now() - startMs);
+  logLine(
+    `[live recruiter hierarchy] DONE domain=${domain} checked=${result.checked} changed=${result.changed} appended=${result.appended} elapsed=${elapsed}`
+  );
+  return { skipped: false, domain, ...result, elapsed };
+}
+
+/**
  * Scans active deal-sheet tables for per-role ownership handovers (recruiter / onsite AM / CSM
  * level, latest row vs the row before it) and appends one ownership_change_logs row per changed
  * role — plus a "vacated" row when a hierarchy person became the recruiter. Also scans consecutive
@@ -2807,12 +2894,15 @@ async function syncOwnershipChangeLogsFromBigQuery(params = {}) {
       ? params.deal_sheet_bq_dataset.trim()
       : config.datasetId;
 
+  // Scoped to the calling trigger's domain — see syncInorganicHierarchyLogsFromBigQuery.
+  const domain = normalizeSyncDomain(params?.sync_domain);
+
   const startMs = Date.now();
   logLine(
-    `[ownership change logs BQ scan] === syncOwnershipChangeLogsFromBigQuery START === dealSheetDataset=${dealSheetDatasetId} logTable=${config.projectId}.${logDatasetId}.${logTableId}`
+    `[ownership change logs BQ scan] === syncOwnershipChangeLogsFromBigQuery START === domain=${domain ?? "all"} dealSheetDataset=${dealSheetDatasetId} logTable=${config.projectId}.${logDatasetId}.${logTableId}`
   );
 
-  const pairs = await fetchDealSheetOwnershipChangePairsFromActive({ datasetId: dealSheetDatasetId });
+  const pairs = await fetchDealSheetOwnershipChangePairsFromActive({ datasetId: dealSheetDatasetId, domain });
 
   const rows = [];
   for (const [, { latest, previous }] of pairs) {
@@ -2827,6 +2917,7 @@ async function syncOwnershipChangeLogsFromBigQuery(params = {}) {
   // CONTRACT_ID chain: consecutive placements (by START_DATE) with ownership role diffs.
   const contractPairs = await fetchContractOwnershipChangePairsFromActive({
     datasetId: dealSheetDatasetId,
+    domain,
   });
   let contractChainBuilt = 0;
   for (const [, { latest, previous }] of contractPairs) {
@@ -2848,6 +2939,7 @@ async function syncOwnershipChangeLogsFromBigQuery(params = {}) {
       dealSheetDatasetId,
       datasetId: logDatasetId,
       tableId: logTableId,
+      domain,
     });
   } catch (ciErr) {
     logLine(`[ownership change logs BQ scan] candidate name/email overwrite failed (non-fatal): ${String(ciErr?.message || ciErr).slice(0, 200)}`);
@@ -2878,8 +2970,10 @@ async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
     typeof params.deal_sheet_bq_dataset === "string" && params.deal_sheet_bq_dataset.trim() !== ""
       ? params.deal_sheet_bq_dataset.trim()
       : config.datasetId;
+  // Scoped to the calling trigger's domain — see syncInorganicHierarchyLogsFromBigQuery.
+  const domain = normalizeSyncDomain(params?.sync_domain);
   const startMs = Date.now();
-  logLine(`[ownership change logs] === syncOwnershipChangeLogEffectiveDatesFromExtensions START ===`);
+  logLine(`[ownership change logs] === syncOwnershipChangeLogEffectiveDatesFromExtensions START === domain=${domain ?? "all"}`);
   // ownership_change_logs: keep START_DATE / END_DATE_PREVIOUS_OWNER / OWNERSHIP_EFFECTIVE_DATE in sync with
   // each placement's CURRENT deal-sheet row, matched by PLACEMENT_ID. Per row type: CONTRACT_CHAIN
   // rows use START_DATE-1 / START_DATE, everything else TENTATIVE_END_DATE / TENTATIVE_END_DATE+1. This
@@ -2889,6 +2983,7 @@ async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
     dealSheetDatasetId,
     datasetId: params.bq_dataset,
     tableId: params.bq_table,
+    domain,
   });
   // Deal-sheet recruiter-change rows: same rule as ownership — OWNERSHIP_EFFECTIVE_DATE = TENTATIVE_END_DATE + 1
   // (repairs rows previously overwritten to a wrong CONTRACT_ID MIN(extension START_DATE)).
@@ -3558,6 +3653,8 @@ module.exports = {
   syncExistingActiveDealSheetUpdatesFromBigQuery,
   syncRateChangeLogsFromBigQuery,
   syncInorganicHierarchyLogsFromBigQuery,
+  syncLiveRecruiterHierarchyForDomain,
+  LIVE_RECRUITER_HIERARCHY_DOMAINS,
   syncOwnershipChangeLogsFromBigQuery,
   syncOwnershipChangeLogEffectiveDatesFromExtensions,
   refreshPlacementRecordToBigQuery,

@@ -228,6 +228,21 @@ function resolveActiveDealSheetTableIdForDomain(domain) {
 }
 
 /**
+ * The domain that owns an active deal sheet table — the inverse of
+ * resolveActiveDealSheetTableIdForDomain. null for anything that is not one of the three active
+ * tables.
+ * @param {unknown} tableId
+ * @returns {"health"|"canada"|"locums"|null}
+ */
+function resolveSyncDomainForActiveTableId(tableId) {
+  const wanted = String(tableId ?? "").trim();
+  for (const [domain, table] of DOMAIN_TO_ACTIVE_TABLE) {
+    if (table === wanted) return domain;
+  }
+  return null;
+}
+
+/**
  * True when a row belongs to `domain`. A null/unknown domain matches everything, so callers can pass
  * the raw param straight through without branching.
  * @param {unknown} domain
@@ -270,6 +285,7 @@ module.exports = {
   SYNC_DOMAINS,
   normalizeSyncDomain,
   resolveActiveDealSheetTableIdForDomain,
+  resolveSyncDomainForActiveTableId,
   rowMatchesSyncDomain,
   buildActiveDealSheetRoutingSentinel,
   TABLE_CYNET_HEALTH,

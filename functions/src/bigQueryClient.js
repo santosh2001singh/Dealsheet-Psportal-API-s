@@ -13,6 +13,7 @@ const {
   ENDED_DEAL_SHEET_TABLE_IDS,
   resolveActiveDealSheetTableId,
   resolveActiveDealSheetTableIdForRow,
+  resolveActiveDealSheetTableIdForDomain,
   resolvePairedActiveTableId,
   resolvePairedEndedTableId,
   resolveRunrateTableIdForDealSheetTable,
@@ -27,7 +28,13 @@ const {
   startDateOnOrAfterUtcMin,
   effectiveMinFilterDate,
 } = require("./columnMappings");
-const { isCynetHealthCanadaRecruiter, isCanadaDealSheetRow, sanitizeCanadaDealSheetRow, CANADA_EXCLUDED_API_OWNED_COLUMNS } = require("./canadaDerivedPlacementFields");
+const {
+  isCynetHealthCanadaRecruiter,
+  isCanadaDealSheetRow,
+  sanitizeCanadaDealSheetRow,
+  CANADA_EXCLUDED_API_OWNED_COLUMNS,
+  applyCanadaNlPerDiemCarryForward,
+} = require("./canadaDerivedPlacementFields");
 const {
   isCynetLocumsRecruiter,
   isLocumsDealSheetRow, sanitizeLocumsDealSheetRow, LOCUMS_EXCLUDED_API_OWNED_COLUMNS,
@@ -925,6 +932,8 @@ function shouldSkipDomainExcludedApiOwnedColumn(row, key) {
 
 function hasBusinessColumnChanges(incomingRow, existingRow, ignoreFieldsSet) {
   if (!existingRow) return true;
+  // NL: a defaulted per diem yields to the stored (possibly hand-edited) one before comparing.
+  incomingRow = applyCanadaNlPerDiemCarryForward(incomingRow, existingRow);
   const isDomainTypeDerived =
     isCanadaDealSheetRow(incomingRow) || isLocumsDealSheetRow(incomingRow);
   if (isDomainTypeDerived) {
@@ -1334,7 +1343,8 @@ function applyManualColumnsCarryForward(incomingRow, baselineRow) {
   // must take the API value rather than freezing the manual one. Canada is keyed on the province.
   const skipManualType = isCanadaDealSheetRow(incomingRow) || isCynetLocumsRecruiter(email);
   const skipManualEntity = isCynetLocumsRecruiter(email);
-  const out = { ...incomingRow };
+  // Same resolution hasBusinessColumnChanges compared against, so the written row matches it.
+  const out = { ...applyCanadaNlPerDiemCarryForward(incomingRow, baselineRow) };
   for (const key of MANUAL_COLUMNS) {
     if (skipManualType && key === "PAYMENT_TYPE") continue;
     if (skipManualEntity && key === "ENTITY") continue;
@@ -3285,9 +3295,21 @@ function buildActiveChangeScanColumnList(tableId) {
 /**
  * Per-table SELECTs (explicit columns) for the change-detection scans, UNION ALL'd. Each row is
  * tagged with `_src` (source table id). Safe across domains with differing full schemas.
+ *
+ * `domain` scopes this to ONE domain's table ("health" | "canada" | "locums") instead of unioning
+ * all three. Every one of these shared audit-log scans (recruiter-change, CSM/hierarchy divergence,
+ * per-role ownership handover, contract-chain ownership) is invoked once per scheduled trigger, and
+ * each trigger owns exactly one domain — so without this a health trigger run's scan also read (and
+ * could write log rows for) canada and locums placements. Omitting `domain` keeps the old
+ * all-three behaviour for any caller that has not been updated yet.
+ * @param {string} datasetId
+ * @param {string|null} [domain] - "health" | "canada" | "locums", or null/omitted for all three
  */
-function buildActiveChangeScanUnionParts(datasetId) {
-  return ACTIVE_DEAL_SHEET_TABLE_IDS.map((tableId) => {
+function buildActiveChangeScanUnionParts(datasetId, domain = null) {
+  const tableIds = domain
+    ? [resolveActiveDealSheetTableIdForDomain(domain)]
+    : ACTIVE_DEAL_SHEET_TABLE_IDS;
+  return tableIds.map((tableId) => {
     const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
     const src = escapeSqlString(tableId);
     const columnList = buildActiveChangeScanColumnList(tableId);
@@ -3703,6 +3725,44 @@ const RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS = new Set([
   "COMMENTS",
 ]);
 Object.freeze(RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS);
+
+/**
+ * SQL for `same_location_by_id` in fetchExtensionRunrateBackfillByPlacementId: is the matched
+ * run-rate row (`r`) the same placement location as the extension (`e2`)?
+ *
+ * Default — IDs only. Names are spelled differently across the two tables and a facility can be
+ * renamed, so NEXUS_PARENT_CLIENT_ID + CLIENT_ID are the only trustworthy test. Both ids must be
+ * present on both sides and agree; anything else is "unknown or different location", never "same".
+ *
+ * Cynet Health Canada — NAMES. Its run-rate table carries no client ids at all, so the id test was
+ * false on every row and a Canada extension never received COMMENTS / BACKOUT_OR_TERMINATION /
+ * ST_DT_PUSHBACK_REASON. PARENT_CLIENT_NAME + FACILITY_NAME are compared the way the Canada DEAL
+ * lookup already matches (LOWER(TRIM(..)) equality, see fetchLegacyContractIdentityForDealRows).
+ * Both names must be non-empty on both sides, so a missing name still reads as "not same".
+ *
+ * Keyed on the run-rate table, so health and locums keep the id test unchanged.
+ *
+ * @param {string} runrateTableId
+ * @returns {string}
+ */
+function buildExtensionSameLocationSql(runrateTableId) {
+  if (runrateTableId === config.runrateCanadaTableId) {
+    return `          (
+            NULLIF(LOWER(TRIM(e2.deal_parent_client)), '') IS NOT NULL
+            AND LOWER(TRIM(r.runrate_parent_client)) = LOWER(TRIM(e2.deal_parent_client))
+            AND NULLIF(LOWER(TRIM(e2.deal_facility)), '') IS NOT NULL
+            AND LOWER(TRIM(r.runrate_facility)) = LOWER(TRIM(e2.deal_facility))
+          )`;
+  }
+  return `          (
+            NULLIF(e2.deal_parent_client_id, '') IS NOT NULL
+            AND r.runrate_parent_client_id IS NOT NULL
+            AND CAST(r.runrate_parent_client_id AS STRING) = e2.deal_parent_client_id
+            AND NULLIF(e2.deal_facility_id, '') IS NOT NULL
+            AND r.runrate_client_id IS NOT NULL
+            AND CAST(r.runrate_client_id AS STRING) = e2.deal_facility_id
+          )`;
+}
 
 /**
  * Hierarchy name + `_EMP_NO` columns an EXTENSION row takes from its matched legacy run-rate row.
@@ -5421,9 +5481,10 @@ async function fetchExtensionRunrateBackfillByPlacementId(rows, options = {}) {
   const runrateSelectHierarchy = runrateSelectColumnsUnique
     .map((col) => `      ${col} AS ${runrateAliasForColumn(col)}`)
     .join(",\n");
+  const sameLocationSql = buildExtensionSameLocationSql(runrateTableId);
   // Location-scoped narrative columns are nulled out unless the matched run-rate row is the same
-  // placement location by id (see RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS). Everything else is
-  // projected straight through.
+  // placement location (see RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS). Everything else is projected
+  // straight through.
   const bestMatchHierarchySelect = runrateSelectColumnsUnique
     .map((col) => {
       const src = `b.${runrateAliasForColumn(col)}`;
@@ -5657,19 +5718,9 @@ ${runrateSelectHierarchy}
       best_match AS (
         SELECT
           r.*,
-          -- Is the matched run-rate row the SAME placement location as this extension, judged on
-          -- IDs only? Names are spelled differently across the two tables and a facility can be
-          -- renamed, so NEXUS_PARENT_CLIENT_ID + CLIENT_ID are the only trustworthy test.
-          -- Both ids must be present on both sides and both must agree; anything else is "unknown
-          -- or different location", never "same".
-          (
-            NULLIF(e2.deal_parent_client_id, '') IS NOT NULL
-            AND r.runrate_parent_client_id IS NOT NULL
-            AND CAST(r.runrate_parent_client_id AS STRING) = e2.deal_parent_client_id
-            AND NULLIF(e2.deal_facility_id, '') IS NOT NULL
-            AND r.runrate_client_id IS NOT NULL
-            AND CAST(r.runrate_client_id AS STRING) = e2.deal_facility_id
-          ) AS same_location_by_id
+          -- Is the matched run-rate row the SAME placement location as this extension?
+${sameLocationSql}
+          AS same_location_by_id
         FROM ranked r
         JOIN extensions e2 ON e2.placement_id = r.placement_id
         WHERE r.rn = 1
@@ -5891,6 +5942,18 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
     ...EXTENSION_RUNRATE_MANUAL_COLUMNS,
   ];
 
+  // Canada / Locums take the managed recruiter hierarchy from the current directory instead
+  // (usesLiveRecruiterHierarchy), so none of the three sources may supply or overwrite it there.
+  const liveManaged = new Set([
+    ...LIVE_MANAGED_HIERARCHY_FIELDS,
+    ...EXTENSION_RUNRATE_HIERARCHY_COLUMNS.filter((col) => MANAGED_HIERARCHY_DESIGNATIONS.includes(col))
+      .flatMap((col) => [col, `${col}_EMP_NO`]),
+  ]);
+  const withoutLiveManaged = (cols) => cols.filter((col) => !liveManaged.has(col));
+  const liveParentFields = withoutLiveManaged(parentFields);
+  const livePriorExtensionFields = withoutLiveManaged(priorExtensionFields);
+  const liveRunrateFields = withoutLiveManaged(runrateFields);
+
   const eligibleSet = new Set(eligible.map((row) => String(row.PLACEMENT_ID).trim()));
   let parentBackfilledCount = 0;
   let priorExtensionBackfilledCount = 0;
@@ -5912,12 +5975,13 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
 
     let current = row;
     let rowChanged = false;
+    const live = usesLiveRecruiterHierarchy(row);
 
     const parentMerged = mergeExtensionBackfillFields(
       current,
       parentByPlacementId.get(key),
-      parentFields,
-      parentHierarchyOverwriteFields
+      live ? liveParentFields : parentFields,
+      live ? withoutLiveManaged(parentHierarchyOverwriteFields) : parentHierarchyOverwriteFields
     );
     if (parentMerged.changed) {
       current = parentMerged.row;
@@ -5928,7 +5992,7 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
     const priorExtensionMerged = mergeExtensionBackfillFields(
       current,
       priorExtensionByPlacementId.get(key),
-      priorExtensionFields
+      live ? livePriorExtensionFields : priorExtensionFields
     );
     if (priorExtensionMerged.changed) {
       current = priorExtensionMerged.row;
@@ -5939,7 +6003,7 @@ async function applyExtensionInheritForInsertRows(rows, options = {}, deps = {})
     const runrateMerged = mergeExtensionBackfillFields(
       current,
       runrateByPlacementId.get(key),
-      runrateFields
+      live ? liveRunrateFields : runrateFields
     );
     if (runrateMerged.changed) {
       current = runrateMerged.row;
@@ -6042,6 +6106,36 @@ async function applyExtensionRunrateBackfillForInsertRows(rows, options = {}, de
 /** All name + emp-no fields filled by the DEAL recruiter-hierarchy backfill. */
 const DEAL_RECRUITER_HIERARCHY_FIELDS = DEAL_RECRUITER_HIERARCHY_TARGETS.flatMap(
   ({ column, empNoColumn }) => [column, empNoColumn]
+);
+
+/**
+ * Cynet Health Canada and Cynet Locums have NO inorganic hierarchy.
+ *
+ * Health freezes a placement's recruiter hierarchy at hire (NEW_HIRE_DATE snapshot for a DEAL,
+ * run-rate / parent DEAL for an EXTENSION) and records anyone who joins the chain later in
+ * inorganic_hierarchy_logs. Canada and Locums do not work that way: a person is effective the moment
+ * they are in the recruiter's chain. So for their rows (business rule, Sep 2026):
+ *   - DEAL and EXTENSION inserts take the recruiter's CURRENT chain from the directory;
+ *   - an EXTENSION does not inherit the managed hierarchy from its parent DEAL / prior extension /
+ *     run-rate row (that would bring back a stale chain);
+ *   - while the placement is not ENDED, a chain change is written straight onto the deal sheet by
+ *     applyLiveRecruiterHierarchyToDealSheet, as a new appended version;
+ *   - no inorganic_hierarchy_logs row is ever written (see syncInorganicHierarchyLogsFromBigQuery).
+ * Keyed on the ROW (Canada by CLIENT_STATE province, Locums by recruiter email / OFFERING).
+ * @param {Record<string, *>|null|undefined} row
+ * @returns {boolean}
+ */
+function usesLiveRecruiterHierarchy(row) {
+  return isCanadaDealSheetRow(row) || isLocumsDealSheetRow(row);
+}
+
+/**
+ * The auto-managed recruiter-hierarchy name + emp-no fields — the ones a live chain owns.
+ * SECONDARY_RECRUITER / SECONDARY_AM stay out: they are manual fields (MANAGED_HIERARCHY_DESIGNATIONS).
+ */
+const LIVE_MANAGED_HIERARCHY_FIELDS = Object.freeze(
+  DEAL_RECRUITER_HIERARCHY_TARGETS.filter((t) => MANAGED_HIERARCHY_DESIGNATIONS.includes(t.column))
+    .flatMap(({ column, empNoColumn }) => [column, empNoColumn])
 );
 
 /** The placeholder the business uses for a hierarchy role nobody holds. */
@@ -6284,12 +6378,17 @@ function vacateDuplicatePersonHierarchyRoles(row, titleColumnByEmpNo = null) {
  * True for brand-new DEAL rows eligible for insert-time recruiter-hierarchy backfill from the
  * employee directory. Mirrors rowNeedsExtensionInsertBackfill's shape for the DEAL side.
  */
-function rowNeedsDealRecruiterHierarchyBackfill(row) {
+function rowNeedsDealRecruiterHierarchyBackfill(row, options = {}) {
   if (!row || typeof row !== "object") return false;
   // Update-appends carry hierarchy forward verbatim (frozen at first insert); never re-derive,
   // or a MOVE-vacated field would be re-filled from the hire-date snapshot.
   if (row.__CARRIED_FORWARD_UPDATE === true) return false;
-  if (normalizeDealTypeKey(row.DEAL_TYPE) !== "DEAL") return false;
+  const dealType = normalizeDealTypeKey(row.DEAL_TYPE);
+  // Canada / Locums EXTENSION rows take the current directory chain too (usesLiveRecruiterHierarchy),
+  // as do the rows the live-hierarchy scan resolves (options.currentChain).
+  const liveExtension =
+    dealType === "EXTENSION" && (options?.currentChain === true || usesLiveRecruiterHierarchy(row));
+  if (dealType !== "DEAL" && !liveExtension) return false;
   if (row.ASSIGNMENT_RECRUITER_EMAIL == null || String(row.ASSIGNMENT_RECRUITER_EMAIL).trim() === "") {
     return false;
   }
@@ -6498,7 +6597,10 @@ async function fetchDealRecruiterHierarchyByPlacementId(rows, options = {}, deps
     const externalId = norm ? directoryByEmail.get(norm)?.externalId : null;
     if (!externalId) continue;
     const key = String(pid).trim();
-    targets.push({ key, externalId, anchorDate: row?.NEW_HIRE_DATE ?? null });
+    // Canada / Locums (and the live-hierarchy scan) take the recruiter's CURRENT chain: no anchor +
+    // on_or_after = each level's most recent snapshot. Everyone else is anchored on NEW_HIRE_DATE.
+    const live = options?.currentChain === true || usesLiveRecruiterHierarchy(row);
+    targets.push({ key, externalId, anchorDate: live ? null : row?.NEW_HIRE_DATE ?? null, live });
     const curEmp = normalizeExtensionRunrateBackfillValue(row?.RECRUITER_EMP_NO);
     if (curEmp != null) currentRecruiterEmpByKey.set(key, String(curEmp).trim().toUpperCase());
   }
@@ -6507,7 +6609,17 @@ async function fetchDealRecruiterHierarchyByPlacementId(rows, options = {}, deps
   // Never forward `options` here: it carries the destination deal-sheet table's datasetId/tableId
   // (from insertEnrichedDealSheetBatch), which would make this query the wrong table entirely —
   // the hierarchy lookup always targets the fixed directory_employee_hierarchy table.
-  const levelsByKey = await fetchHierarchyLevelChainsByKey(targets, { direction: "on_or_before" });
+  // An empty target list issues no query, so a batch of one kind costs one lookup, as before.
+  const levelsByKey = new Map([
+    ...(await fetchHierarchyLevelChainsByKey(
+      targets.filter((t) => !t.live),
+      { direction: "on_or_before" }
+    )),
+    ...(await fetchHierarchyLevelChainsByKey(
+      targets.filter((t) => t.live),
+      { direction: "on_or_after" }
+    )),
+  ]);
 
   for (const [placementId, levelRows] of levelsByKey) {
     const entry = {};
@@ -6549,7 +6661,7 @@ async function fetchDealRecruiterHierarchyByPlacementId(rows, options = {}, deps
 async function applyDealRecruiterHierarchyForInsertRows(rows, options = {}, deps = {}) {
   if (!rows || rows.length === 0) return rows;
 
-  const eligible = rows.filter(rowNeedsDealRecruiterHierarchyBackfill);
+  const eligible = rows.filter((row) => rowNeedsDealRecruiterHierarchyBackfill(row, options));
   if (eligible.length === 0) return rows;
 
   const fetchFn = deps.fetchFn ?? fetchDealRecruiterHierarchyByPlacementId;
@@ -7055,7 +7167,7 @@ async function fetchRecruiterHierarchyReconciliation(options = {}, deps = {}) {
 
   const checkedDesignations = MANAGED_HIERARCHY_DESIGNATIONS;
   const nonBlankPredicate = checkedDesignations.map((col) => `TRIM(IFNULL(${col}, '')) != ''`).join(" OR ");
-  const unionParts = buildActiveChangeScanUnionParts(datasetId);
+  const unionParts = buildActiveChangeScanUnionParts(datasetId, options.domain ?? null);
 
   const sql = `WITH all_rows AS (
                  ${unionParts.join("\n                 UNION ALL\n                 ")}
@@ -7286,6 +7398,108 @@ async function applyRecruiterHierarchyMovesToDealSheet(reconResults, options = {
 }
 
 /**
+ * Canada / Locums: write each open placement's CURRENT recruiter chain onto its deal sheet.
+ *
+ * These domains have no inorganic hierarchy (see usesLiveRecruiterHierarchy): a person is
+ * effective as soon as they are in the recruiter's chain. For every placement of `options.domain`
+ * whose latest row is not ENDED (LIKE 'ENDED%', same stop as the health reconciliation), this
+ * resolves the chain exactly as a fresh insert would — current directory snapshot, same
+ * self-reference / duplicate-person vacate rules — and, when any managed field differs from the
+ * stored one, appends a new version of the row with the chain replaced (via
+ * applyRecruiterHierarchyMovesToDealSheet, so every other column is carried verbatim).
+ *
+ * A recruiter the directory cannot resolve yields no chain at all; that placement is skipped
+ * rather than having its hierarchy wiped. SECONDARY_RECRUITER / SECONDARY_AM are never touched.
+ *
+ * @param {object} options - { datasetId, domain: "canada" | "locums" }
+ * @param {object} [deps] - { queryFn, resolveFn, appendFn } for tests
+ * @returns {Promise<{checked: number, changed: number, appended: number}>}
+ */
+async function applyLiveRecruiterHierarchyToDealSheet(options = {}, deps = {}) {
+  const datasetId =
+    typeof options.datasetId === "string" && options.datasetId.trim() !== ""
+      ? options.datasetId.trim()
+      : config.datasetId;
+  const tableId = resolveActiveDealSheetTableIdForDomain(options.domain);
+  if (!tableId) return { checked: 0, changed: 0, appended: 0 };
+
+  const queryFn = deps.queryFn ?? queryObjects;
+  const resolveFn = deps.resolveFn ?? applyDealRecruiterHierarchyForInsertRows;
+  const appendFn = deps.appendFn ?? applyRecruiterHierarchyMovesToDealSheet;
+
+  // Canada has no AVP role, so only fields its table actually has are read or written.
+  const missing = resolveDealSheetMissingColumns(tableId);
+  const fields = LIVE_MANAGED_HIERARCHY_FIELDS.filter((col) => !missing.has(col));
+  const columns = [
+    "DEAL_SHEET_ID",
+    "PLACEMENT_ID",
+    "PLACEMENT_STATUS",
+    "DEAL_TYPE",
+    "ASSIGNMENT_RECRUITER_EMAIL",
+    "RECRUITER_EMP_NO",
+    ...fields,
+  ];
+  const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
+  // Latest row per placement FIRST, then the ENDED filter — filtering first would pick an older,
+  // not-yet-ended version of a placement that has since ended.
+  const sql = `SELECT * EXCEPT(rn) FROM (
+                 SELECT ${columns.join(", ")},
+                   ROW_NUMBER() OVER (
+                     PARTITION BY CAST(DEAL_SHEET_ID AS STRING), CAST(PLACEMENT_ID AS STRING)
+                     ORDER BY LAST_UPDATED DESC NULLS LAST
+                   ) AS rn
+                 FROM ${fqn}
+                 WHERE DEAL_SHEET_ID IS NOT NULL AND PLACEMENT_ID IS NOT NULL
+               )
+               WHERE rn = 1
+                 AND UPPER(TRIM(IFNULL(PLACEMENT_STATUS, ''))) NOT LIKE 'ENDED%'
+                 AND UPPER(TRIM(IFNULL(DEAL_TYPE, ''))) IN ('DEAL', 'EXTENSION')
+                 AND TRIM(IFNULL(ASSIGNMENT_RECRUITER_EMAIL, '')) != ''`;
+  const stored = await queryFn(sql, 100000);
+  if (!stored || stored.length === 0) return { checked: 0, changed: 0, appended: 0 };
+
+  // Resolve on a copy with the hierarchy blanked, so it is filled exactly like a fresh insert and no
+  // stale stored value can survive or trip the duplicate-person rule.
+  const blanked = stored.map((row) => {
+    const copy = { ...row };
+    for (const col of DEAL_RECRUITER_HIERARCHY_FIELDS) copy[col] = null;
+    return copy;
+  });
+  const resolved = await resolveFn(blanked, { currentChain: true }, deps);
+
+  const updates = [];
+  for (let i = 0; i < stored.length; i++) {
+    const before = stored[i];
+    const after = resolved[i] || {};
+    // Nothing resolved = recruiter not in the directory. Skip rather than wipe the hierarchy.
+    if (!fields.some((col) => !isEmptyDateFieldValue(after[col]))) continue;
+    const differs = fields.some(
+      (col) => normalizeForCompare(after[col]) !== normalizeForCompare(before[col])
+    );
+    if (!differs) continue;
+    const updatedFields = {};
+    for (const col of fields) {
+      updatedFields[col] = isEmptyDateFieldValue(after[col]) ? null : after[col];
+    }
+    updates.push({
+      srcTable: tableId,
+      DEAL_SHEET_ID: before.DEAL_SHEET_ID,
+      PLACEMENT_ID: before.PLACEMENT_ID,
+      moves: ["LIVE_RECRUITER_HIERARCHY"],
+      updatedFields,
+    });
+  }
+
+  const appendResult = updates.length > 0
+    ? await appendFn(updates, { datasetId })
+    : { appended: 0 };
+  logDetail(
+    `[live recruiter hierarchy] domain=${options.domain} table=${tableId} checked=${stored.length} changed=${updates.length} appended=${appendResult.appended}`
+  );
+  return { checked: stored.length, changed: updates.length, appended: appendResult.appended };
+}
+
+/**
  * Merges recruiter-change, CSM-divergence, and recruiter-hierarchy-divergence candidates by
  * DEAL_SHEET_ID+PLACEMENT_ID so a placement with multiple signals in the same scan produces
  * exactly one log row.
@@ -7336,7 +7550,7 @@ async function fetchDealSheetRecruiterChangePairsFromActive(options = {}) {
       ? options.datasetId.trim()
       : config.datasetId;
 
-  const unionParts = buildActiveChangeScanUnionParts(datasetId);
+  const unionParts = buildActiveChangeScanUnionParts(datasetId, options.domain ?? null);
 
   const sql = `WITH all_rows AS (
                  ${unionParts.join("\n                 UNION ALL\n                 ")}
@@ -7705,7 +7919,8 @@ async function resolveInorganicHierarchyLogRows(candidates, options = {}, deps =
 /**
  * Latest active-table row per placement for DEAL_TYPE = EXTENSION (fields needed to seed inorganic
  * from run-rate). One row per DEAL_SHEET_ID + PLACEMENT_ID (newest LAST_UPDATED).
- * @param {object} [options] - { datasetId }
+ * @param {object} [options] - { datasetId, domain } — `domain` scopes the scan to one domain's table
+ *   (see buildActiveChangeScanUnionParts); omit for all three.
  * @param {object} [deps] - { queryFn }
  * @returns {Promise<object[]>}
  */
@@ -7715,6 +7930,9 @@ async function fetchActiveExtensionRowsForInorganic(options = {}, deps = {}) {
       ? options.datasetId.trim()
       : config.datasetId;
   const queryFn = deps.queryFn ?? queryObjects;
+  const tableIds = options.domain
+    ? [resolveActiveDealSheetTableIdForDomain(options.domain)]
+    : ACTIVE_DEAL_SHEET_TABLE_IDS;
 
   const cols = [
     "DEAL_SHEET_ID",
@@ -7728,7 +7946,7 @@ async function fetchActiveExtensionRowsForInorganic(options = {}, deps = {}) {
     "CONTRACT_ID",
   ];
   const columnList = cols.join(", ");
-  const unionParts = ACTIVE_DEAL_SHEET_TABLE_IDS.map((tableId) => {
+  const unionParts = tableIds.map((tableId) => {
     const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
     return `SELECT ${columnList} FROM ${fqn}
             WHERE DEAL_SHEET_ID IS NOT NULL AND PLACEMENT_ID IS NOT NULL
@@ -8231,7 +8449,7 @@ async function fetchDealSheetOwnershipChangePairsFromActive(options = {}) {
       ? options.datasetId.trim()
       : config.datasetId;
 
-  const unionParts = buildActiveChangeScanUnionParts(datasetId);
+  const unionParts = buildActiveChangeScanUnionParts(datasetId, options.domain ?? null);
 
   // A role "changed" when latest's normalized value differs from previous AND latest is non-empty
   // (a genuine new owner — pure removals aren't logged here). Matches OWNERSHIP_CHANGE_DIFF_ROLES.
@@ -8300,7 +8518,7 @@ async function fetchLatestOwnershipRowsPerContractPlacement(options = {}) {
     typeof options.datasetId === "string" && options.datasetId.trim() !== ""
       ? options.datasetId.trim()
       : config.datasetId;
-  const unionParts = buildActiveChangeScanUnionParts(datasetId);
+  const unionParts = buildActiveChangeScanUnionParts(datasetId, options.domain ?? null);
   const sql = `WITH all_rows AS (
                  ${unionParts.join("\n                 UNION ALL\n                 ")}
                ),
@@ -8329,10 +8547,13 @@ async function fetchContractOwnershipChangePairsFromActive(options = {}) {
     typeof options.datasetId === "string" && options.datasetId.trim() !== ""
       ? options.datasetId.trim()
       : config.datasetId;
-  const latestRows = await fetchLatestOwnershipRowsPerContractPlacement({ datasetId });
+  const latestRows = await fetchLatestOwnershipRowsPerContractPlacement({
+    datasetId,
+    domain: options.domain ?? null,
+  });
   const out = buildConsecutiveContractPlacementPairs(latestRows, ownershipChangeRolesDiffer);
   logDetail(
-    `[ownership change logs] fetchContractOwnershipChangePairsFromActive dataset=${datasetId} pairs=${out.size}`
+    `[ownership change logs] fetchContractOwnershipChangePairsFromActive dataset=${datasetId} domain=${options.domain ?? "all"} pairs=${out.size}`
   );
   return out;
 }
@@ -8946,10 +9167,13 @@ async function overwriteOwnershipChangeLogCandidateInfoFromDealSheet(options = {
       : config.ownershipChangeLogTableId;
 
   // Base union lacks CANDIDATE_NAME / LAST_UPDATED — project them so we can pick the latest row.
-  const unionSql = buildActiveDealSheetsUnionSql(dealSheetDatasetId, undefined, [
-    "CANDIDATE_NAME",
-    "LAST_UPDATED",
-  ]);
+  // `domain` scopes the source to that domain's table, so a health run never rewrites another
+  // domain's log rows (see buildActiveChangeScanUnionParts).
+  const unionSql = buildActiveDealSheetsUnionSql(
+    dealSheetDatasetId,
+    options.domain ? resolveActiveDealSheetTableIdForDomain(options.domain) : undefined,
+    ["CANDIDATE_NAME", "LAST_UPDATED"]
+  );
 
   const sql = `
     UPDATE \`${config.projectId}.${logDatasetId}.${logTableId}\` o
@@ -9310,10 +9534,12 @@ async function overwriteOwnershipChangeLogDatesFromPlacements(options = {}) {
       : config.ownershipChangeLogTableId;
 
   // START_DATE + PLACEMENT_ID are in the base union columns; TENTATIVE_END_DATE + LAST_UPDATED are not.
-  const unionSql = buildActiveDealSheetsUnionSql(dealSheetDatasetId, undefined, [
-    "TENTATIVE_END_DATE",
-    "LAST_UPDATED",
-  ]);
+  // `domain` scopes the source to that domain's table (see buildActiveChangeScanUnionParts).
+  const unionSql = buildActiveDealSheetsUnionSql(
+    dealSheetDatasetId,
+    options.domain ? resolveActiveDealSheetTableIdForDomain(options.domain) : undefined,
+    ["TENTATIVE_END_DATE", "LAST_UPDATED"]
+  );
 
   const sql = `
     UPDATE \`${config.projectId}.${logDatasetId}.${logTableId}\` o
@@ -9389,7 +9615,10 @@ async function overwriteOwnershipChangeLogEffectiveDatesFromExtensions(options =
         ? options.tableId.trim()
         : config.ownershipChangeLogTableId,
   };
-  const unionSql = buildActiveDealSheetsUnionSql(dealSheetDatasetId);
+  const unionSql = buildActiveDealSheetsUnionSql(
+    dealSheetDatasetId,
+    options.domain ? resolveActiveDealSheetTableIdForDomain(options.domain) : undefined
+  );
 
   const sql = `
     UPDATE \`${config.projectId}.${logDatasetId}.${logTableId}\` o
@@ -9544,6 +9773,10 @@ module.exports = {
   EXTENSION_RUNRATE_HIERARCHY_COLUMNS,
   EXTENSION_RUNRATE_MANUAL_COLUMNS,
   RUNRATE_LOCATION_SCOPED_MANUAL_COLUMNS,
+  buildExtensionSameLocationSql,
+  usesLiveRecruiterHierarchy,
+  LIVE_MANAGED_HIERARCHY_FIELDS,
+  applyLiveRecruiterHierarchyToDealSheet,
   DEAL_SHEET_MISSING_COLUMNS_BY_TABLE,
   resolveDealSheetMissingColumns,
   RATE_CHANGE_LOG_EXCLUDED_TABLE_IDS,

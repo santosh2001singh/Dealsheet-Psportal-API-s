@@ -72,6 +72,18 @@ Two deliberate departures from the older sheet formulas, both confirmed with the
 
 A "No business" province + T4A yields a **NULL** pay rate, never an invented 1.0 multiplier.
 
+### NL weekly per diem — $70 default, editable on the RR-Dashboard (2026-09-25)
+Nexus `lodging_amount`/`meal_amount` read 0 for NL, though the run-rate has $70 on 92/93 NL rows
+(asked Sunil which field holds it — no answer). The sync now defaults NL to **70** when Nexus sends
+0/null, and a user overrides it per row in the RR-Dashboard Edit modal
+(`src/utils/canadaPerDiemRecalc.js` there, which recomputes T4/FINAL_PAY/FINAL_COST/both margins).
+- Precedence: real Nexus per diem > stored value (incl. a typed 0) > 70. The stored value wins only
+  when the incoming one is our default — see `applyCanadaNlPerDiemCarryForward`, hooked into
+  `hasBusinessColumnChanges`, `applyManualColumnsCarryForward` and `computeChangedFields`.
+- Frontend and backend formulas must agree to the cent, or the sync sees a change and appends.
+- `sql/backfill_canada_nl_default_per_diem.sql` must run **before** the first sync with this code:
+  the old stored 0s are otherwise indistinguishable from a typed 0 and would be kept forever.
+
 ### STILL OPEN — BC bill-rate 4% uplift
 The NS sheet's Final Bill Rate carried an extra BC branch (`Bill_Rate * 1.04 * (1 - fee)`), but BC's
 own sheet has no such uplift and the AB sheet explicitly says not to apply it. The code uses the
@@ -104,6 +116,11 @@ drops three health has. Both directions live in per-table maps, never in the sha
 
 `ENTITY` defaults to `"CANADA HEALTH"` — fill-if-empty only; a run-rate or hand-edited value wins.
 
+EXTENSION rows only take `COMMENTS` / `BACKOUT_OR_TERMINATION` / `ST_DT_PUSHBACK_REASON` from a
+run-rate row at the SAME location. Health/locums judge that on client IDs; Canada's run-rate has
+none, so Canada compares `PARENT_CLIENT_NAME` + `FACILITY_NAME` instead (2026-09-25,
+`buildExtensionSameLocationSql`). Before that, Canada extensions never received these three.
+
 ### No date filter for Canada
 Health and Locums fetch from 2026-01-01. Canada needs its **whole Nexus history**, so all three
 layers of the filter are off for it (`submittal_start_date_from`, `transform_rows_fn`,
@@ -127,7 +144,30 @@ table-wide scan AND the insert-time contract-chain writer), `inorganic_hierarchy
 `SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS` (index).
 **Turn these back on once the data is trusted.**
 
+**Every audit-log scan is scoped to its trigger's domain (2026-09-25).** The ownership / inorganic /
+effective-date scans used to UNION all three deal sheet tables, so a *health* run wrote logs for
+canada and locums placements — 300 ownership + 1 inorganic canada rows had leaked in and were
+deleted by hand. Now `sync_domain` flows from each trigger into `buildActiveChangeScanUnionParts`
+(and the other scan sources), so health logs only health, canada only canada, locums only locums —
+including the recruiter-hierarchy MOVES, which follow the scan's `srcTable`. The manual refresh
+endpoint takes the domain from the row's table (`resolveSyncDomainForActiveTableId`). No domain
+given (bare HTTP call to a scan) still means all three.
+
 ---
+
+## Recruiter hierarchy — health freezes, Canada/Locums are LIVE (2026-09-25)
+
+Health: hierarchy frozen at hire (NEW_HIRE_DATE snapshot / parent DEAL / run-rate), later joiners go
+to `inorganic_hierarchy_logs`. **Canada and Locums have no inorganic concept** — a person is
+effective the moment they are in the recruiter's chain (business rule, confirmed by the user):
+- DEAL **and** EXTENSION inserts take the recruiter's CURRENT directory chain; an extension does not
+  inherit the managed hierarchy from parent DEAL / prior extension / run-rate.
+- `applyLiveRecruiterHierarchyToDealSheet` runs from both canada/locums triggers (before the
+  audit-log guard — it is a deal sheet write, not a log) and appends a new version whenever an open
+  placement's chain differs. Stops at ENDED. Skips a recruiter the directory cannot resolve.
+- `syncInorganicHierarchyLogsFromBigQuery` skips canada/locums outright and, with no domain, scans
+  health only. This is permanent (`LIVE_RECRUITER_HIERARCHY_DOMAINS`), not a validation switch.
+- SECONDARY_RECRUITER / SECONDARY_AM stay manual. CSM levels (ONSITE_AM chain) are unchanged.
 
 ## Hard-won operational lessons
 

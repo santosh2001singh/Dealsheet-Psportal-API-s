@@ -23,6 +23,7 @@ const {
   syncExistingActiveDealSheetUpdatesFromBigQuery,
   syncRateChangeLogsFromBigQuery,
   syncInorganicHierarchyLogsFromBigQuery,
+  syncLiveRecruiterHierarchyForDomain,
   syncOwnershipChangeLogsFromBigQuery,
   syncOwnershipChangeLogEffectiveDatesFromExtensions,
   refreshPlacementRecordToBigQuery,
@@ -741,11 +742,24 @@ async function runDealSheetInsertSyncForDomain(domain, label) {
   // rows are deleted and re-synced repeatedly, so writing audit logs for them just creates rows that
   // have to be cleaned up again (see sql/cleanup_canada_test_rows.sql). Skipped entirely for the
   // domains in SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS; health is unaffected.
+  // Canada / Locums have no inorganic hierarchy: the recruiter's CURRENT chain is written straight
+  // onto the deal sheet instead (no-op for health). Runs BEFORE the audit-log guard below because it
+  // is a deal sheet update, not a log write, so the log switches must not suppress it.
+  let liveRecruiterHierarchy = null;
+  try {
+    liveRecruiterHierarchy = await syncLiveRecruiterHierarchyForDomain({
+      sync_domain: domain,
+      bq_dataset: bqDataset,
+    });
+  } catch (liveErr) {
+    logError(`[${label}] live recruiter hierarchy FAILED (non-fatal)`, liveErr);
+  }
+
   if (!domainRunsAuditLogScans(domain)) {
     logLine(
       `[${label}] audit-log scans SKIPPED for domain=${domain} (ownership / inorganic / effective-date)`
     );
-    return { success: true, domain, result, auditLogScansSkipped: true };
+    return { success: true, domain, result, liveRecruiterHierarchy, auditLogScansSkipped: true };
   }
 
   // Extensions get inserted here; reconcile ownership_change_logs OWNERSHIP_EFFECTIVE_DATE from the
@@ -754,6 +768,8 @@ async function runDealSheetInsertSyncForDomain(domain, label) {
   let ownershipEffectiveDateResult = null;
   try {
     ownershipEffectiveDateResult = await syncOwnershipChangeLogEffectiveDatesFromExtensions({
+      // Scan only this trigger's domain table, so one domain's run never touches another's logs.
+      sync_domain: domain,
       deal_sheet_bq_dataset: bqDataset,
       bq_table: "ownership_change_logs",
     });
@@ -773,6 +789,8 @@ async function runDealSheetInsertSyncForDomain(domain, label) {
   let inorganicHierarchyLogResult = null;
   try {
     inorganicHierarchyLogResult = await syncInorganicHierarchyLogsFromBigQuery({
+      // Scan only this trigger's domain table, so one domain's run never touches another's logs.
+      sync_domain: domain,
       bq_dataset: bqDataset,
       bq_table: "inorganic_hierarchy_logs",
     });
@@ -789,6 +807,8 @@ async function runDealSheetInsertSyncForDomain(domain, label) {
   let ownershipChangeLogResult = null;
   try {
     ownershipChangeLogResult = await syncOwnershipChangeLogsFromBigQuery({
+      // Scan only this trigger's domain table, so one domain's run never touches another's logs.
+      sync_domain: domain,
       bq_dataset: bqDataset,
       bq_table: "ownership_change_logs",
     });
@@ -805,6 +825,7 @@ async function runDealSheetInsertSyncForDomain(domain, label) {
     result,
     ownershipEffectiveDate: ownershipEffectiveDateResult,
     inorganicHierarchyLog: inorganicHierarchyLogResult,
+    liveRecruiterHierarchy,
     ownershipChangeLog: ownershipChangeLogResult,
   };
 }
@@ -916,9 +937,22 @@ async function runDealSheetUpdateSyncForDomain(domain, label) {
   // idempotent, so running them from each domain's trigger is safe — except for a domain still being
   // validated, which skips them so its test rows do not seed log tables. See
   // SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS.
+  // Canada / Locums have no inorganic hierarchy: the recruiter's CURRENT chain is written straight
+  // onto the deal sheet instead (no-op for health). Runs BEFORE the audit-log guard below because it
+  // is a deal sheet update, not a log write, so the log switches must not suppress it.
+  let liveRecruiterHierarchy = null;
+  try {
+    liveRecruiterHierarchy = await syncLiveRecruiterHierarchyForDomain({
+      sync_domain: domain,
+      bq_dataset: bqDataset,
+    });
+  } catch (liveErr) {
+    logError(`[${label}] live recruiter hierarchy FAILED (non-fatal)`, liveErr);
+  }
+
   if (!domainRunsAuditLogScans(domain)) {
     logLine(`[${label}] audit-log scans SKIPPED for domain=${domain} (inorganic / ownership)`);
-    return { success: true, domain, result, auditLogScansSkipped: true };
+    return { success: true, domain, result, liveRecruiterHierarchy, auditLogScansSkipped: true };
   }
 
   logLine(
@@ -927,6 +961,8 @@ async function runDealSheetUpdateSyncForDomain(domain, label) {
   let inorganicHierarchyLogResult = null;
   try {
     inorganicHierarchyLogResult = await syncInorganicHierarchyLogsFromBigQuery({
+      // Scan only this trigger's domain table, so one domain's run never touches another's logs.
+      sync_domain: domain,
       bq_dataset: bqDataset,
       bq_table: "inorganic_hierarchy_logs",
     });
@@ -943,6 +979,8 @@ async function runDealSheetUpdateSyncForDomain(domain, label) {
   let ownershipChangeLogResult = null;
   try {
     ownershipChangeLogResult = await syncOwnershipChangeLogsFromBigQuery({
+      // Scan only this trigger's domain table, so one domain's run never touches another's logs.
+      sync_domain: domain,
       bq_dataset: bqDataset,
       bq_table: "ownership_change_logs",
     });
@@ -963,6 +1001,8 @@ async function runDealSheetUpdateSyncForDomain(domain, label) {
   let ownershipEffectiveDateResult = null;
   try {
     ownershipEffectiveDateResult = await syncOwnershipChangeLogEffectiveDatesFromExtensions({
+      // Scan only this trigger's domain table, so one domain's run never touches another's logs.
+      sync_domain: domain,
       deal_sheet_bq_dataset: bqDataset,
       bq_table: "ownership_change_logs",
     });
@@ -978,6 +1018,7 @@ async function runDealSheetUpdateSyncForDomain(domain, label) {
     domain,
     result,
     inorganicHierarchyLog: inorganicHierarchyLogResult,
+    liveRecruiterHierarchy,
     ownershipChangeLog: ownershipChangeLogResult,
     ownershipEffectiveDate: ownershipEffectiveDateResult,
   };

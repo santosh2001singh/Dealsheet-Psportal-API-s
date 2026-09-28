@@ -377,3 +377,32 @@ test("no canada query path names a column canada dropped", () => {
     assert.deepEqual(bad, [], `${name} names dropped column(s): ${bad.join(", ")}`);
   }
 });
+
+// --------------------------------------------------------------------------
+// EXTENSION location check — names for Canada, ids everywhere else
+// --------------------------------------------------------------------------
+
+test("Canada extensions judge 'same location' on parent client + facility NAME", () => {
+  // The Canada run-rate table has no client ids, so the id test was false on every row and the
+  // three location-scoped narrative columns never reached a Canada extension.
+  const { buildExtensionSameLocationSql } = require("./bigQueryClient");
+  const config = require("./config");
+  const sql = buildExtensionSameLocationSql(config.runrateCanadaTableId);
+  assert.match(sql, /LOWER\(TRIM\(r\.runrate_parent_client\)\) = LOWER\(TRIM\(e2\.deal_parent_client\)\)/);
+  assert.match(sql, /LOWER\(TRIM\(r\.runrate_facility\)\) = LOWER\(TRIM\(e2\.deal_facility\)\)/);
+  // A blank name on the extension side must never read as "same".
+  assert.match(sql, /NULLIF\(LOWER\(TRIM\(e2\.deal_parent_client\)\), ''\) IS NOT NULL/);
+  assert.match(sql, /NULLIF\(LOWER\(TRIM\(e2\.deal_facility\)\), ''\) IS NOT NULL/);
+  assert.doesNotMatch(sql, /client_id/);
+});
+
+test("health and locums extensions keep the id-only location check", () => {
+  const { buildExtensionSameLocationSql } = require("./bigQueryClient");
+  const config = require("./config");
+  for (const table of [config.runrateTableId, config.runrateLocumsTableId, "all_CH_data_runrate"]) {
+    const sql = buildExtensionSameLocationSql(table);
+    assert.match(sql, /CAST\(r\.runrate_parent_client_id AS STRING\) = e2\.deal_parent_client_id/, table);
+    assert.match(sql, /CAST\(r\.runrate_client_id AS STRING\) = e2\.deal_facility_id/, table);
+    assert.doesNotMatch(sql, /runrate_facility\)/, table);
+  }
+});

@@ -53,7 +53,12 @@ const {
 const { computeBonusTotals } = require("../bonusTotals");
 const { computeWeekSplit } = require("../weekSplit");
 const { computeNewRateFamily } = require("../w2PayRateNew");
-const { sanitizeCanadaDealSheetRow, isCanadaDealSheetRow, pickCanadaDealSheetHoursPart } = require("../canadaDerivedPlacementFields");
+const {
+  sanitizeCanadaDealSheetRow,
+  isCanadaDealSheetRow,
+  pickCanadaDealSheetHoursPart,
+  applyCanadaNlDefaultPerDiem,
+} = require("../canadaDerivedPlacementFields");
 const {
   sanitizeLocumsDealSheetRow,
   isLocumsDealSheetRow,
@@ -1085,7 +1090,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       ? { PAYMENT_TYPE: mapLocumsTypeFromTenNintyNine(detail) }
       : {};
 
-    const row = {
+    const nexusRow = {
       ...candidatePart,
       ...clientPart,
       ...dealSheetPart,
@@ -1120,6 +1125,8 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       NEW_HIRE_DATE: newHireDate,
       EXTENSION_DATE: extensionDate,
     };
+    // NL only: Nexus sends no per diem, so the $70 default goes in before the derived step reads it.
+    const row = applyCanadaNlDefaultPerDiem(nexusRow);
     const newRateFamilyPart = (isCanadaRecruiter || isLocumsRecruiter)
       ? {}
       : computeNewRateFamily(row);

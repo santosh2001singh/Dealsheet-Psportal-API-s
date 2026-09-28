@@ -360,6 +360,87 @@ function isCanadaDealSheetRow(row) {
 }
 
 /**
+ * Weekly per diem every NEWFOUNDLAND placement carries by default.
+ *
+ * The run-rate sheet has $70 on 92 of 93 NL rows, but Nexus's lodging_amount / meal_amount (which
+ * WEEKLY_PER_DIEM_NON_TAXED is built from) read 0 for NL, so the loading silently lost 70/11.25 =
+ * 6.22/hr. Nexus's own hourly_revenue does include it — the value is just not exposed where we read.
+ * Until Nexus exposes it, NL defaults to 70 and a user edits the exceptions on the RR-Dashboard.
+ */
+const CANADA_NL_DEFAULT_WEEKLY_PER_DIEM = 70;
+
+/**
+ * Transient marker: the row's per diem is our NL default, not a value Nexus sent. Only such a row
+ * may take the stored (possibly hand-edited) value instead — a real Nexus figure always wins.
+ * "__"-prefixed, so sanitizeRowForBigQueryStreamingInsert strips it before the insert.
+ */
+const CANADA_NL_PER_DIEM_DEFAULTED_FLAG = "__CANADA_NL_PER_DIEM_DEFAULTED";
+
+/** Fields computeCanadaT4PayRate's per diem term cascades into. */
+const CANADA_PER_DIEM_DERIVED_FIELDS = Object.freeze([
+  "T4_PAY_RATE",
+  "FINAL_PAY_RATE",
+  "FINAL_COST",
+  "CALCULATED_MARGIN",
+  "GROSS_MARGIN",
+]);
+
+function isCanadaNlRow(row) {
+  return isCanadaDealSheetRow(row) && normClientState(row?.CLIENT_STATE) === "NL";
+}
+
+/**
+ * Fill the NL default per diem when Nexus sent none (null or 0). Runs on the freshly-enriched row
+ * BEFORE the derived step, so T4_PAY_RATE and the margins are computed with it.
+ *
+ * @param {Record<string, *>|null|undefined} row
+ * @returns {Record<string, *>|null|undefined}
+ */
+function applyCanadaNlDefaultPerDiem(row) {
+  if (!row || typeof row !== "object" || !isCanadaNlRow(row)) return row;
+  const nexusPerDiem = toNumberOrNull(row.WEEKLY_PER_DIEM_NON_TAXED);
+  if (nexusPerDiem != null && nexusPerDiem !== 0) return row;
+  return {
+    ...row,
+    WEEKLY_PER_DIEM_NON_TAXED: CANADA_NL_DEFAULT_WEEKLY_PER_DIEM,
+    [CANADA_NL_PER_DIEM_DEFAULTED_FLAG]: true,
+  };
+}
+
+/**
+ * Keep the stored NL per diem when the incoming one is only our default.
+ *
+ * WEEKLY_PER_DIEM_NON_TAXED is API-owned, so without this a value a user typed on the RR-Dashboard
+ * (say 50) would read as a change on the next sync — incoming default 70 vs stored 50 — and be
+ * appended over. When Nexus sent nothing, the stored value (including a typed 0) is the truth, and
+ * the per-diem-driven fields are recomputed from it so the row stays consistent and the append
+ * compare sees no change. A real Nexus per diem is never replaced.
+ *
+ * Called at the top of both hasBusinessColumnChanges and applyManualColumnsCarryForward, so every
+ * append path compares and writes the same resolved row.
+ *
+ * @param {Record<string, *>|null|undefined} incomingRow
+ * @param {Record<string, *>|null|undefined} baselineRow
+ * @returns {Record<string, *>|null|undefined}
+ */
+function applyCanadaNlPerDiemCarryForward(incomingRow, baselineRow) {
+  if (!incomingRow || typeof incomingRow !== "object" || !baselineRow) return incomingRow;
+  if (incomingRow[CANADA_NL_PER_DIEM_DEFAULTED_FLAG] !== true || !isCanadaNlRow(incomingRow)) {
+    return incomingRow;
+  }
+  const storedPerDiem = toNumberOrNull(baselineRow.WEEKLY_PER_DIEM_NON_TAXED);
+  if (storedPerDiem == null) return incomingRow;
+  if (storedPerDiem === toNumberOrNull(incomingRow.WEEKLY_PER_DIEM_NON_TAXED)) return incomingRow;
+
+  const out = { ...incomingRow, WEEKLY_PER_DIEM_NON_TAXED: storedPerDiem };
+  // A row the derived step left blank (no pay rate, "No business" type, ...) stays blank.
+  if (toNumberOrNull(incomingRow.T4_PAY_RATE) == null) return out;
+  const derived = computeCanadaDerivedPlacementFields(out);
+  for (const key of CANADA_PER_DIEM_DERIVED_FIELDS) out[key] = derived[key];
+  return out;
+}
+
+/**
  * Columns Canada deal sheets do not use (stripped on insert; skipped on append compare).
  *
  * These are NOT columns of the canada tables — see sql/migrate_canada_deal_sheet_schema.sql. Writing
@@ -555,6 +636,11 @@ module.exports = {
   applyCanadaDefaultEntity,
   isCanadaProvince,
   isCanadaDealSheetRow,
+  CANADA_NL_DEFAULT_WEEKLY_PER_DIEM,
+  CANADA_NL_PER_DIEM_DEFAULTED_FLAG,
+  CANADA_PER_DIEM_DERIVED_FIELDS,
+  applyCanadaNlDefaultPerDiem,
+  applyCanadaNlPerDiemCarryForward,
   CANADA_PROVINCES,
   CANADA_PROVINCE_CODES,
   CANADA_BURDEN_BY_PROVINCE,
