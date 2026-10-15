@@ -148,3 +148,43 @@ test("SECONDARY_EMAIL and SECONDARY_CELL_PHN are API-owned, not manual", () => {
   assert.ok(!MANUAL_COLUMNS.has("SECONDARY_EMAIL"));
   assert.ok(!MANUAL_COLUMNS.has("SECONDARY_CELL_PHN"));
 });
+
+// --------------------------------------------------------------------------
+// SOURCER_NAME — Nexus candidate referrer_name (Cynet Health only)
+// --------------------------------------------------------------------------
+
+const { sanitizeCanadaDealSheetRow } = require("./canadaDerivedPlacementFields");
+const { sanitizeLocumsDealSheetRow } = require("./locumsDerivedPlacementFields");
+
+test("SOURCER_NAME comes from referrer_name", () => {
+  // Candidate 31856808: referral_source "Referral", referrer_name "Chantile Williams".
+  const out = mapCandidateToBq({
+    ...candidate,
+    referrer_name: "  Chantile Williams ",
+    referral_source: { name: "Referral" },
+  });
+  assert.equal(out.SOURCER_NAME, "Chantile Williams");
+});
+
+test("SOURCER_NAME is null without a referrer — no fallback to referral_source", () => {
+  assert.equal(
+    mapCandidateToBq({ ...candidate, referrer_name: null, referral_source: { name: "Facebook" } }).SOURCER_NAME,
+    null
+  );
+  assert.equal(mapCandidateToBq({ ...candidate, referrer_name: "   " }).SOURCER_NAME, null);
+  assert.equal(mapCandidateToBq(null).SOURCER_NAME, null);
+});
+
+test("SOURCER_NAME is API-owned and kept on Cynet Health rows only", () => {
+  assert.ok(API_OWNED_COLUMNS.has("SOURCER_NAME"));
+  assert.ok(!MANUAL_COLUMNS.has("SOURCER_NAME"));
+
+  const health = { CLIENT_STATE: "NY", OFFERING: "TRAVEL", SOURCER_NAME: "Chantile Williams" };
+  assert.equal(sanitizeLocumsDealSheetRow(sanitizeCanadaDealSheetRow(health)).SOURCER_NAME, "Chantile Williams");
+
+  const canada = { CLIENT_STATE: "ON", SOURCER_NAME: "Chantile Williams" };
+  assert.ok(!("SOURCER_NAME" in sanitizeCanadaDealSheetRow(canada)));
+
+  const locums = { CLIENT_STATE: "NY", OFFERING: "LOCUMS", SOURCER_NAME: "Chantile Williams" };
+  assert.ok(!("SOURCER_NAME" in sanitizeLocumsDealSheetRow(locums)));
+});

@@ -487,6 +487,8 @@ const CANADA_EXCLUDED_API_OWNED_COLUMNS = new Set([
   "ASSOCIATE_JUNIOR_CSM",
   "ONSITE_VP_AVP",
   "ASSOCIATE_SALES_PERSON",
+  // Candidate referrer — added for Cynet Health only (Oct 2026)
+  "SOURCER_NAME",
 ]);
 Object.freeze(CANADA_EXCLUDED_API_OWNED_COLUMNS);
 

@@ -89,6 +89,25 @@ test("no runrate inorganic match -> no rows", async () => {
   assert.equal(rows.length, 0);
 });
 
+test("run-rate INORGANIC_RECRUITER is never used, even when the RR team filled it and the person is active", async () => {
+  const deps = (inorganic) => ({
+    runrateFetchFn: async () => new Map([["P1", inorganic]]),
+    departmentFetchFn: async () =>
+      buildByName([
+        { name: "Rec Active", empNo: "R2", designation: "Recruiter", status: "Active", immediateManager: null },
+        { name: "Sonam Chaudhary", empNo: "CY100", designation: "Associate Account Manager", status: "Active", immediateManager: null },
+      ]),
+    fetchEmailsFn: async () => ({ byEmp: new Map() }),
+  });
+  // Recruiter only -> nothing inorganic at all.
+  assert.equal((await resolveExtensionInorganicLogRows([EXT_ROW], {}, deps({ INORGANIC_RECRUITER: "Rec Active" }))).length, 0);
+  // Recruiter + a real hierarchy person -> the row has the hierarchy person only.
+  const rows = await resolveExtensionInorganicLogRows([EXT_ROW], {}, deps({ INORGANIC_RECRUITER: "Rec Active", INORGANIC_ASSOCIATE_AM: "Sonam Chaudhary" }));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].INORGANIC_RECRUITER, undefined);
+  assert.equal(rows[0].INORGANIC_ASSOCIATE_AM, "Sonam Chaudhary");
+});
+
 test("inactive recruiter identity slot is dropped (NA)", async () => {
   const rows = await resolveExtensionInorganicLogRows([EXT_ROW], {}, {
     runrateFetchFn: async () =>

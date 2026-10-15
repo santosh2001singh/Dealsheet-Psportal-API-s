@@ -361,6 +361,9 @@ function mapCandidateToBq(candidate) {
     SECONDARY_EMAIL: candidateSecondaryEmailFromContactInfo(candidate),
     CELL_PHONE: candidatePhoneFromContactInfo(candidate) ?? trimContactValue(candidate?.phone),
     SECONDARY_CELL_PHN: candidateSecondaryCellPhoneFromContactInfo(candidate),
+    // The person who referred the candidate. No fallback to referral_source.name: no referrer -> null.
+    // Cynet Health only — the canada and locums sanitizers strip it.
+    SOURCER_NAME: trimContactValue(candidate?.referrer_name),
   };
 }
 
@@ -411,6 +414,36 @@ function mapJobPlacementTypeFromJobType(job) {
   if (jt === "PERMANENT" || jt === "PERM") return "FT";
   if (jt === "LOCAL" || jt === "LOCUM" || jt === "TRAVEL") return "CT";
   return null;
+}
+
+/** True for a permanent-hire row (PLACEMENT_TYPE "FT"). */
+function isFtPlacementRow(row) {
+  return row?.PLACEMENT_TYPE != null && String(row.PLACEMENT_TYPE).trim().toUpperCase() === "FT";
+}
+
+/**
+ * FT bill amount (business rule, Oct 2026). A permanent-hire deal sheet has no hourly rates —
+ * /api/deal-sheet-rates/ comes back all zero — so BILL_RATE ("BILL RATE (OR FT INVOICE AMT)") is
+ * the invoice amount from /api/deal-sheet-perm-details/: gross_margin_dollar. Deal sheet 5256515
+ * carries 11467.87 there. Empty when the API has no perm row, so the rates value stands.
+ * @param {object|null} permRow first item of /api/deal-sheet-perm-details/?deal_sheet_id=
+ */
+function mapDealSheetPermDetailsToBq(permRow) {
+  const amount = toNumberOrNull(permRow?.gross_margin_dollar);
+  return amount == null ? {} : { BILL_RATE: round2(amount) };
+}
+
+/** Value CANDIDATE_PAYMENT_TERMS and INVOICE_CYCLE_TO_CLIENT always hold on an FT row. */
+const FT_PAYMENT_TERMS = "FT";
+
+/**
+ * FT rows: CANDIDATE_PAYMENT_TERMS and INVOICE_CYCLE_TO_CLIENT are always "FT" (business rule,
+ * Oct 2026). Both are manual columns, so this runs at the end of the insert pipeline, after the
+ * baseline / run-rate / parent-DEAL carry tiers — nothing is picked from anywhere for FT.
+ */
+function applyFtPaymentTerms(row) {
+  if (!row || typeof row !== "object" || !isFtPlacementRow(row)) return row;
+  return { ...row, CANDIDATE_PAYMENT_TERMS: FT_PAYMENT_TERMS, INVOICE_CYCLE_TO_CLIENT: FT_PAYMENT_TERMS };
 }
 
 /**
@@ -985,6 +1018,9 @@ function mapSubmittalStatusToPlacementStatus(rawStatus) {
   const key = s.toLowerCase();
   if (key === "offer rejected") return "DID NOT ACCEPT";
   if (key === "completed") return "ENDED";
+  // ENDED vs ENDED<30 is decided later from INITIAL_START_DATE -> END_DATE
+  // (applyEndedPlacementStatusByInitialStart), never from the submittal's Early Term status.
+  if (key === "early term") return "ENDED";
   if (key === "active") return "STARTED";
   if (key === "perm starts") return "STARTED";
   if (key === "cancelled" || key === "canceled") return "DID NOT START";
@@ -1002,7 +1038,7 @@ function mapSubmittalCodeToPlacementStatus(rawCode, fallbackLabel = null) {
   }
   const code = String(rawCode).trim().toUpperCase();
   if (code === "OFFER_REJECTED") return "DID NOT ACCEPT";
-  if (code === "COMPLETED") return "ENDED";
+  if (code === "COMPLETED" || code === "EARLY_TERM") return "ENDED";
   if (code === "ACTIVE" || code === "PERM_STARTS") return "STARTED";
   if (code === "CANCELLED" || code === "CANCELED") return "DID NOT START";
   if (code === "BOOKED") return "BOOKED";
@@ -1225,26 +1261,51 @@ function computeDerivedPlacementFields(row) {
 }
 
 /**
- * Map early term placement status
+ * Date-only "YYYY-MM-DD" from an API string, a BigQuery DATE ({ value }) or a Date; null otherwise.
  */
-function mapEarlyTermPlacementStatus(submittalRow, jobObj) {
-  const nonBlank = (...vals) => {
-    for (const v of vals) {
-      if (v == null) continue;
-      if (String(v).trim() !== "") return v;
-    }
-    return null;
-  };
-  // ENDED vs ENDED<30 = how long the candidate ACTUALLY worked, i.e. start -> ACTUAL end. The actual
-  // (early-term) end is on the SUBMITTAL (same source as END_DATE); the job carries only the planned
-  // end. Using the job's planned end here would call a 2-week early-term "ENDED" (89 planned days)
-  // instead of "ENDED<30" (14 worked days). Start stays job-first.
-  const startStr = nonBlank(jobObj?.start_date, submittalRow?.start_date);
-  const endStr = nonBlank(submittalRow?.end_date, jobObj?.end_date);
-  const days = dateDiffDaysEndMinusStart(startStr, endStr);
-  if (days == null) return null;
-  if (days < 30) return "ENDED<30";
-  return "ENDED";
+function toDateOnlyForEndedStatus(value) {
+  if (value == null) return null;
+  const raw =
+    typeof value === "object" && !(value instanceof Date) && "value" in value ? value.value : value;
+  if (raw == null) return null;
+  if (raw instanceof Date) return Number.isNaN(raw.getTime()) ? null : raw.toISOString().slice(0, 10);
+  const s = String(raw).trim();
+  if (!s) return null;
+  const head = s.slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(head)) return head;
+  const ms = parseDateStringForDiff(s);
+  return ms == null ? null : new Date(ms).toISOString().slice(0, 10);
+}
+
+/**
+ * ENDED vs ENDED<30 (business rule, Oct 2026): INITIAL_START_DATE -> END_DATE.
+ *
+ * The split is the length of the CONTRACT, not of this one placement and not the submittal's
+ * "Early Term" status — that status was never what decided it. An extension that ends two weeks
+ * into its own segment of a contract that began months earlier is ENDED, not ENDED<30.
+ *
+ * Only rows already ENDED / ENDED<30 are touched (the submittal decides THAT the placement ended;
+ * this only decides which of the two). INITIAL_START_DATE falls back to START_DATE when blank (a
+ * brand-new DEAL before the insert pipeline fills it). When either date is missing the status is
+ * left as it is.
+ *
+ * @param {object} row
+ * @param {*} [initialStartOverride] INITIAL_START_DATE to use instead of the row's own — the
+ *   baseline's value at the change gate, where the manual column has not been carried forward yet.
+ */
+function applyEndedPlacementStatusByInitialStart(row, initialStartOverride) {
+  if (!row || typeof row !== "object") return row;
+  const status = normalizePlacementStatusKey(row.PLACEMENT_STATUS);
+  if (status !== "ENDED" && status !== "ENDED<30") return row;
+  const initial =
+    toDateOnlyForEndedStatus(initialStartOverride) ??
+    toDateOnlyForEndedStatus(row.INITIAL_START_DATE) ??
+    toDateOnlyForEndedStatus(row.START_DATE);
+  const end = toDateOnlyForEndedStatus(row.END_DATE);
+  const days = dateDiffDaysEndMinusStart(initial, end);
+  if (days == null) return row;
+  const next = days < 30 ? "ENDED<30" : "ENDED";
+  return row.PLACEMENT_STATUS === next ? row : { ...row, PLACEMENT_STATUS: next };
 }
 
 /**
@@ -1315,15 +1376,9 @@ function computeBqEndDateFromSubmittal(submittalRow, jobObj) {
 /**
  * Resolve placement status from submittal
  */
-function resolvePlacementStatusFromSubmittal(submittalRow, jobObj) {
+function resolvePlacementStatusFromSubmittal(submittalRow) {
   const jobStatusRaw = submittalRow?.organization_submittal_status?.submittal_status ?? null;
   if (jobStatusRaw == null || String(jobStatusRaw).trim() === "") return null;
-  const key = String(jobStatusRaw).trim().toLowerCase();
-  if (key === "early term") {
-    const early = mapEarlyTermPlacementStatus(submittalRow, jobObj);
-    if (early != null) return early;
-    return String(jobStatusRaw).trim();
-  }
   return mapSubmittalStatusToPlacementStatus(jobStatusRaw);
 }
 
@@ -1354,7 +1409,7 @@ function mapJobSubmittalToBq(submittalRow, jobObj) {
     startRaw == null ? null : (formatDateStringForBq(startRaw) ?? String(startRaw).trim());
   // TENTATIVE_END_DATE (planned/tentative end): the SUBMITTAL's end_date, job end_date as fallback
   // only when the submittal has none/blank. (Business rule changed Sep 2026: tentative end is the
-  // submittal's end date, captured at OFFERED and hard-frozen at BOOKED — see
+  // submittal's end date, followed while OFFERED/BOOKED/STARTED and held after — see
   // applyTentativeDateFreeze. It was previously the job's end_date only.) The status-based capture /
   // freeze lives downstream; this mapper just surfaces the current API value.
   const tentativeRaw = firstNonEmptyDate(submittalRow?.end_date, jobObj?.end_date);
@@ -1364,7 +1419,7 @@ function mapJobSubmittalToBq(submittalRow, jobObj) {
   return {
     PLACEMENT_ID: n != null && Number.isFinite(n) ? Math.trunc(n) : null,
     SUBMISSION_DATE: submittedStr,
-    PLACEMENT_STATUS: resolvePlacementStatusFromSubmittal(submittalRow, jobObj || null),
+    PLACEMENT_STATUS: resolvePlacementStatusFromSubmittal(submittalRow),
     START_DATE: startDate,
     TENTATIVE_END_DATE: tentativeDate,
     END_DATE: computeBqEndDateFromSubmittal(submittalRow, jobObj || null),
@@ -1495,32 +1550,62 @@ function isDidNotStartPlacementStatus(status) {
   return normalizePlacementStatusKey(status) === "DID NOT START";
 }
 
-/** Placement statuses at/before which TENTATIVE_END_DATE is still captured from the API. */
-const TENTATIVE_CAPTURE_PLACEMENT_STATUSES = new Set(["OFFERED", "BOOKED"]);
+function isDidNotAcceptPlacementStatus(status) {
+  return normalizePlacementStatusKey(status) === "DID NOT ACCEPT";
+}
 
 /**
- * True while the placement is still at a status where TENTATIVE_END_DATE is captured from the
- * submittal API (OFFERED = soft capture, BOOKED = capture then hard-freeze).
+ * START_DATE + OFFER_TIME_START_DATE for the enriched row (business rule, Oct 2026, all domains).
+ *
+ * DID NOT ACCEPT: both come from the JOB API's start_date, read live on every sync (the user chose
+ * live over frozen, knowing a reused job moves the date). END_DATE is returned too, equal to that
+ * start: the enricher must put it on the row BEFORE computeDerivedPlacementFields, because the
+ * submittal-based END_DATE (computeBqEndDateFromSubmittal: the SUBMITTAL start) made DAYS_WORKED =
+ * END - START non-zero whenever job and submittal starts differed (1450020: -14) — and DAYS_WORKED is
+ * API-owned, so every sync appended a row. The submittal start is only the fallback when the job has
+ * none.
+ *
+ * Every other status: START_DATE is the submittal's (job only as fallback, see mapJobSubmittalToBq)
+ * and OFFER_TIME_START_DATE now takes that same submittal start instead of the job's. It is frozen
+ * from the first insert by applyOfferTimeStartDateFreeze, except that a row TURNING into DID NOT
+ * ACCEPT re-takes the job's date once.
+ * @param {string|null|undefined} placementStatus
+ * @param {string|null|undefined} submittalStartDate - mapJobSubmittalToBq START_DATE
+ * @param {string|null|undefined} jobStartDate - mapJobToBq's job start_date
+ * @returns {{ START_DATE: string|null, OFFER_TIME_START_DATE: string|null, END_DATE?: string|null }}
+ *   END_DATE only for DID NOT ACCEPT; absent otherwise (the submittal's END_DATE stands).
+ */
+function resolveStartAndOfferTimeDates(placementStatus, submittalStartDate, jobStartDate) {
+  const submittalStart = submittalStartDate ?? null;
+  if (isDidNotAcceptPlacementStatus(placementStatus)) {
+    const start = jobStartDate ?? submittalStart;
+    return { START_DATE: start, OFFER_TIME_START_DATE: start, END_DATE: start };
+  }
+  return { START_DATE: submittalStart, OFFER_TIME_START_DATE: submittalStart };
+}
+
+/**
+ * Live placement statuses: while the placement is in one of these, TENTATIVE_END_DATE follows the
+ * submittal API on every sync (business rule, Oct 2026 — it was frozen at BOOKED before).
+ */
+const TENTATIVE_CAPTURE_PLACEMENT_STATUSES = new Set(["OFFERED", "BOOKED", "STARTED"]);
+
+/**
+ * True while TENTATIVE_END_DATE is still taken from the submittal API (OFFERED / BOOKED / STARTED).
+ * Every other status holds the last stored value (DID NOT START clears it).
  * @param {string|null|undefined} status
  */
 function isTentativeCapturePlacementStatus(status) {
   return TENTATIVE_CAPTURE_PLACEMENT_STATUSES.has(normalizePlacementStatusKey(status));
 }
 
-/** True when PLACEMENT_STATUS is BOOKED — the point TENTATIVE_END_DATE hard-freezes. */
-function isBookedPlacementStatus(status) {
-  return normalizePlacementStatusKey(status) === "BOOKED";
-}
-
 /**
  * TENTATIVE_END_DATE for the enriched row: the raw capture (submittal end_date, job end_date as
  * fallback), cleared for DID NOT START.
  *
- * The OFFERED/BOOKED capture window and the BOOKED hard-freeze are NOT applied here — the enrich
- * stage has no access to the stored baseline. applyTentativeDateFreeze owns that, and it is the sole
- * authority because TENTATIVE_END_DATE is a SYSTEM_CONTROLLED column (the change-gate never compares
- * it). On a first insert there is no baseline, so this captured value is what lands — which is also
- * the wanted fallback when BOOKED was never observed (placement already STARTED on first sync).
+ * The OFFERED/BOOKED/STARTED capture window and the hold at later statuses are NOT applied here —
+ * the enrich stage has no access to the stored baseline. applyTentativeDateFreeze owns that. On a
+ * first insert there is no baseline, so this captured value is what lands.
  *
  * `hasBaseline` lets a caller that DOES know the baseline apply the window here too; it defaults to
  * false so the enrich path keeps the raw capture.
@@ -1577,7 +1662,32 @@ function resolveNewHireDateFromSubmittalNotes(notes) {
 }
 
 /**
+ * Earliest OFFER_REJECTED job-submittal-note created_date: the day the candidate turned the offer
+ * down. created_date, like SUBMISSION_DATE's SENT_TO_CLIENT — it is the event time.
+ * @param {object[]} notes
+ * @returns {string|null}
+ */
+function resolveOfferRejectedDateFromSubmittalNotes(notes) {
+  if (!notes || notes.length === 0) return null;
+  let earliestMs = Number.POSITIVE_INFINITY;
+  let earliestRaw = null;
+  for (const note of notes) {
+    if (submittalNoteStatusCode(note) !== "OFFER_REJECTED") continue;
+    const raw = note?.created_date ?? note?.modified_date;
+    if (raw == null || String(raw).trim() === "") continue;
+    const ms = Date.parse(String(raw).trim());
+    if (!Number.isFinite(ms) || ms >= earliestMs) continue;
+    earliestMs = ms;
+    earliestRaw = String(raw).trim();
+  }
+  return earliestRaw;
+}
+
+/**
  * NEW_HIRE_DATE from submittal notes for DEAL rows only; EXTENSION always null.
+ * DID NOT ACCEPT DEAL rows take the day the offer was rejected (earliest OFFER_REJECTED note,
+ * business rule Oct 2026) — such a deal is never BOOKED, so the BOOKED rule left it null. A DID NOT
+ * ACCEPT EXTENSION is untouched: it keeps the contract's hire date it inherited.
  * For DID NOT START (cancelled) DEAL rows without a BOOKED note, falls back to the
  * submittal top-level modified_date (fill-if-empty). This value is frozen thereafter
  * by applyNewHireDateFreeze once it lands on the baseline row.
@@ -1590,6 +1700,10 @@ function resolveNewHireDateFromSubmittalNotes(notes) {
 function resolveNewHireDateForDealRow(dealType, notes, placementStatus, submittalRow) {
   const key = dealType == null ? "" : String(dealType).trim().toUpperCase();
   if (key !== "DEAL") return null;
+  if (isDidNotAcceptPlacementStatus(placementStatus)) {
+    const rejected = resolveOfferRejectedDateFromSubmittalNotes(notes);
+    if (rejected != null) return rejected;
+  }
   const fromNotes = resolveNewHireDateFromSubmittalNotes(notes);
   if (fromNotes != null) return fromNotes;
   if (!isDidNotStartPlacementStatus(placementStatus)) return null;
@@ -1610,6 +1724,51 @@ function resolveExtensionDateForExtensionRow(dealType, notes) {
   const key = dealType == null ? "" : String(dealType).trim().toUpperCase();
   if (key !== "EXTENSION") return null;
   return resolveNewHireDateFromSubmittalNotes(notes);
+}
+
+/**
+ * Earliest SENT_TO_CLIENT job-submittal-note created_date: the moment the candidate was first sent
+ * to the client. created_date, not modified_date — it is the event time we want, and a later edit
+ * to the note must not move it.
+ * @param {object[]} notes
+ * @returns {string|null}
+ */
+function resolveSubmissionDateFromSubmittalNotes(notes) {
+  if (!notes || notes.length === 0) return null;
+  let earliestMs = Number.POSITIVE_INFINITY;
+  let earliestRaw = null;
+  for (const note of notes) {
+    if (submittalNoteStatusCode(note) !== "SENT_TO_CLIENT") continue;
+    const raw = note?.created_date ?? note?.modified_date;
+    if (raw == null || String(raw).trim() === "") continue;
+    const ms = Date.parse(String(raw).trim());
+    if (!Number.isFinite(ms) || ms >= earliestMs) continue;
+    earliestMs = ms;
+    earliestRaw = String(raw).trim();
+  }
+  return earliestRaw;
+}
+
+/**
+ * SUBMISSION_DATE for the enriched row (business rule, Oct 2026): when the DEAL was first SENT TO
+ * CLIENT. The submittal's own submitted_date is when it entered AWAITING_APPROVAL — minutes to days
+ * earlier (PLACEMENT_ID 1468833: submitted 20:33:37, sent to client 20:36:58).
+ *
+ * DEAL: the earliest SENT_TO_CLIENT note. A deal that was never sent to client (a direct offer)
+ * stays null — submitted_date is deliberately NOT used as a fallback (business rule, Oct 2026).
+ *
+ * EXTENSION (anything not DEAL): always null, like NEW_HIRE_DATE. An extension is never sent to
+ * client — it carries its contract's DEAL date, which applyExtensionInheritForInsertRows fills in
+ * (parent DEAL -> prior EXTENSION -> run-rate). Returning the extension's own submitted_date here
+ * would block that fill-if-empty inherit. applySubmissionDateFreeze then holds the stored value.
+ * @param {string|null|undefined} dealType
+ * @param {object[]} notes
+ * @returns {string|null}
+ */
+function resolveSubmissionDateForPlacementRow(dealType, notes) {
+  const key = dealType == null ? "" : String(dealType).trim().toUpperCase();
+  if (key !== "DEAL") return null;
+  return resolveSubmissionDateFromSubmittalNotes(notes);
 }
 
 /**
@@ -1707,6 +1866,8 @@ const API_OWNED_COLUMNS = new Set([
   "CELL_PHONE",
   // Nexus candidate_contact_info[]: leap_phone, then work_phone, then home_phone.
   "SECONDARY_CELL_PHN",
+  // Nexus candidate referrer_name. Cynet Health only (excluded for canada / locums).
+  "SOURCER_NAME",
   "PROVIDER_TYPE",
   "RECRUITER_ID",
   "RECRUITER_EMP_NO",
@@ -1723,7 +1884,9 @@ const API_OWNED_COLUMNS = new Set([
   "JOB_TYPE",
   "PLACEMENT_TYPE",
   "PLACEMENT_ID",
-  "SUBMISSION_DATE",
+  // SUBMISSION_DATE is NOT here (Oct 2026): like NEW_HIRE_DATE it is set once — DEAL from the first
+  // SENT_TO_CLIENT note, EXTENSION inherited from its contract's DEAL — and frozen by
+  // applySubmissionDateFreeze, so it must not drive an append on its own.
   "PLACEMENT_STATUS",
   "TERMINATION_REASON",
   "MSP_ID",
@@ -1781,22 +1944,36 @@ const API_OWNED_COLUMNS = new Set([
 Object.freeze(API_OWNED_COLUMNS);
 
 /**
+ * API-owned columns that never trigger an append on their own. They are still written from the API
+ * on every row we append, so they pick up the latest value whenever something else changes (e.g.
+ * PLACEMENT_STATUS); a change to only these leaves the deal sheet as it is. Users asked for this
+ * because candidate status and provider type flip on the Nexus candidate record many times over a
+ * placement's life and each flip was adding a new deal sheet line.
+ */
+const PASSIVE_API_OWNED_COLUMNS = new Set([
+  "CANDIDATE_STATUS",
+  "PROVIDER_TYPE",
+]);
+Object.freeze(PASSIVE_API_OWNED_COLUMNS);
+
+/**
  * Columns written by the insert pipeline itself (never carried forward from baseline).
  * `ID` is generated per insert, `LAST_UPDATED` is set at insert time,
  * `IS_REJECTED` is reset by applyIsRejectedResetForChangedUpdate,
  * `MOVE_RUNRATE` is gated by applyMoveRunrateAppendOverride,
- * `TENTATIVE_END_DATE` is cleared when PLACEMENT_STATUS is DID NOT START; captured from the submittal
- * end_date while OFFERED (soft) and BOOKED, then hard-frozen from baseline forever by
- * applyTentativeDateFreeze (never released, not even on START_DATE change),
+ * `TENTATIVE_END_DATE` follows the submittal end_date while OFFERED / BOOKED / STARTED (a change there
+ * appends on its own), holds the last stored value at every other status, and is cleared at
+ * DID NOT START (applyTentativeDateFreeze),
  * `NEW_HIRE_DATE` is set from job-submittal-notes (earliest BOOKED modified_date) for DEAL rows when baseline is empty;
  * EXTENSION rows are not set from API on enrich; once baseline has a value it is frozen on update-append (DEAL or EXTENSION)
  * unless `NEW_HIRE_DATE_FREEZE_ENABLED=false` (one-time migration to rewrite legacy insert-time stamps).
  * `EXTENSION_DATE` is earliest BOOKED job-submittal-note date for EXTENSION rows (TIMESTAMP); frozen once set
  * unless `EXTENSION_DATE_FREEZE_ENABLED=false` (one-time migration to rewrite legacy submittal created_date stamps).
  * `EXTENSION_START_DATE` mirrors START_DATE for EXTENSION rows (null for DEAL); updates with START_DATE.
- * `OFFER_TIME_START_DATE` is set from Nexus job.start_date on first insert / empty baseline; once baseline
- * has a value it is frozen on update-append (DEAL or EXTENSION) even when START_DATE changes
- * (applyOfferTimeStartDateFreeze) — never re-compared as API-owned.
+ * `OFFER_TIME_START_DATE` is set on first insert / empty baseline — from the SUBMITTAL start date, or the
+ * JOB start date for a DID NOT ACCEPT row (resolveStartAndOfferTimeDates, Oct 2026); once baseline has a
+ * value it is frozen on update-append (DEAL or EXTENSION) even when START_DATE changes, except once when
+ * the row turns DID NOT ACCEPT (applyOfferTimeStartDateFreeze) — never re-compared as API-owned.
  */
 const SYSTEM_CONTROLLED_COLUMNS = new Set([
   "ID",
@@ -1820,9 +1997,11 @@ Object.freeze(SYSTEM_CONTROLLED_COLUMNS);
  * LEVEL_2_CSM/LEVEL_3_CSM/LEVEL_4_CSM are intentionally NOT here even though they used to be
  * manual — they're now recomputed on every insert from ONSITE_AM_EMAIL's manager chain (see
  * applyOnsiteAmCsmHierarchyForRows in bigQueryClient.js), so they must never be carried forward.
+ * ACC_DIR_OR_VERT_HEAD is not here either (Oct 2026): the business moved to the Level 1-4 CSM
+ * hierarchy (ONSITE_AM + LEVEL_2/3/4_CSM), so it is no longer carried from the baseline, the run-rate
+ * row or a parent DEAL, and new rows land with it empty.
  */
 const MANUAL_COLUMNS = new Set([
-  "ACC_DIR_OR_VERT_HEAD",
   "AGENCY_SWITCH",
   "ASSOCIATE_AM",
   "ASSOCIATE_AM_EMP_NO",
@@ -1944,6 +2123,10 @@ Object.freeze(MANUAL_COLUMNS);
 
 module.exports = {
   toNumberOrNull,
+  mapJobPlacementTypeFromJobType,
+  isFtPlacementRow,
+  mapDealSheetPermDetailsToBq,
+  applyFtPaymentTerms,
   addNumbersOrNull,
   trimContactValue,
   mapUsStateCodeToRegion,
@@ -1976,7 +2159,9 @@ module.exports = {
   mapDealSheetRatesListToBq,
   mapCanadaTypeFromTenNintyNine,
   nexusBinaryFlagToBoolean,
+  mapSubmittalStatusToPlacementStatus,
   mapSubmittalCodeToPlacementStatus,
+  applyEndedPlacementStatusByInitialStart,
   computeDerivedPlacementFields,
   startDateOnOrAfterUtcMin,
   effectiveMinFilterDate,
@@ -1985,16 +2170,21 @@ module.exports = {
   isTerminationApiEligiblePlacementStatus,
   normalizePlacementStatusKey,
   isDidNotStartPlacementStatus,
-  isBookedPlacementStatus,
   isTentativeCapturePlacementStatus,
   resolveTentativeDateForPlacementRow,
   resolveNewHireDateFromSubmittalNotes,
   resolveNewHireDateForDealRow,
+  resolveOfferRejectedDateFromSubmittalNotes,
+  resolveStartAndOfferTimeDates,
+  isDidNotAcceptPlacementStatus,
   resolveExtensionDateForExtensionRow,
+  resolveSubmissionDateFromSubmittalNotes,
+  resolveSubmissionDateForPlacementRow,
   extractTerminationReasonValue,
   pickLatestTerminationDetailItem,
   mapTerminationReasonLogRowForDealSheet,
   API_OWNED_COLUMNS,
+  PASSIVE_API_OWNED_COLUMNS,
   SYSTEM_CONTROLLED_COLUMNS,
   MANUAL_COLUMNS,
 };

@@ -16,6 +16,12 @@ test("resolveHierarchyColumnForTitle handles real '<role> - Delivery' title suff
   assert.equal(resolveHierarchyColumnForTitle("AVP - Delivery"), "AVP");
   assert.equal(resolveHierarchyColumnForTitle("Associate Vice President - Delivery"), "AVP");
   assert.equal(resolveHierarchyColumnForTitle("AVP"), "AVP");
+  // Senior VP spelled out (Varun Gupta's real titles) is VP, and never collides with AVP.
+  assert.equal(resolveHierarchyColumnForTitle("Sr. Vice President - Delivery"), "VP");
+  assert.equal(resolveHierarchyColumnForTitle("Sr. Vice President (SVP)"), "VP");
+  assert.equal(resolveHierarchyColumnForTitle("Sr. VP (SVP)"), "VP");
+  assert.equal(resolveHierarchyColumnForTitle("Senior Vice President"), "VP");
+  assert.equal(resolveHierarchyColumnForTitle("Associate Vice President (AVP)"), null);
   // Unchanged exact matches still work.
   assert.equal(resolveHierarchyColumnForTitle("Sr. Delivery Manager"), "ACCOUNT_MANAGER");
   assert.equal(resolveHierarchyColumnForTitle("Delivery Director"), "DELIVERY_DIRECTOR");

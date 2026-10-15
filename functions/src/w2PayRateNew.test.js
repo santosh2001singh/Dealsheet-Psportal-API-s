@@ -262,6 +262,15 @@ test("computeNewMargin with zero billable hrs equals simple subtract", () => {
   assert.equal(computeNewMargin(row, 100, 80), 20);
 });
 
+test("computeNewMargin excludes billable hrs when the percentage is blank", () => {
+  // Placement 1470046 (Jennifer L. Dahmani): 8 hrs, Nexus billable_orientation null -> "0.00%".
+  const row = { PO_HOURS: 468, BILLABLE_ORIENTATION_HRS: 8, BILLABLE_ORIENTATION: "0.00%" };
+  assert.ok(Math.abs(computeNewMargin(row, 81.13, 73.8) - 7.33) < 1e-9);
+  for (const blank of [null, "", "0%"]) {
+    assert.equal(computeNewMargin({ ...row, BILLABLE_ORIENTATION: blank }, 100, 80), 20);
+  }
+});
+
 test("computeNewMargin returns null when PO_HOURS is zero", () => {
   const row = {
     PO_HOURS: 0,

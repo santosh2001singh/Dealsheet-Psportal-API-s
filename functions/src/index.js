@@ -26,6 +26,7 @@ const {
   syncLiveRecruiterHierarchyForDomain,
   syncOwnershipChangeLogsFromBigQuery,
   syncOwnershipChangeLogEffectiveDatesFromExtensions,
+  syncOwnershipChangeLogDatesForDomain,
   refreshPlacementRecordToBigQuery,
   bulkBackfillPlacementRecordsFromNexus,
   resolveBulkBackfillMaxPlacementIds,
@@ -120,6 +121,54 @@ const SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS = new Set(["canada", "locums"]);
 function domainRunsAuditLogScans(domain) {
   const key = domain == null ? "" : String(domain).trim().toLowerCase();
   return !SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS.has(key);
+}
+
+/**
+ * Domains in SYNC_DOMAINS_WITHOUT_AUDIT_LOG_SCANS that still run the ownership_change_logs scan and
+ * its date sync — nothing else (no inorganic scan, no deal-sheet maintenance backfills).
+ *
+ * Canada (Sep 2026): no inorganic hierarchy, so ownership_change_logs is its only record of who held
+ * each seat and from when. See OWNERSHIP_LOG_WRITES_ENABLED_FOR_CANADA (bigQueryClient) for the
+ * matching insert-time switch.
+ */
+const SYNC_DOMAINS_WITH_OWNERSHIP_LOG_SCANS_ONLY = new Set(["canada"]);
+
+/** True when `domain` skips the shared audit scans but still runs the ownership-log ones. */
+function domainRunsOwnershipLogScansOnly(domain) {
+  const key = domain == null ? "" : String(domain).trim().toLowerCase();
+  return SYNC_DOMAINS_WITH_OWNERSHIP_LOG_SCANS_ONLY.has(key);
+}
+
+/**
+ * ownership_change_logs scan, then its date sync, for one domain. Both non-fatal: the deal sheet
+ * work of the run has already succeeded. The date sync runs second so rows inserted by the scan are
+ * re-dated in the same run.
+ */
+async function runOwnershipLogScansForDomain(label, domain, bqDataset) {
+  let ownershipChangeLog = null;
+  try {
+    ownershipChangeLog = await syncOwnershipChangeLogsFromBigQuery({
+      sync_domain: domain,
+      bq_dataset: bqDataset,
+      bq_table: "ownership_change_logs",
+    });
+    logLine(
+      `[${label}] ownership change log result domain=${domain} inserted=${ownershipChangeLog.inserted} changedPairs=${ownershipChangeLog.total} contractChainPairs=${ownershipChangeLog.contractChainPairs} builtRows=${ownershipChangeLog.builtRows} errorBatches=${ownershipChangeLog.errorBatches} elapsed=${ownershipChangeLog.elapsed || "n/a"}`
+    );
+  } catch (ownershipErr) {
+    logError(`[${label}] ownership change log scan FAILED (non-fatal)`, ownershipErr);
+  }
+  let ownershipDates = null;
+  try {
+    ownershipDates = await syncOwnershipChangeLogDatesForDomain({
+      sync_domain: domain,
+      deal_sheet_bq_dataset: bqDataset,
+      bq_table: "ownership_change_logs",
+    });
+  } catch (dateErr) {
+    logError(`[${label}] ownership date sync FAILED (non-fatal)`, dateErr);
+  }
+  return { ownershipChangeLog, ownershipDates };
 }
 
 /** Max placement composites refreshed per `dealSheetSyncUpdateTrigger` invocation (env override). */
@@ -756,6 +805,11 @@ async function runDealSheetInsertSyncForDomain(domain, label) {
   }
 
   if (!domainRunsAuditLogScans(domain)) {
+    if (domainRunsOwnershipLogScansOnly(domain)) {
+      logLine(`[${label}] audit-log scans SKIPPED for domain=${domain} except ownership (inorganic / effective-date backfills)`);
+      const ownershipLogs = await runOwnershipLogScansForDomain(label, domain, bqDataset);
+      return { success: true, domain, result, liveRecruiterHierarchy, auditLogScansSkipped: true, ...ownershipLogs };
+    }
     logLine(
       `[${label}] audit-log scans SKIPPED for domain=${domain} (ownership / inorganic / effective-date)`
     );
@@ -813,7 +867,7 @@ async function runDealSheetInsertSyncForDomain(domain, label) {
       bq_table: "ownership_change_logs",
     });
     logLine(
-      `[${label}] ownership change log result inserted=${ownershipChangeLogResult.inserted} changedPairs=${ownershipChangeLogResult.total} handoverRows=${ownershipChangeLogResult.handoverRows} builtRows=${ownershipChangeLogResult.builtRows} errorBatches=${ownershipChangeLogResult.errorBatches} elapsed=${ownershipChangeLogResult.elapsed || "n/a"}`
+      `[${label}] ownership change log result inserted=${ownershipChangeLogResult.inserted} changedPairs=${ownershipChangeLogResult.total} alreadyLogged=${ownershipChangeLogResult.alreadyLogged} builtRows=${ownershipChangeLogResult.builtRows} errorBatches=${ownershipChangeLogResult.errorBatches} elapsed=${ownershipChangeLogResult.elapsed || "n/a"}`
     );
   } catch (ownershipErr) {
     logError(`[${label}] ownership change log scan FAILED (non-fatal)`, ownershipErr);
@@ -951,6 +1005,11 @@ async function runDealSheetUpdateSyncForDomain(domain, label) {
   }
 
   if (!domainRunsAuditLogScans(domain)) {
+    if (domainRunsOwnershipLogScansOnly(domain)) {
+      logLine(`[${label}] audit-log scans SKIPPED for domain=${domain} except ownership (inorganic)`);
+      const ownershipLogs = await runOwnershipLogScansForDomain(label, domain, bqDataset);
+      return { success: true, domain, result, liveRecruiterHierarchy, auditLogScansSkipped: true, ...ownershipLogs };
+    }
     logLine(`[${label}] audit-log scans SKIPPED for domain=${domain} (inorganic / ownership)`);
     return { success: true, domain, result, liveRecruiterHierarchy, auditLogScansSkipped: true };
   }
@@ -985,7 +1044,7 @@ async function runDealSheetUpdateSyncForDomain(domain, label) {
       bq_table: "ownership_change_logs",
     });
     logLine(
-      `[${label}] ownership change log result inserted=${ownershipChangeLogResult.inserted} changedPairs=${ownershipChangeLogResult.total} handoverRows=${ownershipChangeLogResult.handoverRows} builtRows=${ownershipChangeLogResult.builtRows} errorBatches=${ownershipChangeLogResult.errorBatches} elapsed=${ownershipChangeLogResult.elapsed || "n/a"}`
+      `[${label}] ownership change log result inserted=${ownershipChangeLogResult.inserted} changedPairs=${ownershipChangeLogResult.total} alreadyLogged=${ownershipChangeLogResult.alreadyLogged} builtRows=${ownershipChangeLogResult.builtRows} errorBatches=${ownershipChangeLogResult.errorBatches} elapsed=${ownershipChangeLogResult.elapsed || "n/a"}`
     );
   } catch (ownershipErr) {
     // Non-fatal, same as the inorganic scan above.

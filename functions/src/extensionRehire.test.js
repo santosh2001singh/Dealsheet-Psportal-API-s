@@ -21,8 +21,9 @@ function facts(overrides = {}) {
   return {
     dealType: "DEAL",
     everStarted: false,
-    isRepeatDeal: false,
-    parentIsRepeatDeal: false,
+    hasEarlierContract: false,
+    hasEarlierStart: false,
+    parentHasEarlierStart: false,
     ...overrides,
   };
 }
@@ -64,44 +65,47 @@ test("isStartedPlacementStatus: STARTED/ACTIVE/ENDED count as started, BOOKED/DN
 // DEAL rows
 // ---------------------------------------------------------------------------
 
-test("the candidate's FIRST deal stays blank", () => {
+test("the candidate's FIRST deal stays blank at every status", () => {
   assert.equal(classifyExtensionRehire(facts()), null);
-});
-
-test("the first deal stays blank even after it is extended", () => {
-  // The EXTENSION label now lives on the extension rows, never on the deal itself.
   assert.equal(classifyExtensionRehire(facts({ everStarted: true })), null);
 });
 
-test("a repeat DEAL still BOOKED is REOFFERED", () => {
-  assert.equal(classifyExtensionRehire(facts({ isRepeatDeal: true })), V.REOFFERED);
+test("a later DEAL not started yet (BOOKED / DNA / DNS) is REOFFERED", () => {
+  assert.equal(classifyExtensionRehire(facts({ hasEarlierContract: true })), V.REOFFERED);
+  // Whatever the earlier contract did — DNS before or a real start before.
+  assert.equal(
+    classifyExtensionRehire(facts({ hasEarlierContract: true, hasEarlierStart: true })),
+    V.REOFFERED
+  );
 });
 
-test("a repeat DEAL that STARTED is REBOOKED", () => {
+test("a later DEAL that STARTED after an earlier start is REBOOKED", () => {
   assert.equal(
-    classifyExtensionRehire(facts({ isRepeatDeal: true, everStarted: true })),
+    classifyExtensionRehire(facts({ hasEarlierContract: true, hasEarlierStart: true, everStarted: true })),
     V.REBOOKED
   );
 });
 
-test("a repeat DEAL that started then ENDED stays REBOOKED (ever-started is sticky)", () => {
+test("a later DEAL that STARTED when every earlier contract was DNA/DNS stays blank (first start)", () => {
+  assert.equal(
+    classifyExtensionRehire(facts({ hasEarlierContract: true, hasEarlierStart: false, everStarted: true })),
+    null
+  );
+});
+
+test("a REBOOKED deal that then ENDED stays REBOOKED (ever-started is sticky)", () => {
   assert.equal(isStartedPlacementStatus("ENDED"), true);
   assert.equal(
-    classifyExtensionRehire(facts({ isRepeatDeal: true, everStarted: true })),
+    classifyExtensionRehire(facts({ hasEarlierContract: true, hasEarlierStart: true, everStarted: true })),
     V.REBOOKED
   );
-});
-
-test("repeat is candidate-level, not client-level — the same client counts too", () => {
-  // isRepeatDeal is set by ANY earlier placement; the classifier has no client input at all.
-  assert.equal(classifyExtensionRehire(facts({ isRepeatDeal: true })), V.REOFFERED);
 });
 
 // ---------------------------------------------------------------------------
 // EXTENSION rows — value comes from the parent deal, never from rank or status
 // ---------------------------------------------------------------------------
 
-test("extension of the FIRST deal is EXTENSION at any placement status", () => {
+test("extension of a first-start deal is EXTENSION at any placement status", () => {
   for (const everStarted of [true, false]) {
     assert.equal(
       classifyExtensionRehire(facts({ dealType: "EXTENSION", everStarted })),
@@ -110,11 +114,11 @@ test("extension of the FIRST deal is EXTENSION at any placement status", () => {
   }
 });
 
-test("extension of a REPEAT deal is REBOOKED/EXTENSION at any placement status", () => {
+test("extension of a REBOOKED deal is REBOOKED/EXTENSION at any placement status", () => {
   for (const everStarted of [true, false]) {
     assert.equal(
       classifyExtensionRehire(
-        facts({ dealType: "EXTENSION", parentIsRepeatDeal: true, everStarted })
+        facts({ dealType: "EXTENSION", parentHasEarlierStart: true, everStarted })
       ),
       V.REBOOKED_EXTENSION
     );
@@ -128,7 +132,7 @@ test("every extension in a run carries the same value — rank is not a factor",
   assert.equal(first, V.EXTENSION);
   assert.equal(later, V.EXTENSION);
   assert.equal(
-    classifyExtensionRehire(facts({ dealType: "EXTENSION", parentIsRepeatDeal: true })),
+    classifyExtensionRehire(facts({ dealType: "EXTENSION", parentHasEarlierStart: true })),
     V.REBOOKED_EXTENSION
   );
 });
@@ -137,25 +141,31 @@ test("a DNS extension keeps its parent-derived value", () => {
   assert.equal(isStartedPlacementStatus("DID NOT START"), false);
   assert.equal(
     classifyExtensionRehire(
-      facts({ dealType: "EXTENSION", parentIsRepeatDeal: true, everStarted: false })
+      facts({ dealType: "EXTENSION", parentHasEarlierStart: true, everStarted: false })
     ),
     V.REBOOKED_EXTENSION
   );
 });
 
 test("an extension is never REOFFERED/REBOOKED — those are DEAL-only values now", () => {
-  for (const parentIsRepeatDeal of [true, false]) {
+  for (const parentHasEarlierStart of [true, false]) {
     const value = classifyExtensionRehire(
-      facts({ dealType: "EXTENSION", parentIsRepeatDeal, everStarted: true, isRepeatDeal: true })
+      facts({
+        dealType: "EXTENSION",
+        parentHasEarlierStart,
+        everStarted: true,
+        hasEarlierContract: true,
+        hasEarlierStart: true,
+      })
     );
     assert.ok(value === V.EXTENSION || value === V.REBOOKED_EXTENSION);
   }
 });
 
 test("run-rate-only chain: an extension with no parent DEAL here reads EXTENSION", () => {
-  // parentIsRepeatDeal stays false when the deal is not in the deal sheet at all.
+  // parentHasEarlierStart stays false when the deal is not in the deal sheet at all.
   assert.equal(
-    classifyExtensionRehire(facts({ dealType: "EXTENSION", parentIsRepeatDeal: false })),
+    classifyExtensionRehire(facts({ dealType: "EXTENSION", parentHasEarlierStart: false })),
     V.EXTENSION
   );
 });
@@ -164,18 +174,22 @@ test("unknown / blank DEAL_TYPE stays blank", () => {
   assert.equal(classifyExtensionRehire(facts({ dealType: "" })), null);
   assert.equal(classifyExtensionRehire(facts({ dealType: null })), null);
   assert.equal(
-    classifyExtensionRehire(facts({ dealType: "PERM", isRepeatDeal: true, everStarted: true })),
+    classifyExtensionRehire(
+      facts({ dealType: "PERM", hasEarlierContract: true, hasEarlierStart: true, everStarted: true })
+    ),
     null
   );
 });
 
 test("classifier is case/space insensitive on DEAL_TYPE", () => {
   assert.equal(
-    classifyExtensionRehire(facts({ dealType: " extension ", parentIsRepeatDeal: true })),
+    classifyExtensionRehire(facts({ dealType: " extension ", parentHasEarlierStart: true })),
     V.REBOOKED_EXTENSION
   );
   assert.equal(
-    classifyExtensionRehire(facts({ dealType: " deal ", isRepeatDeal: true, everStarted: true })),
+    classifyExtensionRehire(
+      facts({ dealType: " deal ", hasEarlierContract: true, hasEarlierStart: true, everStarted: true })
+    ),
     V.REBOOKED
   );
 });
@@ -188,8 +202,9 @@ test("generated CASE mirrors the rule list order and values", () => {
   const caseSql = buildExtensionRehireCaseSql();
   const branchOrder = [...caseSql.matchAll(/THEN '([^']+)'/g)].map((m) => m[1]);
   assert.deepEqual(branchOrder, EXT_OR_REHIRE_RULES.map((r) => r.value));
-  assert.ok(caseSql.includes("parent_is_repeat_deal"));
-  assert.ok(caseSql.includes("is_repeat_deal AND ever_started"));
+  assert.ok(caseSql.includes("parent_has_earlier_start"));
+  assert.ok(caseSql.includes("ever_started AND has_earlier_start"));
+  assert.ok(caseSql.includes("NOT ever_started AND has_earlier_contract"));
   // Rank no longer participates in the classification.
   assert.ok(!caseSql.includes("extension_rank"));
   assert.ok(!caseSql.includes("generation_extension_count"));
@@ -221,7 +236,7 @@ test("buildExtensionRehireSql chains on candidate + client + VMS job", () => {
   assert.ok(sql.includes("NULLIF(TRIM(CAST(VMS_JOB_ID AS STRING)), '')"));
   // Extensions inherit their parent deal instead of being ranked within a generation.
   assert.ok(sql.includes("extension_parents AS ("));
-  assert.ok(sql.includes("repeat_deals AS ("));
+  assert.ok(sql.includes("deal_history AS ("));
   assert.ok(!sql.includes("deal_generation"));
   // A unit is a deal/extension event: DEAL_SHEET_ID, or PLACEMENT_ID when that is null.
   assert.ok(sql.includes("CONCAT('ds:', CAST(DEAL_SHEET_ID AS STRING))"));
@@ -237,19 +252,81 @@ test("buildExtensionRehireSql includes run-rate history only for the tables it i
   }).sql;
   assert.ok(withRunrate.includes("FROM `proj.ds.all_CH_data_runrate`"));
   assert.ok(withRunrate.includes("FROM `proj.ds.all_Health_Canada_data_Runrate`"));
+  // A run-rate row is an earlier contract; only its started statuses count as an earlier start.
+  assert.ok(withRunrate.includes("AS hist_started"));
 
   const withoutRunrate = buildExtensionRehireSql({ projectId: "proj", datasetId: "ds" }).sql;
   assert.ok(!withoutRunrate.includes("all_CH_data_runrate"));
-  // Deal-sheet history alone still drives the repeat-deal rule.
+  // Deal-sheet history alone still drives the earlier-contract rule.
   assert.ok(withoutRunrate.includes("candidate_history AS ("));
 });
 
-test("repeat-deal lookup is client-agnostic and needs strictly earlier history", () => {
+test("earlier-contract lookup is client-agnostic and needs strictly earlier history", () => {
   const { sql } = buildExtensionRehireSql({ projectId: "proj", datasetId: "ds" });
   // No client comparison at all — a return to the SAME client is still a repeat.
   assert.ok(!sql.includes("h.parent_client_key != u.parent_client_key"));
   assert.ok(sql.includes("h.hist_start < u.start_key"));
+  assert.ok(sql.includes("LOGICAL_OR(IFNULL(h.hist_started, FALSE)) AS has_earlier_start"));
   assert.ok(sql.includes("WHERE u.deal_type = 'DEAL'"));
+});
+
+test("runrateUpdateTableIds copies the deal sheet value onto the run-rate rows from the deal sheet", () => {
+  const { sql, runrateUpdateTableIds } = buildExtensionRehireSql({
+    projectId: "proj",
+    datasetId: "ds",
+    runrateTableIds: ["all_CH_data_runrate"],
+    runrateUpdateTableIds: ["all_CH_data_runrate"],
+  });
+  assert.deepEqual(runrateUpdateTableIds, ["all_CH_data_runrate"]);
+  assert.ok(sql.includes("UPDATE `proj.ds.all_CH_data_runrate` t"));
+  assert.equal((sql.match(/^UPDATE /gm) || []).length, EXT_OR_REHIRE_TABLE_IDS.length + 1);
+  // Same DEAL_SHEET_ID / PLACEMENT_ID key as the deal sheet unit.
+  const runrateUpdate = sql.slice(sql.indexOf("UPDATE `proj.ds.all_CH_data_runrate` t"));
+  assert.ok(runrateUpdate.includes("CONCAT('ds:', CAST(t.DEAL_SHEET_ID AS STRING))"));
+  // Run-rate rows never shape the unit values.
+  assert.ok(sql.includes("TRUE AS is_runrate"));
+  assert.ok(sql.includes("WHERE NOT is_runrate"));
+  // Data-team rows (no DEAL_TYPE) are neither read as targets nor written.
+  assert.equal(
+    (sql.match(/UPPER\(TRIM\(CAST\((t\.)?DEAL_TYPE AS STRING\)\)\) IN \('DEAL', 'EXTENSION'\)/g) || []).length,
+    2
+  );
+});
+
+test("without runrateUpdateTableIds there is no run-rate UPDATE", () => {
+  const plain = buildExtensionRehireSql({ projectId: "proj", datasetId: "ds", runrateTableIds: ["all_CH_data_runrate"] }).sql;
+  assert.ok(!plain.includes("UPDATE `proj.ds.all_CH_data_runrate`"));
+  assert.ok(!plain.includes("TRUE AS is_runrate"));
+});
+
+test("updateTableIds writes only those tables but still reads every table as history", () => {
+  const active = ["cynet_health_deal_sheet", "cynet_health_canada_deal_sheet", "cynet_locums_deal_sheet"];
+  const { sql } = buildExtensionRehireSql({
+    projectId: "proj",
+    datasetId: "ds",
+    runrateUpdateTableIds: ["all_CH_data_runrate"],
+    updateTableIds: [...active, "all_CH_data_runrate"],
+  });
+  for (const tableId of EXT_OR_REHIRE_TABLE_IDS) {
+    assert.ok(sql.includes(`FROM \`proj.ds.${tableId}\``), `reads ${tableId}`);
+    assert.equal(sql.includes(`UPDATE \`proj.ds.${tableId}\` t`), active.includes(tableId), `update ${tableId}`);
+  }
+  assert.ok(sql.includes("UPDATE `proj.ds.all_CH_data_runrate` t"));
+  assert.ok(!sql.includes("'cynet_health_ended_deal_sheet', 'cynet_health_canada_ended_deal_sheet'"));
+});
+
+test("previewOnly writes nothing and returns old -> new counts", () => {
+  const { sql } = buildExtensionRehireSql({
+    projectId: "proj",
+    datasetId: "ds",
+    runrateUpdateTableIds: ["all_CH_data_runrate"],
+    previewOnly: true,
+  });
+  assert.ok(!/^UPDATE /m.test(sql));
+  assert.ok(!sql.includes("ext_rehire_pending"));
+  assert.ok(sql.includes("AS old_value"));
+  assert.ok(sql.includes("AS new_value"));
+  assert.ok(sql.includes("AS rows_changing"));
 });
 
 // ---------------------------------------------------------------------------
@@ -342,7 +419,7 @@ test("pending counts are computed before the updates and cover every table", () 
 // End-to-end scenarios
 //
 // `computeValues` is a JS model of the CTEs in buildExtensionRehireSql (unit grouping, sticky
-// ever-started, candidate+client+VMS chain, repeat-deal history, extension->parent-deal
+// ever-started, candidate+client+VMS chain, earlier-contract/earlier-start history, extension->parent-deal
 // inheritance). It exists so the SCENARIOS below exercise the whole rule composition, not just the
 // final CASE.
 // ---------------------------------------------------------------------------
@@ -375,31 +452,35 @@ function computeValues(rows, runrateHistory = []) {
     u.chainKey = `${u.candidateKey}|${u.clientKey}${u.vmsJobKey ? `|vms:${u.vmsJobKey}` : ""}`;
   }
 
-  // candidate history: ANY earlier placement, client-agnostic.
+  // candidate history: ANY earlier contract, client-agnostic, with whether it started.
   const history = [
-    ...flat.map((u) => ({ candidateKey: u.candidateKey, histStart: u.startKey })),
+    ...flat.map((u) => ({ candidateKey: u.candidateKey, histStart: u.startKey, histStarted: u.everStarted })),
     ...runrateHistory.map((h) => ({
       candidateKey: `nx:${h.candidateNexusId}`,
       histStart: h.startDate ?? null,
+      histStarted: isStartedPlacementStatus(h.placementStatus ?? "ENDED"),
     })),
   ];
 
   for (const u of flat) {
-    u.isRepeatDeal =
-      u.dealType === "DEAL" &&
-      history.some(
-        (h) =>
-          h.candidateKey === u.candidateKey &&
-          h.histStart != null &&
-          u.startKey != null &&
-          h.histStart < u.startKey
-      );
+    const earlier =
+      u.dealType !== "DEAL"
+        ? []
+        : history.filter(
+            (h) =>
+              h.candidateKey === u.candidateKey &&
+              h.histStart != null &&
+              u.startKey != null &&
+              h.histStart < u.startKey
+          );
+    u.hasEarlierContract = earlier.length > 0;
+    u.hasEarlierStart = earlier.some((h) => h.histStarted);
   }
 
   // Each extension inherits the newest DEAL of its chain starting at or before it.
   for (const u of flat) {
     if (u.dealType !== "EXTENSION") {
-      u.parentIsRepeatDeal = false;
+      u.parentHasEarlierStart = false;
       continue;
     }
     const candidates = flat
@@ -414,7 +495,7 @@ function computeValues(rows, runrateHistory = []) {
           String(b.startKey ?? "").localeCompare(String(a.startKey ?? "")) ||
           b.unitKey.localeCompare(a.unitKey)
       );
-    u.parentIsRepeatDeal = candidates.length > 0 ? candidates[0].isRepeatDeal === true : false;
+    u.parentHasEarlierStart = candidates.length > 0 ? candidates[0].hasEarlierStart === true : false;
   }
 
   const out = {};
@@ -462,7 +543,7 @@ test("scenario: every extension of the first deal reads EXTENSION, whatever the 
   assert.equal(values["ds:4"], V.EXTENSION);
 });
 
-test("scenario: repeat deal moves REOFFERED -> REBOOKED and stays REBOOKED on ENDED", () => {
+test("scenario: later deal moves REOFFERED -> REBOOKED and stays REBOOKED on ENDED", () => {
   const base = [
     row({ dealSheetId: 1, dealType: "DEAL", placementStatus: "ENDED", startDate: "2025-02-01" }),
   ];
@@ -488,7 +569,7 @@ test("scenario: repeat deal moves REOFFERED -> REBOOKED and stays REBOOKED on EN
   );
 });
 
-test("scenario: extensions of a repeat deal are REBOOKED/EXTENSION at any status", () => {
+test("scenario: extensions of a REBOOKED deal are REBOOKED/EXTENSION at any status", () => {
   const values = computeValues([
     row({ dealSheetId: 1, dealType: "DEAL", placementStatus: "ENDED", startDate: "2025-02-01" }),
     row({
@@ -522,8 +603,8 @@ test("scenario: extensions of a repeat deal are REBOOKED/EXTENSION at any status
   assert.equal(values["ds:4"], V.REBOOKED_EXTENSION);
 });
 
-test("scenario: returning to the SAME client is still a repeat deal", () => {
-  // Client-agnostic: the second deal at Mercy Health is a repeat just like a move elsewhere.
+test("scenario: returning to the SAME client still counts the earlier contract", () => {
+  // Client-agnostic: the second deal at Mercy Health counts the first just like a move elsewhere.
   const values = computeValues([
     row({ dealSheetId: 1, dealType: "DEAL", placementStatus: "ENDED", startDate: "2025-02-01" }),
     row({ dealSheetId: 2, dealType: "DEAL", placementStatus: "BOOKED", startDate: "2026-06-01" }),
@@ -532,7 +613,7 @@ test("scenario: returning to the SAME client is still a repeat deal", () => {
   assert.equal(values["ds:2"], V.REOFFERED);
 });
 
-test("scenario: repeat deal from run-rate history alone (candidate not in the deal sheet before)", () => {
+test("scenario: earlier contract from run-rate history alone (candidate not in the deal sheet before)", () => {
   const values = computeValues(
     [row({ dealSheetId: 2, dealType: "DEAL", placementStatus: "BOOKED", startDate: "2026-06-01" })],
     [{ candidateNexusId: 501, parentClientName: "Sutter Health", startDate: "2024-03-01" }]
@@ -552,7 +633,7 @@ test("scenario: later history does not retro-flag the earlier deal", () => {
       parentClientName: "Sutter Health",
     }),
   ]);
-  // Only the LATER deal is the repeat — it needs strictly earlier history.
+  // Only the LATER deal looks back — it needs strictly earlier history.
   assert.equal(values["ds:1"], null);
   assert.equal(values["ds:2"], V.REOFFERED);
 });
@@ -572,9 +653,66 @@ test("scenario: a different VMS job at the same client is a separate chain", () 
     row({ dealSheetId: 3, dealType: "EXTENSION", placementStatus: "BOOKED", startDate: "2026-09-01", vmsJobId: "J2" }),
   ]);
   assert.equal(values["ds:1"], null);
-  assert.equal(values["ds:2"], V.REBOOKED); // repeat candidate
+  assert.equal(values["ds:2"], V.REBOOKED); // J1 started earlier
   // ds:3 hangs off the J2 deal (a repeat), not the J1 one.
   assert.equal(values["ds:3"], V.REBOOKED_EXTENSION);
+});
+
+test("scenario: DNS first, then a second contract — REOFFERED while booked, blank once it starts", () => {
+  const first = row({ dealSheetId: 1, dealType: "DEAL", placementStatus: "DID NOT START", startDate: "2025-02-01" });
+  const second = (status, at) =>
+    row({ dealSheetId: 2, dealType: "DEAL", placementStatus: status, startDate: "2026-06-01", at });
+
+  assert.equal(computeValues([first])["ds:1"], null);
+  assert.equal(computeValues([first, second("BOOKED", 1)])["ds:2"], V.REOFFERED);
+  assert.equal(computeValues([first, second("DID NOT ACCEPT", 1)])["ds:2"], V.REOFFERED);
+  // First real start of the candidate: blank, and its extensions read plain EXTENSION.
+  const started = computeValues([
+    first,
+    second("BOOKED", 1),
+    second("STARTED", 2),
+    row({ dealSheetId: 3, dealType: "EXTENSION", placementStatus: "STARTED", startDate: "2026-09-01" }),
+  ]);
+  assert.equal(started["ds:2"], null);
+  assert.equal(started["ds:3"], V.EXTENSION);
+});
+
+test("scenario: the earlier contract still STARTED (not ended) counts as an earlier start", () => {
+  const values = computeValues([
+    row({ dealSheetId: 1, dealType: "DEAL", placementStatus: "STARTED", startDate: "2026-01-05" }),
+    row({ dealSheetId: 2, dealType: "DEAL", placementStatus: "STARTED", startDate: "2026-06-01", clientId: 91 }),
+  ]);
+  assert.equal(values["ds:2"], V.REBOOKED);
+});
+
+test("scenario: run-rate history — BOOKED counts as an earlier contract, not an earlier start", () => {
+  const deal = (status) =>
+    row({ dealSheetId: 2, dealType: "DEAL", placementStatus: status, startDate: "2026-06-01" });
+  const bookedOnly = [{ candidateNexusId: 501, startDate: "2024-03-01", placementStatus: "BOOKED" }];
+  const ended = [{ candidateNexusId: 501, startDate: "2024-03-01", placementStatus: "ENDED<30" }];
+  assert.equal(computeValues([deal("BOOKED")], bookedOnly)["ds:2"], V.REOFFERED);
+  assert.equal(computeValues([deal("STARTED")], bookedOnly)["ds:2"], null);
+  assert.equal(computeValues([deal("STARTED")], ended)["ds:2"], V.REBOOKED);
+});
+
+test("scenario: the business sheet — count 1 to 5", () => {
+  // 1 DNS, 2 DNS, 3 started + extended (first start), 4 started + extended, 5 DNA.
+  const values = computeValues([
+    row({ dealSheetId: 1, dealType: "DEAL", placementStatus: "DID NOT START", startDate: "2025-01-01" }),
+    row({ dealSheetId: 2, dealType: "DEAL", placementStatus: "DID NOT START", startDate: "2025-03-01" }),
+    row({ dealSheetId: 3, dealType: "DEAL", placementStatus: "ENDED", startDate: "2025-05-01" }),
+    row({ dealSheetId: 4, dealType: "EXTENSION", placementStatus: "ENDED<30", startDate: "2025-08-01" }),
+    row({ dealSheetId: 5, dealType: "DEAL", placementStatus: "ENDED", startDate: "2026-01-01", clientId: 91 }),
+    row({ dealSheetId: 6, dealType: "EXTENSION", placementStatus: "STARTED", startDate: "2026-04-01", clientId: 91 }),
+    row({ dealSheetId: 7, dealType: "DEAL", placementStatus: "DID NOT ACCEPT", startDate: "2026-09-01", clientId: 92 }),
+  ]);
+  assert.equal(values["ds:1"], null);
+  assert.equal(values["ds:2"], V.REOFFERED);
+  assert.equal(values["ds:3"], null);
+  assert.equal(values["ds:4"], V.EXTENSION);
+  assert.equal(values["ds:5"], V.REBOOKED);
+  assert.equal(values["ds:6"], V.REBOOKED_EXTENSION);
+  assert.equal(values["ds:7"], V.REOFFERED);
 });
 
 test("scenario: full walkthrough — XYZ then PQR then ABC", () => {

@@ -76,6 +76,16 @@ const HIERARCHY_DESIGNATION_SYNONYMS = {
     "srvp",
     "vp srvp",
     "vp/srvp",
+    // Senior VP spelled out — Varun Gupta (CY760) carries "Sr. Vice President - Delivery" and
+    // "Sr. Vice President (SVP)"; unmatched, Canada's VP seat came out blank (Sep 2026).
+    "sr vice president",
+    "sr. vice president",
+    "senior vice president",
+    "sr vice president (svp)",
+    "sr. vice president (svp)",
+    "senior vice president (svp)",
+    "sr vp (svp)",
+    "sr. vp (svp)",
   ],
   // Associate VP is its OWN designation (AVP column), split out of VP. Exact-map lookup means
   // "associate vice president" never collides with VP's "vice president".

@@ -39,6 +39,7 @@ const {
   resolveActiveDealSheetTableId,
   resolveActiveDealSheetTableIdForRow,
   resolveRunrateTableIdForDealSheetTable,
+  isPlacementKeyedDealSheetTable,
   TABLE_CYNET_LOCUMS,
   TABLE_ENDED_CYNET_LOCUMS,
 } = require("./recruiterDomainTables");
@@ -53,6 +54,64 @@ function toInt64OrNull(value) {
   const n = Number(typeof value === "string" ? value.trim() : value);
   if (!Number.isFinite(n)) return null;
   return Math.trunc(n);
+}
+
+/**
+ * Key an existing CONTRACT_ID is reused on: DEAL_SHEET_ID, or DEAL_SHEET_ID|PLACEMENT_ID for a
+ * placement-keyed table (health — see isPlacementKeyedDealSheetTable). "" when there is no deal sheet.
+ * @param {object} row
+ * @param {boolean} placementKeyed
+ */
+function contractReuseKeyForRow(row, placementKeyed) {
+  const ds = row?.DEAL_SHEET_ID == null ? "" : String(toInt64OrNull(row.DEAL_SHEET_ID) ?? "").trim();
+  if (ds === "" || !placementKeyed) return ds;
+  const pid = row?.PLACEMENT_ID == null ? "" : String(toInt64OrNull(row.PLACEMENT_ID) ?? "").trim();
+  return `${ds}|${pid}`;
+}
+
+/**
+ * Existing CONTRACT_IDs for `rows`, keyed by contractReuseKeyForRow. Plain and placement-keyed deal
+ * sheets are looked up in separate calls (the latter with matchPlacement) and merged; the two key
+ * shapes cannot collide. Throws what the lookup throws — callers keep their own fallbacks.
+ * @param {object[]} rows
+ * @param {(row: object) => boolean} isPlacementKeyedRow
+ * @param {Function} fetchContractIdsByDealSheetIdsFn
+ * @param {object} [bqOptions]
+ * @returns {Promise<Map<string, string>>}
+ */
+async function fetchExistingContractIdsForRows(
+  rows,
+  isPlacementKeyedRow,
+  fetchContractIdsByDealSheetIdsFn,
+  bqOptions
+) {
+  const plainIds = [];
+  const keyedIds = [];
+  const plainSeen = new Set();
+  const keyedSeen = new Set();
+  for (const row of rows) {
+    const dsid = toInt64OrNull(row?.DEAL_SHEET_ID);
+    if (dsid == null) continue;
+    const key = String(dsid);
+    const [ids, seen] = isPlacementKeyedRow(row) ? [keyedIds, keyedSeen] : [plainIds, plainSeen];
+    if (seen.has(key)) continue;
+    seen.add(key);
+    ids.push(key);
+  }
+
+  const out = new Map();
+  if (plainIds.length > 0) {
+    const result = await fetchContractIdsByDealSheetIdsFn(plainIds, bqOptions);
+    if (result instanceof Map) for (const [k, v] of result) out.set(k, v);
+  }
+  if (keyedIds.length > 0) {
+    const result = await fetchContractIdsByDealSheetIdsFn(keyedIds, {
+      ...(bqOptions || {}),
+      matchPlacement: true,
+    });
+    if (result instanceof Map) for (const [k, v] of result) out.set(k, v);
+  }
+  return out;
 }
 
 function normalizeDealTypeKey(value) {
@@ -191,22 +250,20 @@ async function resolveContractIdsForRows(rows, deps = {}) {
   const fetchContractIdsForExtensionsFn =
     deps.fetchContractIdsForExtensionsFn ?? fetchContractIdsForExtensions;
 
-  const dealSheetIds = [];
-  const dsSeen = new Set();
-  for (const row of rows) {
-    const dsid = toInt64OrNull(row?.DEAL_SHEET_ID);
-    if (dsid == null) continue;
-    const key = String(dsid);
-    if (dsSeen.has(key)) continue;
-    dsSeen.add(key);
-    dealSheetIds.push(key);
-  }
+  // Row-aware routing (province / OFFERING), not resolveTableIdFn: callers may pass an email-only
+  // resolver, which would put a Canada or Locums row with a health recruiter under health's rule.
+  const isPlacementKeyedRow = (row) =>
+    isPlacementKeyedDealSheetTable(resolveActiveDealSheetTableIdForRow(row));
 
   let existingByDealSheetId = new Map();
-  if (dealSheetIds.length > 0) {
+  if (rows.some((row) => toInt64OrNull(row?.DEAL_SHEET_ID) != null)) {
     try {
-      const result = await fetchContractIdsByDealSheetIdsFn(dealSheetIds, deps.bqOptions);
-      if (result instanceof Map) existingByDealSheetId = result;
+      existingByDealSheetId = await fetchExistingContractIdsForRows(
+        rows,
+        isPlacementKeyedRow,
+        fetchContractIdsByDealSheetIdsFn,
+        deps.bqOptions
+      );
     } catch (err) {
       logDetail(
         `[contractId resolver] fetchContractIdsByDealSheetIds failed (continuing without existing-by-dsid): ${String(err?.message || err).slice(0, 200)}`
@@ -231,8 +288,7 @@ async function resolveContractIdsForRows(rows, deps = {}) {
   for (const row of rows) {
     if (normalizeDealTypeKey(row?.DEAL_TYPE) !== "DEAL") continue;
 
-    const dsKey =
-      row?.DEAL_SHEET_ID == null ? "" : String(toInt64OrNull(row.DEAL_SHEET_ID) ?? "").trim();
+    const dsKey = contractReuseKeyForRow(row, isPlacementKeyedRow(row));
     const existingId = dsKey !== "" ? existingByDealSheetId.get(dsKey) : undefined;
 
     if (existingId != null) {
@@ -317,8 +373,7 @@ async function resolveContractIdsForRows(rows, deps = {}) {
   for (const row of rows) {
     if (normalizeDealTypeKey(row?.DEAL_TYPE) !== "EXTENSION") continue;
 
-    const dsKey =
-      row?.DEAL_SHEET_ID == null ? "" : String(toInt64OrNull(row.DEAL_SHEET_ID) ?? "").trim();
+    const dsKey = contractReuseKeyForRow(row, isPlacementKeyedRow(row));
     const existingId = dsKey !== "" ? existingByDealSheetId.get(dsKey) : undefined;
 
     if (existingId != null) {
@@ -518,6 +573,13 @@ async function applyLegacyContractIdentityToDealRows(dealRows, deps = {}) {
       // writing a self-contradictory date.
       if (ownStart !== "" && proposed > ownStart) {
         initialStartRejected++;
+        // The matched contract's run-rate row starts a few days after this, its first segment
+        // (PLACEMENT_ID 1454462: row 2026-06-22, run-rate 2026-06-24). The contract then began no
+        // later than this row, so its own start is the initial start when nothing else holds one.
+        if (row.INITIAL_START_DATE == null || String(row.INITIAL_START_DATE).trim() === "") {
+          row.INITIAL_START_DATE = ownStart;
+          initialStartSet++;
+        }
       } else if (row.INITIAL_START_DATE == null || String(row.INITIAL_START_DATE).trim().slice(0, 10) !== proposed) {
         row.INITIAL_START_DATE = proposed;
         initialStartSet++;
@@ -593,23 +655,20 @@ async function applyExistingContractIdsByDealSheetId(dealRows, deps = {}) {
   const fetchContractIdsByDealSheetIdsFn =
     deps.fetchContractIdsByDealSheetIdsFn ?? fetchContractIdsByDealSheetIds;
 
-  const dealSheetIds = [];
-  const dsSeen = new Set();
-  for (const row of dealRows) {
-    if (row == null || row.CONTRACT_ID != null) continue;
-    const dsid = toInt64OrNull(row?.DEAL_SHEET_ID);
-    if (dsid == null) continue;
-    const key = String(dsid);
-    if (dsSeen.has(key)) continue;
-    dsSeen.add(key);
-    dealSheetIds.push(key);
-  }
-  if (dealSheetIds.length === 0) return 0;
+  const pendingRows = dealRows.filter(
+    (row) => row != null && row.CONTRACT_ID == null && toInt64OrNull(row?.DEAL_SHEET_ID) != null
+  );
+  if (pendingRows.length === 0) return 0;
+  const placementKeyed = isPlacementKeyedDealSheetTable(deps.tableId);
 
   let existingByDealSheetId = new Map();
   try {
-    const result = await fetchContractIdsByDealSheetIdsFn(dealSheetIds, deps.bqOptions);
-    if (result instanceof Map) existingByDealSheetId = result;
+    existingByDealSheetId = await fetchExistingContractIdsForRows(
+      pendingRows,
+      () => placementKeyed,
+      fetchContractIdsByDealSheetIdsFn,
+      deps.bqOptions
+    );
   } catch (err) {
     logDetail(
       `[contractId allocator] fetchContractIdsByDealSheetIds failed (continuing to mint): ${String(err?.message || err).slice(0, 200)}`
@@ -620,8 +679,7 @@ async function applyExistingContractIdsByDealSheetId(dealRows, deps = {}) {
   let reused = 0;
   for (const row of dealRows) {
     if (row == null || row.CONTRACT_ID != null) continue;
-    const dsKey =
-      row?.DEAL_SHEET_ID == null ? "" : String(toInt64OrNull(row.DEAL_SHEET_ID) ?? "").trim();
+    const dsKey = contractReuseKeyForRow(row, placementKeyed);
     if (dsKey === "") continue;
     const existingId = existingByDealSheetId.get(dsKey);
     if (existingId == null) continue;

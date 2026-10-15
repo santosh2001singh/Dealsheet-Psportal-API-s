@@ -274,7 +274,40 @@ function rowMatchesSyncDomainForRow(domain, row) {
   return resolveActiveDealSheetTableIdForRow(row) === wanted;
 }
 
+/**
+ * Active deal sheet tables where a row's identity is its PLACEMENT_ID, not its DEAL_SHEET_ID.
+ *
+ * Nexus can move a deal sheet onto a new submittal: placement 1464278 (Albany Medical Center) was
+ * offer-rejected and stored as DID NOT ACCEPT under DEAL_SHEET_ID 5248044; the recruiter then pointed
+ * that SAME deal sheet at a new job (job_id_change_source "Nexus Update dealsheet", 2026-09-09) and
+ * the candidate started as placement 1464580. Keyed on the deal sheet, the insert saw 5248044 as
+ * already present and skipped the new placement forever — and the update trigger could not bring it
+ * in either, because it refreshes the OLD placement (whose submittal is still the rejected one).
+ *
+ * For these tables:
+ *   - the insert dedupe skips a row only when its PLACEMENT_ID already exists (a known deal sheet on
+ *     a new placement is a new placement, and is inserted);
+ *   - CONTRACT_ID reuse matches DEAL_SHEET_ID + PLACEMENT_ID, so the new placement goes through the
+ *     normal new-contract rules instead of inheriting the rejected placement's id.
+ *
+ * Health only for now (Canada / Locums unchanged). Before this, no health deal sheet was stored under
+ * more than one PLACEMENT_ID, so both rules give identical results for every existing row.
+ */
+const PLACEMENT_KEYED_DEAL_SHEET_TABLE_IDS = new Set([TABLE_CYNET_HEALTH]);
+
+/** @param {unknown} tableId */
+function isPlacementKeyedDealSheetTable(tableId) {
+  return PLACEMENT_KEYED_DEAL_SHEET_TABLE_IDS.has(String(tableId ?? "").trim());
+}
+
+/** @param {unknown} domain - "health" | "canada" | "locums"; null/unknown -> false */
+function isPlacementKeyedSyncDomain(domain) {
+  return isPlacementKeyedDealSheetTable(resolveActiveDealSheetTableIdForDomain(domain));
+}
+
 module.exports = {
+  isPlacementKeyedDealSheetTable,
+  isPlacementKeyedSyncDomain,
   ACTIVE_DEAL_SHEET_TABLE_IDS,
   resolveActiveDealSheetTableId,
   resolveActiveDealSheetTableIdForRow,

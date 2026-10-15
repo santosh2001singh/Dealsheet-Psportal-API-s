@@ -2,10 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const { mapDealSheetUsersToBq } = require("./columnMappings");
-const {
-  applyPreviousRecruiterOnRecruiterChange,
-  buildRecruiterHandoverOwnershipLogRows,
-} = require("./bigQueryClient");
+const { applyPreviousRecruiterOnRecruiterChange } = require("./bigQueryClient");
 
 const currentRecruiterUser = { id: 561722, first_name: "Sonam", last_name: "Chaudhary (R4A)", email: "sonam.c@cynethealth.com" };
 const submittalWithDifferentRecruiter = {
@@ -115,54 +112,4 @@ test("applyPreviousRecruiterOnRecruiterChange: no baseline recruiter (first inse
   assert.equal(changed, false);
   assert.equal(row.__PREV_RECRUITER_EMAIL, undefined);
   assert.equal(row.PREVIOUS_RECRUITER_EMAIL, undefined);
-});
-
-// ---------------------------------------------------------------------------
-// The ownership log still fires on a handover — now sourced from the in-memory
-// temp fields rather than the (removed) PREVIOUS_RECRUITER_EMAIL column.
-// ---------------------------------------------------------------------------
-
-test("buildRecruiterHandoverOwnershipLogRows: builds RECRUITER row from __PREV_RECRUITER_* temp fields", async () => {
-  const rows = await buildRecruiterHandoverOwnershipLogRows(
-    [
-      {
-        DEAL_TYPE: "DEAL",
-        PLACEMENT_ID: "1452278",
-        ASSIGNMENT_RECRUITER: "Sonam Chaudhary (R4A)",
-        ASSIGNMENT_RECRUITER_EMAIL: "sonam.c@cynethealth.com",
-        RECRUITER_EMP_NO: "CY9001",
-        __PREV_RECRUITER_NAME: "Shim Kashung (R2N)",
-        __PREV_RECRUITER_EMAIL: "shim.k@cynethealth.com",
-        __PREV_RECRUITER_EMP_NO: "CY1554",
-      },
-    ],
-    {
-      directoryFetchFn: async () => new Map(),
-      hierarchyFetchFn: async () => new Map(),
-    }
-  );
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].OWNERSHIP_ROLE, "RECRUITER");
-  assert.equal(rows[0].PREVIOUS_OWNER_NAME, "Shim Kashung (R2N)");
-  assert.equal(rows[0].PREVIOUS_OWNER_EMP_NO, "CY1554");
-  assert.equal(rows[0].NEW_OWNER_NAME, "Sonam Chaudhary (R4A)");
-  assert.equal(rows[0].NEW_OWNER_EMP_NO, "CY9001");
-});
-
-test("buildRecruiterHandoverOwnershipLogRows: a stale PREVIOUS_RECRUITER_EMAIL column is ignored", async () => {
-  const rows = await buildRecruiterHandoverOwnershipLogRows(
-    [
-      {
-        DEAL_TYPE: "DEAL",
-        ASSIGNMENT_RECRUITER_EMAIL: "sonam.c@cynethealth.com",
-        // Left over on an old row; no temp field -> no handover log.
-        PREVIOUS_RECRUITER_EMAIL: "shim.k@cynethealth.com",
-      },
-    ],
-    {
-      directoryFetchFn: async () => new Map(),
-      hierarchyFetchFn: async () => new Map(),
-    }
-  );
-  assert.equal(rows.length, 0);
 });

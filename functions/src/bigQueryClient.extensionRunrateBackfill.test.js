@@ -111,7 +111,7 @@ test("EXTENSION_RUNRATE_MANUAL_COLUMNS covers sales/credentialing/payment + SECO
     // the run-rate side and 100% empty on every deal sheet row, so the deal sheet only ever gets
     // them by inheriting them here.
     "TYPE_OF_CLIENT",
-    "ACC_DIR_OR_VERT_HEAD",
+    // ACC_DIR_OR_VERT_HEAD dropped Oct 2026: replaced by the Level 1-4 CSM hierarchy.
     "WEEKLY_WALLET_MONEY",
     "DIVERSITY_STATUS",
     "PO_RECEIVED",

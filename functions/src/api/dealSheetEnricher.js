@@ -48,7 +48,11 @@ const {
   resolveNewHireDateFromSubmittalNotes,
   resolveNewHireDateForDealRow,
   resolveExtensionDateForExtensionRow,
+  resolveSubmissionDateForPlacementRow,
+  resolveStartAndOfferTimeDates,
   resolveTentativeDateForPlacementRow,
+  mapJobPlacementTypeFromJobType,
+  mapDealSheetPermDetailsToBq,
 } = require("../columnMappings");
 const { computeBonusTotals } = require("../bonusTotals");
 const { computeWeekSplit } = require("../weekSplit");
@@ -340,6 +344,7 @@ function createFailedIdsByKind() {
     clioff: new Set(),
     user: new Set(),
     par: new Set(),
+    perm: new Set(),
   };
 }
 
@@ -369,6 +374,7 @@ function collectCandidateApiFailureKinds({
   for (const k of DEAL_SHEET_WAVE1_API_KINDS) {
     if (failedIdsByKind[k].has(dsKey)) failedKinds.push(`${k}:${dsKey}`);
   }
+  if (failedIdsByKind.perm.has(dsKey)) failedKinds.push(`perm:${dsKey}`);
   if (jobKey && failedIdsByKind.job.has(jobKey)) failedKinds.push(`job:${jobKey}`);
   if (candKey) {
     if (failedIdsByKind.cand.has(candKey)) failedKinds.push(`cand:${candKey}`);
@@ -716,6 +722,21 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     wave2Ops.push({ k: "par", id: pid });
   }
 
+  // FT perm details, only for deal sheets whose job is permanent. Wave2, not wave1, because the job
+  // type is known only once wave1's /api/jobs/ responses are in.
+  const permDsSeen = new Set();
+  for (const c of candidates) {
+    const dsId = normalizeNexusResourceId(c?.deal_sheet);
+    const jobId = normalizeNexusResourceId(c?.job);
+    if (dsId == null || dsId === "" || jobId == null || jobId === "") continue;
+    const dsKey = String(dsId);
+    if (permDsSeen.has(dsKey)) continue;
+    if (mapJobPlacementTypeFromJobType(jobById.get(String(jobId))) !== "FT") continue;
+    permDsSeen.add(dsKey);
+    wave2Urls.push(buildUrl(`${config.nexus.baseUrl}/api/deal-sheet-perm-details/`, { deal_sheet_id: dsKey }));
+    wave2Ops.push({ k: "perm", id: dsKey });
+  }
+
   if (!hasPreloadedSubmittals) {
     for (const op of submittalOps) {
       wave2Urls.push(
@@ -759,17 +780,19 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
   }
   const wave2Ms = Date.now() - wave2Start;
   logLine(
-    `[enriched sync] STEP 3/4 ENRICH APIS wave2: requests=${wave2Urls.length} responses=${wave2Responses.length} httpMs=${wave2Ms} (users=${userIds.length} parentClients=${parentIdsToFetch.length}${hasPreloadedSubmittals ? "" : ` submittals=${submittalOps.length}`})`
+    `[enriched sync] STEP 3/4 ENRICH APIS wave2: requests=${wave2Urls.length} responses=${wave2Responses.length} httpMs=${wave2Ms} (users=${userIds.length} parentClients=${parentIdsToFetch.length} ftPermDetails=${permDsSeen.size}${hasPreloadedSubmittals ? "" : ` submittals=${submittalOps.length}`})`
   );
 
   const userById = new Map();
   const submittalByKey = new Map();
+  const permByDs = new Map();
 
   for (let i = 0; i < wave2Ops.length; i++) {
     const op = wave2Ops[i];
     const json = wave2Responses[i];
     if (op.k === "user") userById.set(op.id, json);
     else if (op.k === "par") parentClientById.set(op.id, json);
+    else if (op.k === "perm") permByDs.set(op.id, firstPagedItemOrNull(json));
     else submittalByKey.set(`${op.jobId}:${op.recruiterId}:${op.candId}`, pickAllowedSubmittalFromRun(json, op.candId));
   }
 
@@ -1002,6 +1025,10 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       ? jobRatesByJob.get(String(jobId)) ?? null
       : null;
     const ratesPart = mapDealSheetRatesListToBq(ratesList, clientStateNorm, jobRatesList);
+    // FT: BILL_RATE is the perm invoice amount, not the (all-zero) hourly rate.
+    const permPart = jobPart?.PLACEMENT_TYPE === "FT"
+      ? mapDealSheetPermDetailsToBq(permByDs.get(String(dealSheetId)) ?? null)
+      : {};
     const positionPart = mapJobProfessionSpecialtyFromJob(jobObj);
 
     if (!submittalRow && !hasPreloadedSubmittals) {
@@ -1024,9 +1051,12 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     const isCanadaRecruiter = isCanadaDealSheetRow({ CLIENT_STATE: clientStateNorm });
     // Decided on the ROW, not the email alone: OFFERING=LOCUMS routes a GOV-desk row
     // (@cynethealth.com) into the locums table, so it must take the locums shape everywhere.
+    // CLIENT_STATE rides along so a Canadian-province row is never also treated as locums: the
+    // province decides the table first (see isLocumsDealSheetRow).
     const locumsIdentity = {
       ASSIGNMENT_RECRUITER_EMAIL: userPart?.ASSIGNMENT_RECRUITER_EMAIL,
       OFFERING: jobPart?.OFFERING,
+      CLIENT_STATE: clientStateNorm,
     };
     const isLocumsRecruiter = isLocumsDealSheetRow(locumsIdentity);
     // Built here rather than with the other parts above because the target column depends on the
@@ -1082,6 +1112,15 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       submittalRow
     );
     const extensionDate = resolveExtensionDateForExtensionRow(dealSheetPart?.DEAL_TYPE, notesForPlacement);
+    // First SENT_TO_CLIENT for a DEAL; null for an EXTENSION so the contract's DEAL date can be
+    // inherited downstream (see resolveSubmissionDateForPlacementRow).
+    const submissionDate = resolveSubmissionDateForPlacementRow(dealSheetPart?.DEAL_TYPE, notesForPlacement);
+    // DID NOT ACCEPT: START_DATE + OFFER_TIME_START_DATE from the job; otherwise both from the submittal.
+    const startDates = resolveStartAndOfferTimeDates(
+      submittalPart?.PLACEMENT_STATUS,
+      submittalPart?.START_DATE,
+      jobPart?.OFFER_TIME_START_DATE
+    );
 
     const canadaTypePart = isCanadaRecruiter
       ? { PAYMENT_TYPE: mapCanadaTypeFromTenNintyNine(detail) }
@@ -1103,6 +1142,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       ...jobPart,
       ...mspPart,
       ...ratesPart,
+      ...permPart,
       ...positionPart,
       ...submittalPart,
       ...userPart,
@@ -1113,9 +1153,12 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       // CLIENT_TYPE / TYPE_OF_CLIENT are intentionally absent: manual columns since Aug 2026,
       // carried forward from the baseline row by applyManualColumnsCarryForward.
       LINE_OF_BUSINESS: lineOfBusiness,
-      START_DATE: submittalPart?.START_DATE ?? null,
+      START_DATE: startDates.START_DATE,
+      OFFER_TIME_START_DATE: startDates.OFFER_TIME_START_DATE,
+      // DID NOT ACCEPT: END_DATE = the job-based START_DATE here, before DAYS_WORKED is derived below.
+      ...("END_DATE" in startDates ? { END_DATE: startDates.END_DATE } : {}),
       // Raw capture only (submittal end_date, job end_date as fallback — see mapJobSubmittalToBq).
-      // The OFFERED/BOOKED capture window and the BOOKED hard-freeze are applied downstream in
+      // The OFFERED/BOOKED/STARTED capture window and the hold at later statuses are applied downstream in
       // applyTentativeDateFreeze, which is the only place the stored baseline is known.
       TENTATIVE_END_DATE: resolveTentativeDateForPlacementRow(
         submittalPart?.PLACEMENT_STATUS,
@@ -1124,6 +1167,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       TERMINATION_REASON: terminationReason,
       NEW_HIRE_DATE: newHireDate,
       EXTENSION_DATE: extensionDate,
+      SUBMISSION_DATE: submissionDate,
     };
     // NL only: Nexus sends no per diem, so the $70 default goes in before the derived step reads it.
     const row = applyCanadaNlDefaultPerDiem(nexusRow);
@@ -1131,10 +1175,13 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       ? {}
       : computeNewRateFamily(row);
     const derivedPart = computeDerivedPlacementFields(row);
+    // FT: FINAL_BILL_RATE is the perm invoice amount as-is (no MSP-fee netting).
+    const ftFinalBillPart = permPart.BILL_RATE != null ? { FINAL_BILL_RATE: permPart.BILL_RATE } : {};
     const finalRow = sanitizeLocumsDealSheetRow(sanitizeCanadaDealSheetRow(coerceApiFloatNullsToZero({
       ...row,
       ...newRateFamilyPart,
       ...derivedPart,
+      ...ftFinalBillPart,
     })));
     if (shouldExcludeRowFromBigQuery(finalRow)) {
       excludedDummyOrTraining++;

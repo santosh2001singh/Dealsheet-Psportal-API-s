@@ -18,13 +18,64 @@ test("applyOriginalStartDateForDealRows: never overwrites an existing INITIAL_ST
 });
 
 for (const status of ["STARTED", "ACTIVE", "ENDED", "ENDED<30"]) {
-  test(`applyOriginalStartDateForDealRows: ${status} freezes INITIAL_START_DATE against a START_DATE change`, () => {
+  test(`applyOriginalStartDateForDealRows: ${status} keeps an EARLIER INITIAL_START_DATE (contract lineage)`, () => {
     const out = applyOriginalStartDateForDealRows([
       { DEAL_TYPE: "DEAL", PLACEMENT_STATUS: status, START_DATE: "2026-09-28", INITIAL_START_DATE: "2026-09-14" },
     ]);
     assert.equal(out[0].INITIAL_START_DATE, "2026-09-14");
   });
 }
+
+// A contract cannot begin after the assignment it belongs to, so the status is irrelevant: the
+// value is corrected whether or not the candidate has started.
+//
+// Live case (CANDIDATE_ID 31826743 "Lalla Drame", PLACEMENT_ID 1467110, Sep 2026): a fresh DEAL —
+// no run-rate history, no extension — booked 2026-09-21, then pulled back to 2026-09-14. It tracked
+// correctly while BOOKED, then froze at 09-21 the moment it turned STARTED and stayed a week ahead
+// of its own start.
+for (const status of ["STARTED", "ACTIVE", "ENDED", "ENDED<30"]) {
+  test(`applyOriginalStartDateForDealRows: ${status} still re-syncs an INITIAL_START_DATE later than its own start`, () => {
+    const out = applyOriginalStartDateForDealRows([
+      { DEAL_TYPE: "DEAL", PLACEMENT_STATUS: status, START_DATE: "2026-09-14", INITIAL_START_DATE: "2026-09-21" },
+    ]);
+    assert.equal(out[0].INITIAL_START_DATE, "2026-09-14");
+  });
+}
+
+// The Lalla Drame sequence end to end: the value must be right at every step, not only before the
+// candidate starts.
+test("applyOriginalStartDateForDealRows: a fresh DEAL tracks START_DATE across the whole booking lifecycle", () => {
+  const steps = [
+    { PLACEMENT_STATUS: "BOOKED", START_DATE: "2026-09-21", INITIAL_START_DATE: "2026-09-21" },
+    { PLACEMENT_STATUS: "BOOKED", START_DATE: "2026-09-14", INITIAL_START_DATE: "2026-09-21" },
+    { PLACEMENT_STATUS: "STARTED", START_DATE: "2026-09-14", INITIAL_START_DATE: "2026-09-21" },
+  ];
+  for (const step of steps) {
+    const out = applyOriginalStartDateForDealRows([{ DEAL_TYPE: "DEAL", ...step }]);
+    assert.equal(
+      out[0].INITIAL_START_DATE,
+      step.START_DATE,
+      `${step.PLACEMENT_STATUS} row must report its own start as the contract start`
+    );
+  }
+});
+
+// OFFER_TIME_START_DATE is the column that holds the start as offered — frozen outright by
+// applyOfferTimeStartDateFreeze, and START_DATE changes never release it. This function must not
+// touch it while correcting INITIAL_START_DATE: the two answer different questions.
+test("applyOriginalStartDateForDealRows: OFFER_TIME_START_DATE is left alone", () => {
+  const out = applyOriginalStartDateForDealRows([
+    {
+      DEAL_TYPE: "DEAL",
+      PLACEMENT_STATUS: "STARTED",
+      START_DATE: "2026-09-14",
+      INITIAL_START_DATE: "2026-09-21",
+      OFFER_TIME_START_DATE: "2026-09-21",
+    },
+  ]);
+  assert.equal(out[0].INITIAL_START_DATE, "2026-09-14", "contract start follows START_DATE");
+  assert.equal(out[0].OFFER_TIME_START_DATE, "2026-09-21", "offer-time start stays frozen");
+});
 
 // A pre-start booking pulled EARLIER leaves INITIAL_START_DATE ahead of the row's own start, which
 // no real initial start can be — so it is re-synced. Live shape: PLACEMENT_ID 1466685, initial

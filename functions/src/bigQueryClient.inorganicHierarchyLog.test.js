@@ -9,6 +9,8 @@ const {
   filterInorganicHierarchyAgainstFrozenOrganic,
   fetchOnsiteAmCsmHierarchyByKey,
   applyOnsiteAmCsmHierarchyForRows,
+  insertInorganicHierarchyLogBatch,
+  buildInorganicRecruiterChangeKey,
 } = require("./bigQueryClient");
 
 test("buildInorganicHierarchyLogCandidate returns null when recruiter email is unchanged", () => {
@@ -28,7 +30,7 @@ test("buildInorganicHierarchyLogCandidate returns null when either row is missin
   assert.equal(buildInorganicHierarchyLogCandidate({ ASSIGNMENT_RECRUITER_EMAIL: "a@x.com" }, null), null);
 });
 
-test("buildInorganicHierarchyLogCandidate uses NEW_HIRE_DATE as anchor for DEAL rows", () => {
+test("buildInorganicHierarchyLogCandidate anchors on the day the recruiter changed, not NEW_HIRE_DATE (DEAL)", () => {
   const latest = {
     DEAL_SHEET_ID: 1,
     PLACEMENT_ID: 100,
@@ -38,29 +40,33 @@ test("buildInorganicHierarchyLogCandidate uses NEW_HIRE_DATE as anchor for DEAL 
     DEAL_TYPE: "DEAL",
     NEW_HIRE_DATE: "2025-01-01T00:00:00.000Z",
     EXTENSION_DATE: "2099-01-01T00:00:00.000Z",
+    LAST_UPDATED: "2026-09-14T20:32:36.915Z",
     ASSIGNMENT_RECRUITER_EMAIL: "new@cynethealth.com",
   };
   const previous = { ASSIGNMENT_RECRUITER_EMAIL: "old@cynethealth.com" };
   const candidate = buildInorganicHierarchyLogCandidate(latest, previous);
   assert.equal(candidate.DEAL_TYPE, "DEAL");
-  assert.equal(candidate.anchorDate, "2025-01-01T00:00:00.000Z");
+  assert.equal(candidate.anchorDate, "2026-09-14T20:32:36.915Z");
   assert.equal(candidate.newRecruiterEmail, "new@cynethealth.com");
   assert.equal(candidate.PLACEMENT_ID, 100);
 });
 
-test("buildInorganicHierarchyLogCandidate uses EXTENSION_DATE as anchor for EXTENSION rows", () => {
+test("buildInorganicHierarchyLogCandidate anchors on the day the recruiter changed, not EXTENSION_DATE", () => {
+  // Placement 1455552: booked 04-22 (EXTENSION_DATE), recruiter changed 09-14. On 04-22 the new
+  // recruiter was still under another RM, so reading the chain then logged a fake inorganic RM.
   const latest = {
     DEAL_SHEET_ID: 2,
     PLACEMENT_ID: 200,
     DEAL_TYPE: "EXTENSION",
     NEW_HIRE_DATE: null,
-    EXTENSION_DATE: "2025-06-01T00:00:00.000Z",
+    EXTENSION_DATE: "2026-04-22T19:04:01.000Z",
+    LAST_UPDATED: { value: "2026-09-14T20:32:36.915Z" },
     ASSIGNMENT_RECRUITER_EMAIL: "new@cynethealth.com",
   };
   const previous = { ASSIGNMENT_RECRUITER_EMAIL: "old@cynethealth.com" };
   const candidate = buildInorganicHierarchyLogCandidate(latest, previous);
   assert.equal(candidate.DEAL_TYPE, "EXTENSION");
-  assert.equal(candidate.anchorDate, "2025-06-01T00:00:00.000Z");
+  assert.equal(candidate.anchorDate, "2026-09-14T20:32:36.915Z", "BigQuery {value} wrapper unwrapped");
 });
 
 test("buildInorganicHierarchyLogDedupeKey combines DEAL_SHEET_ID, PLACEMENT_ID, recruiter email, CSM levels, and hierarchy divergences", () => {
@@ -130,8 +136,9 @@ test("resolveInorganicHierarchyLogRows fills recruiter identity and hierarchy fr
   assert.equal(row.PLACEMENT_ID, 100);
   assert.equal(row.RECRUITER_EMAIL_ID, "ajay.k@cynethealth.com");
   assert.equal(row.RECRUITER_NAME, "Ajay Kumar");
-  assert.equal(row.INORGANIC_RECRUITER, "Ajay Kumar");
-  assert.equal(row.INORGANIC_RECRUITER_EMP_NO, "CY2393");
+  // The recruiter is the assignment recruiter, never inorganic (ownership_change_logs has the change).
+  assert.equal(row.INORGANIC_RECRUITER, null);
+  assert.equal(row.INORGANIC_RECRUITER_EMP_NO, null);
   assert.equal(row.INORGANIC_ACCOUNT_MANAGER, "Nikhil Sharma");
   assert.equal(row.INORGANIC_ACCOUNT_MANAGER_EMP_NO, "CY2431");
   // "Associate Vice President - Delivery" is now its own AVP designation (split out of VP).
@@ -235,7 +242,7 @@ test("resolveInorganicHierarchyLogRows combines recruiter-change and CSM-diverge
   const rows = await resolveInorganicHierarchyLogRows(candidates, {}, { directoryFetchFn, hierarchyFetchFn });
   assert.equal(rows.length, 1);
   assert.equal(rows[0].RECRUITER_EMAIL_ID, "ajay.k@cynethealth.com");
-  assert.equal(rows[0].INORGANIC_RECRUITER, "Ajay Kumar");
+  assert.equal(rows[0].INORGANIC_RECRUITER, null);
   assert.equal(rows[0].INORGANIC_ACCOUNT_MANAGER, "Nikhil Sharma");
   assert.equal(rows[0].INORGANIC_LEVEL_4_CSM, "Someone New");
 });
@@ -531,4 +538,91 @@ test("filterInorganicHierarchyAgainstFrozenOrganic: same by name when emp missin
   assert.equal(hasDivergence, true);
   assert.equal(row.INORGANIC_TL, null);
   assert.equal(row.INORGANIC_RM, "Different RM");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Placement 1455552 (Miguel Ipina, 2026-09): recruiter Robin Kumar -> Vance Tyson on 09-14. Both sit
+// under RM Ajay Kumar / AM Nikhil Sharma / AVP Maneet Gupta, the placement's frozen hierarchy, so the
+// change is not inorganic. Read at the EXTENSION_DATE (04-22) Vance was under RM Nitish Sharma, which
+// logged INORGANIC_RECRUITER = Vance and INORGANIC_RM = Nitish; the RR dashboard cleared both and the
+// next scan appended them again.
+// ---------------------------------------------------------------------------------------------
+
+const MIGUEL_FROZEN = {
+  DEAL_SHEET_ID: 5206537,
+  PLACEMENT_ID: 1455552,
+  PLACEMENT_STATUS: "STARTED",
+  DEAL_TYPE: "EXTENSION",
+  EXTENSION_DATE: "2026-04-22T19:04:01.000Z",
+  LAST_UPDATED: "2026-09-14T20:32:36.915Z",
+  ASSIGNMENT_RECRUITER_EMAIL: "vance.t@cynethealth.com",
+  RM: "Ajay Kumar",
+  RM_EMP_NO: "CY2393",
+  ACCOUNT_MANAGER: "Nikhil Sharma",
+  ACCOUNT_MANAGER_EMP_NO: "CY2431",
+  AVP: "Maneet Gupta",
+  AVP_EMP_NO: "CY2088",
+};
+
+test("recruiter change inside the same team: chain read on the change day -> no inorganic row", async () => {
+  const candidate = buildInorganicHierarchyLogCandidate(MIGUEL_FROZEN, { ASSIGNMENT_RECRUITER_EMAIL: "robin.k@cynethealth.com" });
+  let anchorSeen = null;
+  const rows = await resolveInorganicHierarchyLogRows([candidate], {}, {
+    directoryFetchFn: async () =>
+      new Map([["vance.t@cynethealth.com", { employeeId: "CY5930", externalId: "ext-vance", nameFull: "Vance Tyson" }]]),
+    hierarchyFetchFn: async (targets) => {
+      anchorSeen = targets[0].anchorDate;
+      // Vance's RM was Nitish Sharma until 2026-05-19 and Ajay Kumar from 05-28.
+      const rm = String(anchorSeen) >= "2026-05-28"
+        ? { manager_name: "Ajay Kumar", manager_employee_id: "CY2393" }
+        : { manager_name: "Nitish Sharma", manager_employee_id: "CY5881" };
+      return new Map([["0", [
+        { hierarchy_level: "1", manager_title: "Recruitment Manager", ...rm },
+        { hierarchy_level: "2", manager_title: "Sr. Delivery Manager", manager_name: "Nikhil Sharma", manager_employee_id: "CY2431" },
+        { hierarchy_level: "3", manager_title: "Associate Vice President - Delivery", manager_name: "Maneet Gupta", manager_employee_id: "CY2088" },
+      ]]]);
+    },
+    fetchEmailsFn: async () => ({ byEmp: new Map(), byName: new Map() }),
+  });
+  assert.equal(anchorSeen, "2026-09-14T20:32:36.915Z");
+  assert.equal(rows[0].INORGANIC_RECRUITER, null);
+  assert.equal(rows[0].INORGANIC_RM, "Ajay Kumar");
+  const { hasDivergence } = filterInorganicHierarchyAgainstFrozenOrganic(rows[0], MIGUEL_FROZEN);
+  assert.equal(hasDivergence, false, "same team as the frozen hierarchy: nothing inorganic to log");
+});
+
+test("insertInorganicHierarchyLogBatch: a recruiter change already logged is not appended again, even if the RR dashboard cleared it", async () => {
+  let inserted = null;
+  const result = await insertInorganicHierarchyLogBatch(
+    [{ DEAL_SHEET_ID: 5206537, PLACEMENT_ID: 1455552, RECRUITER_EMAIL_ID: "Vance.T@cynethealth.com", INORGANIC_RM: "Nitish Sharma", INORGANIC_RM_EMP_NO: "CY5881" }],
+    0,
+    { datasetId: "rr_project_data", tableId: "inorganic_hierarchy_logs" },
+    {
+      // The row the RR dashboard left after clearing every inorganic value by hand.
+      queryFn: async () => [{ DEAL_SHEET_ID: 5206537, PLACEMENT_ID: 1455552, RECRUITER_EMAIL_ID: "vance.t@cynethealth.com" }],
+      insertAllFn: async (rows) => { inserted = rows; return { inserted: rows.length, attempted: rows.length, errors: [] }; },
+    }
+  );
+  assert.equal(result.inserted, 0);
+  assert.equal(inserted, null, "nothing written");
+});
+
+test("insertInorganicHierarchyLogBatch: a different recruiter change on the same placement is still logged", async () => {
+  let inserted = null;
+  await insertInorganicHierarchyLogBatch(
+    [{ DEAL_SHEET_ID: 5206537, PLACEMENT_ID: 1455552, RECRUITER_EMAIL_ID: "someone.new@cynethealth.com", INORGANIC_RM: "Other RM", INORGANIC_RM_EMP_NO: "CY1" }],
+    0,
+    { datasetId: "rr_project_data", tableId: "inorganic_hierarchy_logs" },
+    {
+      queryFn: async () => [{ DEAL_SHEET_ID: 5206537, PLACEMENT_ID: 1455552, RECRUITER_EMAIL_ID: "vance.t@cynethealth.com" }],
+      insertAllFn: async (rows) => { inserted = rows; return { inserted: rows.length, attempted: rows.length, errors: [] }; },
+    }
+  );
+  assert.equal(inserted.length, 1);
+});
+
+test("buildInorganicRecruiterChangeKey: placement + new recruiter email; empty without either", () => {
+  assert.equal(buildInorganicRecruiterChangeKey({ PLACEMENT_ID: 1455552, RECRUITER_EMAIL_ID: " Vance.T@cynethealth.com" }), "rc|1455552|vance.t@cynethealth.com");
+  assert.equal(buildInorganicRecruiterChangeKey({ PLACEMENT_ID: 1455552 }), "");
+  assert.equal(buildInorganicRecruiterChangeKey({ RECRUITER_EMAIL_ID: "a@b.com" }), "");
 });

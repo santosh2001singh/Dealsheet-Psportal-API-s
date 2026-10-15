@@ -2,6 +2,8 @@
  * Locums (@cynetlocums.com) derived placement metrics from locumns deal sheet formulas.
  */
 
+const { isCanadaProvince } = require("./canadaDerivedPlacementFields");
+
 const DAYS_WORKED_ELIGIBLE_STATUSES = new Set([
   "ENDED",
   "ENDED<30",
@@ -136,13 +138,19 @@ const OFFERING_LOCUMS = "LOCUMS";
  * *_NEW rate family survived the sanitizer that should have stripped it.
  *
  * Mirrors resolveActiveDealSheetTableIdForRow's rule, so what decides the TABLE also decides the
- * derivations written into it.
+ * derivations written into it. That rule checks the Canadian province FIRST, so a row in a Canadian
+ * province is Canada business even when OFFERING=LOCUMS — it lands in the canada table and must take
+ * Canada's derivations. Treating it as locums too put Nexus's hourly_revenue in GROSS_MARGIN (then
+ * overwritten by Canada's derived step, leaving MARGIN 0) and set PAYMENT_TYPE to locums' "1099",
+ * which Canada's burden table does not know, so the whole T4 rate chain came out null
+ * (placement 1463925, Ontario, OFFERING=LOCUMS, Sep 2026).
  *
  * @param {Record<string, *>|null|undefined} row
  * @returns {boolean}
  */
 function isLocumsDealSheetRow(row) {
   if (!row || typeof row !== "object") return false;
+  if (isCanadaProvince(row.CLIENT_STATE)) return false;
   if (isCynetLocumsRecruiter(row.ASSIGNMENT_RECRUITER_EMAIL)) return true;
   return (
     String(row.OFFERING ?? "")
@@ -424,6 +432,8 @@ const LOCUMS_EXCLUDED_API_OWNED_COLUMNS = new Set([
   "SCHEDULE_HOURS_2",
   "BILLABLE_ORIENTATION_HRS",
   "BILLABLE_ORIENTATION",
+  // Candidate referrer — added for Cynet Health only (Oct 2026)
+  "SOURCER_NAME",
 ]);
 Object.freeze(LOCUMS_EXCLUDED_API_OWNED_COLUMNS);
 

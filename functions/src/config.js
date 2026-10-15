@@ -44,6 +44,19 @@ const config = {
     process.env.BQ_OWNERSHIP_CHANGE_LOG_DATASET || "rr_project_data",
   ownershipChangeLogTableId:
     process.env.BQ_OWNERSHIP_CHANGE_LOG_TABLE || "ownership_change_logs",
+  /**
+   * Master switch for every ownership_change_logs write (inserts, date sync, candidate name sync).
+   * OFF unless OWNERSHIP_LOG_WRITES_ENABLED=true. The table was rebuilt from the data team's history
+   * on 2026-10-02 (sql/ownership_rebuild/); deploy with this off, clean out anything the old code
+   * wrote (05_delete_old_code_rows.sql), then set it to true in functions/.env and redeploy.
+   */
+  ownershipLogWritesEnabled: process.env.OWNERSHIP_LOG_WRITES_ENABLED === "true",
+  /**
+   * ownership_change_logs: the data team reload (sql/ownership_rebuild/03, EDITED_BY=DATA_TEAM_SYNC)
+   * is the history up to this moment; the sync only logs changes first seen after it. Move it if
+   * the data team data is reloaded.
+   */
+  ownershipLogDataTeamCutoff: process.env.OWNERSHIP_LOG_DATA_TEAM_CUTOFF || "2026-10-02T12:50:26Z",
 
   batchSize: parseInt(process.env.BATCH_SIZE || "300", 10),
   /** Nexus job-submittals per_page (deal-sheet sync paths); override via PER_PAGE */
@@ -180,6 +193,12 @@ const config = {
    * (one-time migration: set EXTENSION_DATE_FREEZE_ENABLED=false in Firebase env, run update sync, re-enable).
    */
   extensionDateFreezeEnabled: process.env.EXTENSION_DATE_FREEZE_ENABLED !== "false",
+
+  /**
+   * When false, SUBMISSION_DATE is not frozen on update-append and SUBMISSION_DATE diffs trigger append
+   * (one-time migration: set SUBMISSION_DATE_FREEZE_ENABLED=false in Firebase env, run update sync, re-enable).
+   */
+  submissionDateFreezeEnabled: process.env.SUBMISSION_DATE_FREEZE_ENABLED !== "false",
 
   /** Parent Firestore document for deal-sheet sync state (subcollections below) */
   firestoreWorkspace: {

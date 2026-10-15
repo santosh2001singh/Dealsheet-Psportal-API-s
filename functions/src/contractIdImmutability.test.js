@@ -35,7 +35,8 @@ function runrateProposes(contractId) {
   };
 }
 
-/** Existing-id lookup, stubbed to return what the table already holds for a DEAL_SHEET_ID. */
+/** Existing-id lookup, stubbed to return what the table already holds. Health is placement-keyed,
+ *  so its keys are `${DEAL_SHEET_ID}|${PLACEMENT_ID}` (see isPlacementKeyedDealSheetTable). */
 function tableHolds(map) {
   return { fetchContractIdsByDealSheetIdsFn: async () => new Map(Object.entries(map)) };
 }
@@ -62,7 +63,7 @@ test("an existing CONTRACT_ID beats a run-rate match proposing a different one",
 
   await allocateContractIdsForInsertableRows(rows, {
     tableId: "cynet_health_deal_sheet",
-    ...tableHolds({ 5139885: "CHC20908" }),
+    ...tableHolds({ "5139885|1441464": "CHC20908" }),
     ...runrateProposes("CHC20892"),
     ...NEVER_MINT,
   });
@@ -87,7 +88,7 @@ test("the same rule protects EXTENSION rows", async () => {
 
   await allocateContractIdsForInsertableRows(rows, {
     tableId: "cynet_health_deal_sheet",
-    ...tableHolds({ 5256080: "CHC21529" }),
+    ...tableHolds({ "5256080|1465994": "CHC21529" }),
     ...runrateProposes("CHC99999"),
     ...NEVER_MINT,
   });

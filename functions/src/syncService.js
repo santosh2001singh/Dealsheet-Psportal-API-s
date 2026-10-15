@@ -34,6 +34,7 @@ const {
   fetchLatestTerminationReasonLogRowsByKeys,
   fetchContractRateChangePairsFromActive,
   fetchContractSegmentRateChangePairsFromActive,
+  fetchPlacementVersionRateChangePairsFromActive,
   fetchRecruiterHierarchyReconciliation,
   buildOwnershipChangeLogRowsForHierarchyMoves,
   applyRecruiterHierarchyMovesToDealSheet,
@@ -44,15 +45,13 @@ const {
   buildInorganicHierarchyLogCandidate,
   resolveInorganicHierarchyLogRows,
   filterInorganicHierarchyAgainstFrozenOrganic,
+  applyContractOrganicOwnerFilterToInorganicRows,
   buildInorganicCandidateFromReconciliation,
   insertInorganicHierarchyLogBatch,
-  fetchDealSheetOwnershipChangePairsFromActive,
-  fetchContractOwnershipChangePairsFromActive,
-  buildRecruiterHandoverOwnershipLogRows,
-  buildOwnershipChangeLogRows,
-  buildContractOwnershipChangeLogRows,
+  fetchOwnershipScanVersions,
+  buildOwnershipChangeLogRowsFromVersions,
   insertOwnershipChangeLogBatch,
-  overwriteOwnershipChangeLogDatesFromPlacements,
+  syncStoredOwnershipChangeLogDates,
   overwriteOwnershipChangeLogCandidateInfoFromDealSheet,
   overwriteDealSheetEffectiveDatesFromTentative,
   backfillHierarchyEmpNoNaForActive,
@@ -62,7 +61,8 @@ const {
   backfillExtensionParentInheritForDealSheets,
   finalizeDealSheetRowForResponse,
   hasBusinessColumnChanges,
-  applyDidNotAcceptDateOverrides,
+  hasLiveTentativeEndDateChange,
+  applyDidNotAcceptDateOverridesForRow,
   revalidateDealContractIdAgainstRunrate,
   repairStoredContractIdForPlacement,
   normalizeForCompare,
@@ -76,7 +76,13 @@ const {
   addOneDayToDateOnly,
   formatDateOnlyForSql,
 } = require("./bigQueryClient");
-const { startDateOnOrAfterUtcMin, effectiveMinFilterDate, API_OWNED_COLUMNS } = require("./columnMappings");
+const {
+  startDateOnOrAfterUtcMin,
+  effectiveMinFilterDate,
+  API_OWNED_COLUMNS,
+  PASSIVE_API_OWNED_COLUMNS,
+  applyEndedPlacementStatusByInitialStart,
+} = require("./columnMappings");
 const { buildEnrichedRowsFromDealSheetCandidates } = require("./api/dealSheetEnricher");
 const { normalizeContractIdOrNull } = require("./contractIdFormat");
 const { getCheckpointRef } = require("./firestoreWorkspace");
@@ -96,6 +102,7 @@ const {
   rowMatchesSyncDomain,
   resolveActiveDealSheetTableIdForDomain,
   resolveSyncDomainForActiveTableId,
+  isPlacementKeyedSyncDomain,
   buildActiveDealSheetRoutingSentinel,
   resolveEndedDealSheetTableId,
   resolveActiveDealSheetTableIdForRow,
@@ -531,11 +538,22 @@ function toRateChangeEffectiveDate(row) {
   return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : null;
 }
 
+/**
+ * ch_rate_change_logs numbers are kept to 3 decimals: float arithmetic otherwise stores
+ * 6.859999999999999 for 6.86 and 2.8900000000000006 for 2.89.
+ */
+function roundRateLogNumber(value) {
+  const n = toFloatOrNull(value);
+  if (n == null) return null;
+  const rounded = Math.round(n * 1000) / 1000;
+  return Object.is(rounded, -0) ? 0 : rounded;
+}
+
 function numDiff(newVal, oldVal) {
   const n = toFloatOrNull(newVal);
   const o = toFloatOrNull(oldVal);
   if (n == null || o == null) return null;
-  return n - o;
+  return roundRateLogNumber(n - o);
 }
 
 /**
@@ -558,51 +576,72 @@ function formatBillableOrientationForRateSnapshot(value) {
 }
 
 /**
+ * Deal-sheet rate columns snapshotted into ch_rate_change_logs as OLD_<col> / NEW_<col>, under the
+ * same name. Added Oct 2026 so every rate the deal sheet carries is visible in the log, not just the
+ * base pay/bill pair.
+ */
+const RATE_LOG_SAME_NAME_COLUMNS = Object.freeze([
+  "OT_RATE",
+  "HOLIDAY_RATE",
+  "CALL_BACK_RATE",
+  "ON_CALL_RATE",
+  "CLIENT_OT_RATE",
+  "CLIENT_HOLIDAY_RATE",
+  "CLIENT_CALL_BACK_RATE",
+  "CLIENT_ON_CALL_RATE",
+  "W2_PAY_RATE_NEW",
+  "FINAL_PAY_RATE_NEW",
+  "FINAL_BILL_RATE_NEW",
+  "FINAL_COST_NEW",
+  "MARGIN",
+  "CALCULATED_MARGIN",
+  "GM_OT",
+  "GP_PERCENTAGE",
+  "TOTAL_BONUS_TAXABLE",
+  "TOTAL_BONUS_NON_TAXABLE",
+  "WEEKLY_WALLET_MONEY",
+]);
+
+/**
  * Map deal-sheet row columns into OLD_* or NEW_* rate snapshot fields on the log row.
+ *
+ * Keys must match ch_rate_change_logs exactly: the insert runs with ignoreUnknownValues, so a key the
+ * table does not have is dropped silently. Until Oct 2026 the table's duration / orientation columns
+ * were named INITIAL_PROJECT_DURATION_IN_WEEKS / ORIENTATION_HOURS and GROSS_MARGIN was written as
+ * MARGIN, so all three (and GM_DIFFERENCE) sat empty. Every log column that mirrors a deal-sheet
+ * column now carries the deal sheet's own name (sql/rename_ch_rate_change_logs_to_deal_sheet_names.sql).
  * @param {object|null} row
  * @param {"OLD_"|"NEW_"} prefix
  */
 function extractRateSnapshotFields(row, prefix) {
-  if (!row) {
-    return {
-      [`${prefix}GUARANTEED_HOURS`]: null,
-      [`${prefix}PROJECT_DURATION`]: null,
-      [`${prefix}NBO_HOURS`]: null,
-      [`${prefix}BILLABLE_ORIENTATION_HRS`]: null,
-      [`${prefix}BILLABLE_ORIENTATION`]: null,
-      [`${prefix}ADDITIONAL_BONUS`]: null,
-      [`${prefix}PAY_RATE`]: null,
-      [`${prefix}WEEKLY_PER_DIEM`]: null,
-      [`${prefix}W2_PAY_RATE`]: null,
-      [`${prefix}FINAL_PAY_RATE`]: null,
-      [`${prefix}FINAL_COST`]: null,
-      [`${prefix}BILL_RATE`]: null,
-      [`${prefix}FINAL_BILL_RATE`]: null,
-      [`${prefix}NET_MARGIN`]: null,
-      [`${prefix}MARGIN`]: null,
-      [`${prefix}CLIENT_MSP_FEE`]: null,
-      [`${prefix}GM_BASED_ON_NEW_LOADING_COST`]: null,
-    };
-  }
-  return {
-    [`${prefix}GUARANTEED_HOURS`]: toFloatOrNull(row.GUARANTEED_HOURS),
-    [`${prefix}PROJECT_DURATION`]: toFloatOrNull(row.PROJECT_DURATION),
-    [`${prefix}NBO_HOURS`]: toFloatOrNull(row.NBO_HOURS),
-    [`${prefix}BILLABLE_ORIENTATION_HRS`]: toFloatOrNull(row.BILLABLE_ORIENTATION_HRS),
-    [`${prefix}BILLABLE_ORIENTATION`]: formatBillableOrientationForRateSnapshot(row.BILLABLE_ORIENTATION),
-    [`${prefix}ADDITIONAL_BONUS`]: toFloatOrNull(row.ADDITIONAL_BONUS),
-    [`${prefix}PAY_RATE`]: toFloatOrNull(row.PAY_RATE),
-    [`${prefix}WEEKLY_PER_DIEM`]: toFloatOrNull(row.WEEKLY_PER_DIEM_NON_TAXED),
-    [`${prefix}W2_PAY_RATE`]: toFloatOrNull(row.T4_PAY_RATE ?? row.W2_PAY_RATE),
-    [`${prefix}FINAL_PAY_RATE`]: toFloatOrNull(row.FINAL_PAY_RATE),
-    [`${prefix}FINAL_COST`]: toFloatOrNull(row.FINAL_COST),
-    [`${prefix}BILL_RATE`]: toFloatOrNull(row.BILL_RATE),
-    [`${prefix}FINAL_BILL_RATE`]: toFloatOrNull(row.FINAL_BILL_RATE),
-    [`${prefix}NET_MARGIN`]: toFloatOrNull(row.NET_MARGIN),
-    [`${prefix}MARGIN`]: toFloatOrNull(row.MARGIN),
-    [`${prefix}CLIENT_MSP_FEE`]: toFloatOrNull(row.CLIENT_MSP_FEE),
-    [`${prefix}GM_BASED_ON_NEW_LOADING_COST`]: resolveNewMarginForRateSnapshot(row),
+  const r = row || {};
+  const out = {
+    // Guaranteed weekly hours: the deal sheet's SCHEDULE_HOURS_1 (what the Canada rate formula uses).
+    [`${prefix}SCHEDULE_HOURS_1`]: toFloatOrNull(r.SCHEDULE_HOURS_1),
+    [`${prefix}PROJECT_DURATION`]: toFloatOrNull(r.PROJECT_DURATION),
+    [`${prefix}NBO_HOURS`]: toFloatOrNull(r.NBO_HOURS),
+    [`${prefix}BILLABLE_ORIENTATION_HRS`]: toFloatOrNull(r.BILLABLE_ORIENTATION_HRS),
+    [`${prefix}BILLABLE_ORIENTATION`]: formatBillableOrientationForRateSnapshot(r.BILLABLE_ORIENTATION),
+    [`${prefix}ADDITIONAL_BONUS`]: toFloatOrNull(r.ADDITIONAL_BONUS),
+    [`${prefix}PAY_RATE`]: toFloatOrNull(r.PAY_RATE),
+    [`${prefix}WEEKLY_PER_DIEM_NON_TAXED`]: toFloatOrNull(r.WEEKLY_PER_DIEM_NON_TAXED),
+    [`${prefix}W2_PAY_RATE`]: toFloatOrNull(r.T4_PAY_RATE ?? r.W2_PAY_RATE),
+    [`${prefix}FINAL_PAY_RATE`]: toFloatOrNull(r.FINAL_PAY_RATE),
+    [`${prefix}FINAL_COST`]: toFloatOrNull(r.FINAL_COST),
+    [`${prefix}BILL_RATE`]: toFloatOrNull(r.BILL_RATE),
+    [`${prefix}FINAL_BILL_RATE`]: toFloatOrNull(r.FINAL_BILL_RATE),
+    [`${prefix}NET_MARGIN`]: toFloatOrNull(r.NET_MARGIN),
+    [`${prefix}GROSS_MARGIN`]: toFloatOrNull(r.GROSS_MARGIN),
+    [`${prefix}CLIENT_MSP_FEE`]: toFloatOrNull(r.CLIENT_MSP_FEE),
+    [`${prefix}GM_BASED_ON_NEW_LOADING_COST`]: row ? resolveNewMarginForRateSnapshot(row) : null,
   };
+  for (const col of RATE_LOG_SAME_NAME_COLUMNS) {
+    out[`${prefix}${col}`] = toFloatOrNull(r[col]);
+  }
+  for (const [key, value] of Object.entries(out)) {
+    if (typeof value === "number") out[key] = roundRateLogNumber(value);
+  }
+  return out;
 }
 
 /**
@@ -622,6 +661,8 @@ function buildRateChangeLogRow(latestRow, previousRow = null, options = {}) {
 
   return {
     RATE_CHANGE: "YES",
+    // The placement the NEW snapshot was read from (sql/add_placement_id_to_ch_rate_change_logs.sql).
+    PLACEMENT_ID: toInt64OrNull(latestRow?.PLACEMENT_ID?.value ?? latestRow?.PLACEMENT_ID),
     SKU_NUMBER: latestRow?.SKU_NUMBER ?? null,
     CONTRACT_ID: normalizeContractIdOrNull(latestRow?.CONTRACT_ID),
     CANDIDATE_NAME: latestRow?.CANDIDATE_NAME ?? null,
@@ -629,15 +670,15 @@ function buildRateChangeLogRow(latestRow, previousRow = null, options = {}) {
     PLACEMENT_STATUS: latestRow?.PLACEMENT_STATUS ?? null,
     START_DATE: latestRow?.START_DATE ?? null,
     END_DATE: latestRow?.END_DATE ?? null,
-    RECRUITER: latestRow?.ASSIGNMENT_RECRUITER ?? null,
-    RECRUITER_EMAIL_ID: latestRow?.ASSIGNMENT_RECRUITER_EMAIL ?? null,
+    ASSIGNMENT_RECRUITER: latestRow?.ASSIGNMENT_RECRUITER ?? null,
+    ASSIGNMENT_RECRUITER_EMAIL: latestRow?.ASSIGNMENT_RECRUITER_EMAIL ?? null,
     ACCOUNT_MANAGER: latestRow?.ACCOUNT_MANAGER ?? null,
     SECONDARY_AM: latestRow?.SECONDARY_AM ?? null,
     ASSOCIATE_AM: latestRow?.ASSOCIATE_AM ?? null,
     RM: latestRow?.RM ?? null,
     TEAM_LEAD: latestRow?.TEAM_LEAD ?? null,
     ATL: latestRow?.ATL ?? null,
-    MSP: latestRow?.MSP_NAME ?? null,
+    MSP_NAME: latestRow?.MSP_NAME ?? null,
     FACILITY_NAME: latestRow?.FACILITY_NAME ?? null,
     ...oldSnap,
     ...newSnap,
@@ -645,7 +686,7 @@ function buildRateChangeLogRow(latestRow, previousRow = null, options = {}) {
     BR_DIFFERENCE: numDiff(newSnap.NEW_BILL_RATE, oldSnap.OLD_BILL_RATE),
     PROFIT_DIFFERENCE: numDiff(newSnap.NEW_NET_MARGIN, oldSnap.OLD_NET_MARGIN),
     DELIVERY_POC: latestRow?.DELIVERY_POC ?? null,
-    ONSITE_MANAGER: latestRow?.ONSITE_AM ?? null,
+    ONSITE_AM: latestRow?.ONSITE_AM ?? null,
     CLIENT_STATE: latestRow?.CLIENT_STATE ?? null,
   };
 }
@@ -785,6 +826,8 @@ function computeChangedFields(incomingRow, existingRow, ignoreFields) {
   }
   for (const key of API_OWNED_COLUMNS) {
     if (ignore.has(key)) continue;
+    // Mirror hasBusinessColumnChanges: passive columns never count as a change on their own.
+    if (PASSIVE_API_OWNED_COLUMNS.has(key)) continue;
     if (shouldSkipDomainExcludedApiOwnedColumn(incomingRow, key)) continue;
     const nextVal = normalizeForCompare(incomingRow?.[key]);
     const prevVal = normalizeForCompare(existingRow?.[key]);
@@ -793,6 +836,8 @@ function computeChangedFields(incomingRow, existingRow, ignoreFields) {
     if (key === "CONTRACT_ID" && nextVal == null && prevVal != null) continue;
     if (nextVal !== prevVal) out.push(key);
   }
+  // Mirror hasBusinessColumnChanges: a live row's tentative end date change appends on its own.
+  if (hasLiveTentativeEndDateChange(incomingRow, existingRow)) out.push("TENTATIVE_END_DATE");
   return out.sort();
 }
 
@@ -1046,7 +1091,7 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   // corrected. We compare and insert this same row so the gate decision and the stored row stay
   // consistent. EXTENSION rows are NOT date-overridden from a prior ended placement any more, so
   // there is nothing further to pre-apply here.
-  const [didNotAcceptRow] = applyDidNotAcceptDateOverrides([row]);
+  const didNotAcceptRow = applyDidNotAcceptDateOverridesForRow(row);
   let compareRow = didNotAcceptRow || row;
 
   // Contract-identity repair (DEAL rows only).
@@ -1121,6 +1166,11 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   }
 
 
+  // ENDED vs ENDED<30 against the INITIAL_START_DATE the row will carry (baseline's, a manual
+  // column) so the gate and diff_fields see the final status, same as the insert pipeline's gate.
+  if (baseline) {
+    compareRow = applyEndedPlacementStatusByInitialStart(compareRow, baseline.INITIAL_START_DATE);
+  }
   const changed = hasBusinessColumnChanges(compareRow, baseline, new Set(compareIgnoreFields));
   const diffFields = computeChangedFields(compareRow, baseline, compareIgnoreFields);
   const allowFirstInsert = placementStatusAllowsFirstInsert(
@@ -1212,31 +1262,9 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     responseData = row;
   }
 
-  // Recruiter-handover ownership logs for this placement (RECRUITER change + vacated hierarchy role).
-  // The scheduled triggers do this table-wide; the refresh endpoint does it for just this row so the
-  // logs appear as soon as the API is hit. Dedupe on the log table makes repeat calls idempotent.
-  let ownershipHandoverLog = null;
-  // Same domain gate as the scheduled scans: canada / locums write no ownership logs while they are
-  // being validated. Keyed on the row's domain (logParams), so the manual endpoint obeys it too.
-  if (domainWritesEnrichLogs(logParams)) {
-    try {
-      const handoverRows = await buildRecruiterHandoverOwnershipLogRows([responseData]);
-      if (handoverRows.length > 0) {
-        const owc = await insertOwnershipChangeLogBatch(handoverRows, 0, {
-          datasetId: config.ownershipChangeLogDatasetId,
-          tableId: config.ownershipChangeLogTableId,
-        });
-        ownershipHandoverLog = { built: handoverRows.length, inserted: owc.inserted, errorBatches: owc.errorBatches };
-        logLine(
-          `[refreshDealSheetByPlacementId] recruiter-handover ownership logs built=${handoverRows.length} inserted=${owc.inserted}`
-        );
-      }
-    } catch (ownErr) {
-      logLine(
-        `[refreshDealSheetByPlacementId] ownership handover log write failed (non-fatal): ${String(ownErr?.message || ownErr).slice(0, 200)}`
-      );
-    }
-  }
+  // Ownership logs for this placement were written by the insert above (insert-time path in
+  // insertEnrichedDealSheetBatch, built from the contract's version history), so nothing is
+  // logged separately here.
 
   // Full inorganic-hierarchy scan (recruiter-change + CSM-divergence + recruiter-hierarchy
   // reconciliation incl. moves + ownership-from-moves). NOTE: this is a table-WIDE reconciliation
@@ -1273,7 +1301,7 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     // Present only when this refresh repaired a CONTRACT_ID that no longer matches its run-rate
     // window (see revalidateDealContractIdAgainstRunrate). Null on every ordinary refresh.
     contract_id_revalidation: contractRevalidation,
-    ownership_handover_log: ownershipHandoverLog,
+    ownership_handover_log: insertResult.contractChainOwnershipLog ?? null,
     inorganic_scan: inorganicScanLog
       ? { inserted: inorganicScanLog.inserted, recruiterHierarchyDivergences: inorganicScanLog.recruiterHierarchyDivergences }
       : null,
@@ -1756,6 +1784,9 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
   const skipExistingDealSheetOrPlacement =
     params.skip_existing_deal_sheet_or_placement === true || onlyNewDealSheets;
   const rejectIfExistingDealSheetOrPlacement = params.reject_if_existing_deal_sheet_or_placement === true;
+  // Health: skip-existing keys on PLACEMENT_ID alone, so a deal sheet Nexus moved onto a new
+  // placement is inserted as that new placement (see isPlacementKeyedDealSheetTable).
+  const dedupeExistingByPlacementOnly = isPlacementKeyedSyncDomain(syncDomain);
   const dedupeByPlacementId = params.dedupe_by_placement_id === true;
   const skipDidNotAcceptIfAlreadyDidNotAccept = params.skip_did_not_accept_existing === true;
   const maxCandidatesRaw = params.max_candidates;
@@ -2039,6 +2070,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
     const result = await insertBatchFn(rowsForInsert, totalRowsInserted, {
       skipExistingDealSheets: onlyNewDealSheets,
       rejectIfExistingDealSheetOrPlacement,
+      dedupeExistingByPlacementOnly,
       dedupeByPlacementId: dedupeByPlacementId,
       skipDidNotAcceptIfAlreadyDidNotAccept: skipDidNotAcceptIfAlreadyDidNotAccept,
       generatedUuidField,
@@ -2364,7 +2396,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
         const unknownPlacementSeen = new Set();
         for (const item of filteredCandidates) {
           const dsid = item?.deal_sheet;
-          if (dsid != null && String(dsid).trim() !== "") {
+          if (!dedupeExistingByPlacementOnly && dsid != null && String(dsid).trim() !== "") {
             const id = String(dsid).trim();
             if (!knownExistingDealSheetIds.has(id) && !knownNewDealSheetIds.has(id) && !unknownDealSheetSeen.has(id)) {
               unknownDealSheetSeen.add(id);
@@ -2422,7 +2454,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
             rowJobK && rowCandK ? submittalByJobCandidate.get(`${rowJobK}:${rowCandK}`) : null;
           const pidKeyRaw = rowSubmittal?.id ?? rowSubmittal?.placement ?? row?.placement ?? row?.placement_id;
           const pidKey = pidKeyRaw == null ? "" : String(pidKeyRaw).trim();
-          if (dsKey !== "" && knownExistingDealSheetIds.has(dsKey)) {
+          if (!dedupeExistingByPlacementOnly && dsKey !== "" && knownExistingDealSheetIds.has(dsKey)) {
             skippedExistingDealSheet++;
             continue;
           }
@@ -2434,7 +2466,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
         }
         candidatesToProcess = nextCandidates;
         logLine(
-          `[enriched sync] STEP 3/5 SKIP-EXISTING FILTER: unknownDealSheetsChecked=${unknownDealSheetIds.length} unknownPlacementsChecked=${unknownPlacementIds.length} skippedExistingDealSheet=${skippedExistingDealSheet} skippedExistingPlacement=${skippedExistingPlacement} remainingForFlow=${candidatesToProcess.length}`
+          `[enriched sync] STEP 3/5 SKIP-EXISTING FILTER (key=${dedupeExistingByPlacementOnly ? "PLACEMENT_ID" : "DEAL_SHEET_ID|PLACEMENT_ID"}): unknownDealSheetsChecked=${unknownDealSheetIds.length} unknownPlacementsChecked=${unknownPlacementIds.length} skippedExistingDealSheet=${skippedExistingDealSheet} skippedExistingPlacement=${skippedExistingPlacement} remainingForFlow=${candidatesToProcess.length}`
         );
       }
 
@@ -2620,6 +2652,24 @@ async function syncRateChangeLogsFromBigQuery(params = {}) {
     rows.push(row);
   }
 
+  // Same placement, latest version vs the one before: any tracked rate changed, with or without
+  // RATE_CHANGE=YES. Effective date = the latest version's LAST_UPDATED, as for the YES pairs above.
+  const versionPairs = await fetchPlacementVersionRateChangePairsFromActive({
+    datasetId: dealSheetDatasetId,
+  });
+  let versionBuilt = 0;
+  for (const [, { latest, previous }] of versionPairs) {
+    const row = buildRateChangeLogRow(latest, previous);
+    const key = `${row.CONTRACT_ID || ""}|${row.RATE_CHANGE_EFFECTIVE_DATE || ""}`;
+    if (key !== "|" && seenDedupe.has(key)) continue;
+    if (key !== "|") seenDedupe.add(key);
+    rows.push(row);
+    versionBuilt++;
+  }
+  logLine(
+    `[rate-change logs BQ scan] placement-version pairs=${versionPairs.size} versionBuilt=${versionBuilt}`
+  );
+
   // Consecutive placements under the same CONTRACT_ID with rate snapshot diffs (or next YES).
   // OWNERSHIP_EFFECTIVE_DATE = COALESCE(prev.END_DATE, prev.TENTATIVE_END_DATE) + 1.
   const segmentPairs = await fetchContractSegmentRateChangePairsFromActive({
@@ -2647,13 +2697,14 @@ async function syncRateChangeLogsFromBigQuery(params = {}) {
 
   const elapsedStr = formatDuration(Date.now() - startMs);
   logLine(
-    `[rate-change logs BQ scan] DONE inserted=${result.inserted} yesPairs=${pairs.size} segmentPairs=${segmentPairs.size} built=${rows.length} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
+    `[rate-change logs BQ scan] DONE inserted=${result.inserted} yesPairs=${pairs.size} versionPairs=${versionPairs.size} segmentPairs=${segmentPairs.size} built=${rows.length} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
   );
 
   return {
     inserted: result.inserted,
-    total: pairs.size + segmentPairs.size,
+    total: pairs.size + versionPairs.size + segmentPairs.size,
     rateChangeYes: rows.length,
+    versionPairs: versionPairs.size,
     segmentPairs: segmentPairs.size,
     errorBatches: result.errorBatches,
     elapsed: elapsedStr,
@@ -2790,7 +2841,27 @@ async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
     `[inorganic hierarchy logs BQ scan] reconNewPersonCandidates=${reconCandidates.length} afterOrganicFilter=${reconRows.length}`
   );
 
-  const rows = [...runrateRows, ...recruiterChangeRows, ...reconRows];
+  // Contract-based gate over all three sources: anyone who already owned the placement's contract
+  // organically (recruiter or any hierarchy role, on any of its placements) is a promotion, not an
+  // inorganic join. Fails closed — a wrong row is permanent in an append-only log, whereas skipping
+  // this run's inserts is caught up by the next scheduled run.
+  let rows = [];
+  let contractOwnerFilter = { droppedRows: 0, droppedSlots: 0 };
+  try {
+    contractOwnerFilter = await applyContractOrganicOwnerFilterToInorganicRows(
+      [...runrateRows, ...recruiterChangeRows, ...reconRows],
+      { datasetId: dealSheetDatasetId, domain }
+    );
+    rows = contractOwnerFilter.rows;
+  } catch (e) {
+    logLine(
+      `[inorganic hierarchy logs BQ scan] WARN contract organic-owner lookup failed, no log rows inserted this run: ${e && e.message ? e.message : e}`
+    );
+  }
+  logLine(
+    `[inorganic hierarchy logs BQ scan] contractOrganicOwnerFilter droppedRows=${contractOwnerFilter.droppedRows} droppedSlots=${contractOwnerFilter.droppedSlots} remaining=${rows.length}`
+  );
+
   const result = await insertInorganicHierarchyLogBatch(rows, 0, {
     datasetId: logDatasetId,
     tableId: logTableId,
@@ -2812,6 +2883,9 @@ async function syncInorganicHierarchyLogsFromBigQuery(params = {}) {
     for (const r of reconResults) {
       moveOwnershipRows.push(...buildOwnershipChangeLogRowsForHierarchyMoves(r, nowIso));
     }
+    // One promotion is logged once per contract: the earliest placement's rows go first, so the
+    // per-contract dedupe in insertOwnershipChangeLogBatch keeps those and drops the later repeats.
+    moveOwnershipRows.sort((a, b) => String(a.START_DATE ?? "").localeCompare(String(b.START_DATE ?? "")));
     if (moveOwnershipRows.length > 0) {
       const ownResult = await insertOwnershipChangeLogBatch(moveOwnershipRows, 0, {
         datasetId: config.ownershipChangeLogDatasetId,
@@ -2873,12 +2947,13 @@ async function syncLiveRecruiterHierarchyForDomain(params = {}) {
 }
 
 /**
- * Scans active deal-sheet tables for per-role ownership handovers (recruiter / onsite AM / CSM
- * level, latest row vs the row before it) and appends one ownership_change_logs row per changed
- * role — plus a "vacated" row when a hierarchy person became the recruiter. Also scans consecutive
- * placements under the same CONTRACT_ID (extension chain) for ownership diffs, with
- * OWNERSHIP_EFFECTIVE_DATE = COALESCE(prev.END_DATE, prev.TENTATIVE_END_DATE) + 1 (CHANGE_REASON_NOTES =
- * CONTRACT_CHAIN so the placement date overwrite skips them).
+ * ownership_change_logs scan for one domain (all three when sync_domain is omitted).
+ *
+ * Reads every deal-sheet version of the domain and builds one row per ownership change per contract,
+ * with its effective date (rules in ownershipChangeLogRules / docs/OWNERSHIP_LOGS.md). Inserts only
+ * the changes the table does not hold yet — the data team's history included — then re-dates the
+ * system's existing rows against the current deal sheet and refreshes their candidate name / email.
+ * Every write is a no-op while OWNERSHIP_LOG_WRITES_ENABLED is off.
  */
 async function syncOwnershipChangeLogsFromBigQuery(params = {}) {
   const logDatasetId =
@@ -2902,37 +2977,31 @@ async function syncOwnershipChangeLogsFromBigQuery(params = {}) {
     `[ownership change logs BQ scan] === syncOwnershipChangeLogsFromBigQuery START === domain=${domain ?? "all"} dealSheetDataset=${dealSheetDatasetId} logTable=${config.projectId}.${logDatasetId}.${logTableId}`
   );
 
-  const pairs = await fetchDealSheetOwnershipChangePairsFromActive({ datasetId: dealSheetDatasetId, domain });
-
-  const rows = [];
-  for (const [, { latest, previous }] of pairs) {
-    rows.push(...buildOwnershipChangeLogRows(latest, previous));
-  }
-
-  // NOTE: the table-wide recruiter-handover scan is gone — it read PREVIOUS_RECRUITER_EMAIL off the
-  // deal sheet, which is no longer written. RECRUITER handovers (and the vacated-hierarchy-role row)
-  // already come out of the latest-vs-previous pair scan above via buildOwnershipChangeLogRows; the
-  // refresh endpoint additionally builds them in-memory from __PREV_RECRUITER_* on a recruiter change.
-
-  // CONTRACT_ID chain: consecutive placements (by START_DATE) with ownership role diffs.
-  const contractPairs = await fetchContractOwnershipChangePairsFromActive({
-    datasetId: dealSheetDatasetId,
-    domain,
-  });
-  let contractChainBuilt = 0;
-  for (const [, { latest, previous }] of contractPairs) {
-    const chainRows = buildContractOwnershipChangeLogRows(latest, previous);
-    contractChainBuilt += chainRows.length;
-    rows.push(...chainRows);
-  }
+  const versions = await fetchOwnershipScanVersions({ datasetId: dealSheetDatasetId, domain });
+  const rows = buildOwnershipChangeLogRowsFromVersions(versions);
+  const contractChainRows = rows.filter((r) => r.CHANGE_REASON_NOTES === "CONTRACT_CHAIN").length;
 
   const result = await insertOwnershipChangeLogBatch(rows, 0, {
     datasetId: logDatasetId,
     tableId: logTableId,
   });
 
+  // Rows inserted above already carry their dates; this upgrades older provisional ones (END_DATE + 1
+  // -> the next extension's START_DATE) and follows date edits on the deal sheet.
+  let dateSync = null;
+  try {
+    dateSync = await syncStoredOwnershipChangeLogDates({
+      versions,
+      datasetId: logDatasetId,
+      tableId: logTableId,
+      domain,
+    });
+  } catch (dsErr) {
+    logLine(`[ownership change logs BQ scan] date sync failed (non-fatal): ${String(dsErr?.message || dsErr).slice(0, 200)}`);
+  }
+
   // Candidate name/email can change on the deal sheet (a new appended row); the ownership log keeps
-  // one row per (placement, role) and must be OVERWRITTEN in place (by PLACEMENT_ID) — not appended.
+  // one row per change and is OVERWRITTEN in place (by PLACEMENT_ID) — not appended.
   let candidateInfoOverwrite = null;
   try {
     candidateInfoOverwrite = await overwriteOwnershipChangeLogCandidateInfoFromDealSheet({
@@ -2947,24 +3016,51 @@ async function syncOwnershipChangeLogsFromBigQuery(params = {}) {
 
   const elapsedStr = formatDuration(Date.now() - startMs);
   logLine(
-    `[ownership change logs BQ scan] DONE inserted=${result.inserted} changedPairs=${pairs.size} contractChainPairs=${contractPairs.size} contractChainBuilt=${contractChainBuilt} builtRows=${rows.length} candidateInfoUpdated=${candidateInfoOverwrite?.updated ?? "n/a"} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
+    `[ownership change logs BQ scan] DONE versions=${versions.length} changes=${rows.length} contractChainChanges=${contractChainRows} inserted=${result.inserted} alreadyLogged=${result.skippedExisting ?? 0} datesUpdated=${dateSync?.updated ?? "n/a"} candidateInfoUpdated=${candidateInfoOverwrite?.updated ?? "n/a"} writesDisabled=${result.disabled === true} errorBatches=${result.errorBatches} elapsed=${elapsedStr}`
   );
 
   return {
     inserted: result.inserted,
-    total: pairs.size,
-    contractChainPairs: contractPairs.size,
+    total: rows.length,
+    contractChainPairs: contractChainRows,
     builtRows: rows.length,
+    alreadyLogged: result.skippedExisting ?? 0,
+    datesUpdated: dateSync?.updated ?? null,
     candidateInfoUpdated: candidateInfoOverwrite?.updated ?? null,
+    writesDisabled: result.disabled === true,
     errorBatches: result.errorBatches,
     elapsed: elapsedStr,
   };
 }
 
+
 /**
- * Keeps ownership_change_logs + deal-sheet OWNERSHIP_EFFECTIVE_DATE in sync with each placement's current
- * TENTATIVE_END_DATE (+1). Runs from the insert trigger after extensions/updates land.
+ * ownership_change_logs date sync ONLY, for one domain (syncStoredOwnershipChangeLogDates — the same
+ * step syncOwnershipChangeLogEffectiveDatesFromExtensions starts with). Canada's trigger calls this
+ * instead of that function, whose deal-sheet maintenance backfills are not domain-scoped and are not
+ * Canada's to run.
  */
+async function syncOwnershipChangeLogDatesForDomain(params = {}) {
+  const dealSheetDatasetId =
+    typeof params.deal_sheet_bq_dataset === "string" && params.deal_sheet_bq_dataset.trim() !== ""
+      ? params.deal_sheet_bq_dataset.trim()
+      : config.datasetId;
+  const domain = normalizeSyncDomain(params?.sync_domain);
+  if (domain == null) throw new Error("syncOwnershipChangeLogDatesForDomain requires sync_domain");
+  const startMs = Date.now();
+  const result = await syncStoredOwnershipChangeLogDates({
+    dealSheetDatasetId,
+    datasetId: params.bq_dataset,
+    tableId: params.bq_table,
+    domain,
+  });
+  const elapsed = formatDuration(Date.now() - startMs);
+  logLine(
+    `[ownership change logs] date sync DONE domain=${domain} updated=${result.updated == null ? "n/a" : result.updated} elapsed=${elapsed}`
+  );
+  return { updated: result.updated, elapsed };
+}
+
 async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
   const dealSheetDatasetId =
     typeof params.deal_sheet_bq_dataset === "string" && params.deal_sheet_bq_dataset.trim() !== ""
@@ -2974,12 +3070,10 @@ async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
   const domain = normalizeSyncDomain(params?.sync_domain);
   const startMs = Date.now();
   logLine(`[ownership change logs] === syncOwnershipChangeLogEffectiveDatesFromExtensions START === domain=${domain ?? "all"}`);
-  // ownership_change_logs: keep START_DATE / END_DATE_PREVIOUS_OWNER / OWNERSHIP_EFFECTIVE_DATE in sync with
-  // each placement's CURRENT deal-sheet row, matched by PLACEMENT_ID. Per row type: CONTRACT_CHAIN
-  // rows use START_DATE-1 / START_DATE, everything else TENTATIVE_END_DATE / TENTATIVE_END_DATE+1. This
-  // replaces the older CONTRACT_ID -> extension-START_DATE OWNERSHIP_EFFECTIVE_DATE overwrite for the log
-  // table (both writing OWNERSHIP_EFFECTIVE_DATE would fight every run).
-  const result = await overwriteOwnershipChangeLogDatesFromPlacements({
+  // ownership_change_logs: re-date the system's rows against the CURRENT deal sheet — a provisional
+  // END_DATE + 1 / TENTATIVE_END_DATE + 1 becomes the next extension's START_DATE once it is booked.
+  // Data team rows are never touched (ownershipChangeLogRules.resolveStoredOwnershipLogDates).
+  const result = await syncStoredOwnershipChangeLogDates({
     dealSheetDatasetId,
     datasetId: params.bq_dataset,
     tableId: params.bq_table,
@@ -2998,8 +3092,8 @@ async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
   //  1) hierarchy NAME "NA"/blank -> its EMP_NO also "NA" (name is master).
   //  2) DELIVERY_POC recompute with the corrected priority (now includes AVP + DELIVERY_DIRECTOR).
   //  3) EXTENSION PREVIOUS_RECRUITER from Cluster_Data.ownership_data when still empty.
-  //  4) EXT_OR_REHIRE_BY_RMG ("Extension/Rehire") recompute across active + ended tables — a new
-  //     extension has to flip its PARENT DEAL row to 'EXTENSION', which insert-time rules cannot do.
+  //  4) EXT_OR_REHIRE_BY_RMG ("Extension/Rehire") recompute across active + ended tables — a deal's
+  //     value moves REOFFERED -> REBOOKED / blank when it starts, which insert-time rules cannot do.
   //  5) EXTENSION rows whose parent DEAL was synced AFTER them: insert-time inherit found no parent,
   //     so CONTRACT_ID / SKU_NUMBER / hierarchy / ops were left null. Nothing else goes back for them.
   //  6) RECRUITER_CLUSTER_REGION / CLIENT_CLUSTER_REGION / CLUSTER_TYPE on the cynet health tables
@@ -3657,6 +3751,7 @@ module.exports = {
   LIVE_RECRUITER_HIERARCHY_DOMAINS,
   syncOwnershipChangeLogsFromBigQuery,
   syncOwnershipChangeLogEffectiveDatesFromExtensions,
+  syncOwnershipChangeLogDatesForDomain,
   refreshPlacementRecordToBigQuery,
   backfillPlacementRecordFromNexus,
   bulkBackfillPlacementRecordsFromNexus,
@@ -3667,6 +3762,7 @@ module.exports = {
   splitActiveDealSheetUpdateTargetsByPlacementStatus,
   filterStaleTerminalBatchTargets,
   buildRateChangeLogRow,
+  extractRateSnapshotFields,
   buildContractSegmentRateChangeLogRow,
   parseBooleanLike,
   computeChangedFields,

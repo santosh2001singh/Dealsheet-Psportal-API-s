@@ -69,13 +69,16 @@ const INDEX_SRC = fs.readFileSync(path.join(__dirname, "index.js"), "utf8");
 const SYNC_SRC = fs.readFileSync(path.join(__dirname, "syncService.js"), "utf8");
 
 test("both triggers pass their domain to every audit-log scan", () => {
-  for (const fn of [
-    "syncOwnershipChangeLogEffectiveDatesFromExtensions",
-    "syncInorganicHierarchyLogsFromBigQuery",
-    "syncOwnershipChangeLogsFromBigQuery",
+  // syncOwnershipChangeLogsFromBigQuery has a third call: runOwnershipLogScansForDomain, the
+  // ownership-only path Canada takes. The date-only sync is called from there alone.
+  for (const [fn, expected] of [
+    ["syncOwnershipChangeLogEffectiveDatesFromExtensions", 2],
+    ["syncInorganicHierarchyLogsFromBigQuery", 2],
+    ["syncOwnershipChangeLogsFromBigQuery", 3],
+    ["syncOwnershipChangeLogDatesForDomain", 1],
   ]) {
     const calls = INDEX_SRC.split(`await ${fn}({`).slice(1);
-    assert.equal(calls.length, 2, `${fn}: insert + update trigger`);
+    assert.equal(calls.length, expected, `${fn}: call sites`);
     for (const body of calls) {
       const args = body.slice(0, body.indexOf("});"));
       assert.match(args, /sync_domain: domain,/, fn);
@@ -87,15 +90,14 @@ test("each scan hands its domain to every source query", () => {
   for (const call of [
     "fetchActiveExtensionRowsForInorganic({ datasetId: dealSheetDatasetId, domain })",
     "fetchRecruiterHierarchyReconciliation({ datasetId: dealSheetDatasetId, domain })",
-    "fetchDealSheetOwnershipChangePairsFromActive({ datasetId: dealSheetDatasetId, domain })",
+    "fetchOwnershipScanVersions({ datasetId: dealSheetDatasetId, domain })",
   ]) {
     assert.ok(SYNC_SRC.includes(call), call);
   }
   for (const fn of [
     "fetchDealSheetRecruiterChangePairsFromActive",
-    "fetchContractOwnershipChangePairsFromActive",
+    "syncStoredOwnershipChangeLogDates",
     "overwriteOwnershipChangeLogCandidateInfoFromDealSheet",
-    "overwriteOwnershipChangeLogDatesFromPlacements",
   ]) {
     const body = SYNC_SRC.split(`await ${fn}({`)[1] ?? "";
     assert.match(body.slice(0, body.indexOf("});")), /\bdomain,/, fn);
@@ -107,7 +109,9 @@ test("the refresh endpoint writes logs under the row's own domain", () => {
   assert.equal((SYNC_SRC.match(/resolveSyncDomainForActiveTableId\(effectiveTableId\)/g) || []).length, 2);
   assert.equal((SYNC_SRC.match(/writeAdditionalCostLogRows\(additionalCostLogRows, 0, logParams,/g) || []).length, 2);
   assert.equal((SYNC_SRC.match(/writeTerminationReasonLogRows\(terminationLogRows, 0, logParams,/g) || []).length, 2);
-  assert.ok(SYNC_SRC.includes("if (domainWritesEnrichLogs(logParams)) {"), "handover ownership gate");
+  // Ownership logs for a refreshed row come from the insert itself (insert-time path), whose domain
+  // gate reads the row (Canada by province, Locums by recruiter) — no separate write here.
+  assert.ok(!SYNC_SRC.includes("buildRecruiterHandoverOwnershipLogRows"), "no separate handover write");
   assert.ok(
     SYNC_SRC.includes("params.refresh_run_inorganic_scan === true && domainWritesEnrichLogs(logParams)"),
     "inorganic scan gate"

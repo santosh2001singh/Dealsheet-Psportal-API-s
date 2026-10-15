@@ -52,8 +52,9 @@ for (const listName of SQL_SPREAD_COLUMN_LISTS) {
   });
 }
 
-test("ACC_DIR_OR_VERT_HEAD specifically appears once in the parent-deal inherit list", () => {
-  // The exact regression from the Aug 18 2026 outage, pinned by name.
-  const cols = readColumnListLiteral("EXTENSION_PARENT_DEAL_INHERIT_COLUMNS");
-  assert.equal(cols.filter((c) => c === "ACC_DIR_OR_VERT_HEAD").length, 1);
+test("ACC_DIR_OR_VERT_HEAD is not inherited at all (replaced by the Level 1-4 CSM hierarchy)", () => {
+  // Was the column behind the Aug 18 2026 outage; dropped from every inherit list in Oct 2026.
+  for (const listName of ["EXTENSION_PARENT_DEAL_INHERIT_COLUMNS", "EXTENSION_RUNRATE_MANUAL_COLUMNS"]) {
+    assert.equal(readColumnListLiteral(listName).includes("ACC_DIR_OR_VERT_HEAD"), false, listName);
+  }
 });

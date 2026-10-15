@@ -25,6 +25,7 @@ test("all 64 inherited columns are filled, contract identity included", () => {
     "SKU_NUMBER",
     "INITIAL_START_DATE",
     "NEW_HIRE_DATE",
+    "SUBMISSION_DATE",
     "VP",
     "VP_EMP_NO",
     "ACCOUNT_MANAGER",
@@ -53,7 +54,8 @@ test("the extra columns extend the insert path's list rather than replacing it",
   for (const col of EXTRA_PARENT_BACKFILL_COLUMNS) assert.ok(cols.includes(col));
   // These come from EXTENSION_PARENT_DEAL_INHERIT_COLUMNS, which the insert path owns.
   assert.ok(cols.includes("CONTRACT_ID"));
-  assert.ok(cols.includes("ACC_DIR_OR_VERT_HEAD"));
+  // Replaced by the Level 1-4 CSM hierarchy (Oct 2026): never inherited from a parent DEAL.
+  assert.ok(!cols.includes("ACC_DIR_OR_VERT_HEAD"));
 });
 
 // --- fill-if-empty is the whole safety argument -----------------------------------------------------

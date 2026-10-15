@@ -77,8 +77,13 @@ test("the pre-filter only runs when skip-existing is on", () => {
 });
 
 test("the DEAL_SHEET_ID dedupe still runs on what is fetched", () => {
-  // The pre-filter narrows the fetch; it does not replace the filter below it.
-  assert.ok(SRC.includes("if (dsKey !== \"\" && knownExistingDealSheetIds.has(dsKey)) {"));
+  // The pre-filter narrows the fetch; it does not replace the filter below it. Health (placement-
+  // keyed) skips only the DEAL_SHEET_ID half — see placementKeyedInsertDedupe.test.js.
+  assert.ok(
+    SRC.includes(
+      "if (!dedupeExistingByPlacementOnly && dsKey !== \"\" && knownExistingDealSheetIds.has(dsKey)) {"
+    )
+  );
   assert.ok(SRC.includes("skippedExistingDealSheet++"));
 });
 

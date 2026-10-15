@@ -147,8 +147,12 @@ function computeNewMargin(row, finalBillRateNew, finalCostNew) {
   const po = toNumberOrZero(row?.PO_HOURS);
   if (po === 0) return null;
 
-  const hrs = toNumberOrZero(row?.BILLABLE_ORIENTATION_HRS);
+  // Billable orientation hours with a blank percentage are left out of the margin (business rule,
+  // Oct 2026): the percentage is filled in only once the temp finishes the orientation modules, so
+  // a blank one means "not known yet", not "0% billable". Nexus sends null and the row stores
+  // "0.00%", so 0% is read as blank. Placement 1470046: 81.13 - 73.80 = 7.33, the Nexus MARGIN.
   const pct = parseBillableOrientationFraction(row?.BILLABLE_ORIENTATION);
+  const hrs = pct === 0 ? 0 : toNumberOrZero(row?.BILLABLE_ORIENTATION_HRS);
   const adjustment = (finalBillRateNew * hrs * (1 - pct)) / po;
   const value = finalBillRateNew - adjustment - finalCostNew;
   return Number.isFinite(value) ? value : null;

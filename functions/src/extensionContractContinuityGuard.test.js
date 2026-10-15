@@ -143,10 +143,13 @@ for (const { label, fn, alias, skuFallback } of TIERS) {
     const [sql] = await captureSql(() =>
       fn([UNRESOLVED_EXTENSION_ROW], { tableId: "cynet_health_deal_sheet" })
     );
-    // Removing the gap window must not take the original forward-looking guard with it.
+    // Removing the gap window must not take the original forward-looking guard with it. A parent
+    // DEAL must start strictly before (a same-day DEAL is a duplicate booking, placement 1470658);
+    // a prior EXTENSION of the chain may share the day.
+    const op = alias === "d" ? "<" : "<=";
     assert.match(
       sql,
-      new RegExp(`${alias}\\.START_DATE <= ext\\.extension_start_date`),
+      new RegExp(`${alias}\\.START_DATE ${op} ext\\.extension_start_date`),
       "a source that starts after the extension is still never its parent"
     );
   });
@@ -251,4 +254,33 @@ test("prior-EXTENSION tier: SKU is a contract key, never a substitute for the id
   assert.match(sql, /p\.CANDIDATE_ID = ext\.candidate_nexus_id/);
   assert.match(sql, /p\.CLIENT_ID = ext\.client_id/);
   assert.match(sql, /p\.START_DATE <= ext\.extension_start_date/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// A parent DEAL started BEFORE the extension — never on the same day. Live case (Martay L Shepard,
+// placement 1470658, 2026-09-30): a same-day 11-22 rebooking (DEAL 1470294, CHC23778, later
+// retracted) won over the real parent CHC22640 (started 08-24) under `<=`, and the extension took
+// that DEAL's INITIAL_START_DATE (11-22) and RM.
+// ---------------------------------------------------------------------------------------------
+
+const { fetchContractIdsForExtensions } = require("./bigQueryClient");
+
+test("contract lookup: a DEAL must start strictly before the extension; a prior EXTENSION may share the day", async () => {
+  const [sql] = await captureSql(() =>
+    fetchContractIdsForExtensions(
+      [{ placementId: 1470658, candidateNexusId: 8234689, candidateEmail: "martayshepard@gmail.com", phoneNumber: "(813) 525-1365", clientId: 983445, startDate: "2026-11-22" }],
+      { tableId: "cynet_health_deal_sheet", includeExtensionSource: true }
+    )
+  );
+  assert.match(sql, /d\.START_DATE < ext\.start_date/);
+  assert.match(sql, /d\.deal_type_norm = 'EXTENSION' AND d\.START_DATE = ext\.start_date/);
+  assert.ok(!/d\.START_DATE <= ext\.start_date/.test(sql), "the same-day DEAL arm must not come back");
+});
+
+test("parent-DEAL tier: the parent started strictly before the extension", async () => {
+  const [sql] = await captureSql(() =>
+    fetchExtensionParentDealInheritByPlacementId([UNRESOLVED_EXTENSION_ROW], { tableId: "cynet_health_deal_sheet" })
+  );
+  assert.match(sql, /d\.START_DATE < ext\.extension_start_date/);
+  assert.ok(!/d\.START_DATE <= ext\.extension_start_date/.test(sql));
 });
