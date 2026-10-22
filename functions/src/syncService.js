@@ -103,6 +103,7 @@ const {
   resolveActiveDealSheetTableIdForDomain,
   resolveSyncDomainForActiveTableId,
   isPlacementKeyedSyncDomain,
+  isPlacementKeyedDealSheetTable,
   buildActiveDealSheetRoutingSentinel,
   resolveEndedDealSheetTableId,
   resolveActiveDealSheetTableIdForRow,
@@ -110,6 +111,10 @@ const {
   rowMatchesSyncDomainForRow,
   buildEndedDealSheetRoutingSentinel,
 } = require("./recruiterDomainTables");
+const {
+  selectOneDealSheetPerJobCandidate,
+  resolveStoredDealSheetSelection,
+} = require("./dealSheetSelection");
 
 function isPositiveInt(value) {
   return value != null && Number.isFinite(Number(value)) && Number(value) > 0;
@@ -894,9 +899,21 @@ async function resolveRefreshSeed(accessToken, params = {}) {
 
   let dealSheetId = explicitDealSheetId || null;
   let preferredCandidateRow = null;
+  // Set when BigQuery stores several deal sheets for this placement and the requested one is not the
+  // selected one (PRIMARY -> FINAL -> newest created). The caller skips the refresh.
+  let notSelectedWinnerDealSheetId = null;
   if (jobId) {
     const byJob = await fetchDealSheetCandidatesByJobIdsParallel([jobId], accessToken, "FINAL,VERBAL");
     const rows = byJob.get(String(jobId)) || [];
+    if (Array.isArray(params.stored_deal_sheet_ids) && params.stored_deal_sheet_ids.length > 1) {
+      const selection = resolveStoredDealSheetSelection({
+        candidateRows: rows,
+        candidateId,
+        dealSheetId: explicitDealSheetId,
+        storedDealSheetIds: params.stored_deal_sheet_ids,
+      });
+      if (!selection.selected) notSelectedWinnerDealSheetId = selection.winnerDealSheetId;
+    }
     preferredCandidateRow = resolvePreferredCandidateRow(rows, candidateId, explicitDealSheetId);
     dealSheetId = normalizeNexusResourceId(preferredCandidateRow?.deal_sheet) || dealSheetId;
   }
@@ -908,6 +925,7 @@ async function resolveRefreshSeed(accessToken, params = {}) {
     dealSheetId,
     submittalRow,
     preferredCandidateRow,
+    notSelectedWinnerDealSheetId,
   };
 }
 
@@ -971,6 +989,25 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
 
   const accessToken = await getNexusAccessToken();
   const seed = await resolveRefreshSeed(accessToken, params);
+
+  if (seed.notSelectedWinnerDealSheetId) {
+    return {
+      action: "SKIPPED_NOT_SELECTED_DEAL_SHEET",
+      inserted: 0,
+      attempted: 0,
+      diff_fields: [],
+      reason: `Placement has several deal sheets in BigQuery; only ${seed.notSelectedWinnerDealSheetId} is refreshed (PRIMARY > FINAL > newest created)`,
+      resolved_ids: {
+        placement_id: seed.placementId || null,
+        job_id: seed.jobId || null,
+        candidate_id: seed.candidateId || null,
+        deal_sheet_id: normalizeNexusResourceId(params.deal_sheet_id),
+        selected_deal_sheet_id: seed.notSelectedWinnerDealSheetId,
+      },
+      data: null,
+      elapsed: formatDuration(Date.now() - startMs),
+    };
+  }
 
   if (!seed.jobId || !seed.preferredCandidateRow || !seed.dealSheetId) {
     return {
@@ -2388,6 +2425,30 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
         `[enriched sync] STEP 3/5 DEAL_SHEET_STATUS FILTER (allowed=${Array.from(allowedDealSheetStatusKeys).join(",")}): excludedTotal=${excludedByStatus} verbal=${excludedVerbal} emptyStatus=${excludedEmptyStatus} notAllowedStatus=${excludedNotAllowedStatus} finalButNoSubmittalOnPage=${excludedFinalNoSubmittalMatch} verbalSample=${verbalSamples.length ? JSON.stringify(verbalSamples) : "none"}`
       );
 
+      // Placement-keyed tables (health): one deal sheet per job + candidate. Nexus can hold a PRIMARY and
+      // a SECONDARY (or a FINAL and a VERBAL) deal sheet for the same submittal; both used to land in the
+      // same batch and both were inserted. Pick PRIMARY -> FINAL -> newest created (dealSheetSelection).
+      if (dedupeExistingByPlacementOnly && filteredCandidates.length > 1) {
+        const { kept, dropped } = selectOneDealSheetPerJobCandidate(filteredCandidates);
+        if (dropped.length > 0) {
+          const sample = dropped.slice(0, 5).map(({ row, winner }) => ({
+            job: row?.job ?? null,
+            candidate: row?.candidate ?? null,
+            dropped: row?.deal_sheet ?? null,
+            droppedType: row?.type ?? null,
+            droppedStatus: row?.deal_sheet_status ?? null,
+            kept: winner?.deal_sheet ?? null,
+            keptType: winner?.type ?? null,
+            keptStatus: winner?.deal_sheet_status ?? null,
+          }));
+          logLine(
+            `[enriched sync] STEP 3/5 ONE DEAL SHEET PER PLACEMENT (PRIMARY>FINAL>newest): dropped=${dropped.length} remaining=${kept.length} sample=${JSON.stringify(sample)}`
+          );
+          filteredCandidates.length = 0;
+          filteredCandidates.push(...kept);
+        }
+      }
+
       let candidatesToProcess = filteredCandidates;
       if (skipExistingDealSheetOrPlacement && filteredCandidates.length > 0) {
         const unknownDealSheetIds = [];
@@ -3235,6 +3296,32 @@ function splitActiveDealSheetUpdateTargetsByPlacementStatus(targets) {
  * @param {object} baseParams
  * @returns {{params: object|null, skipReason: string|null}}
  */
+/**
+ * Map "<table_id>|<placement_id>" -> stored DEAL_SHEET_IDs, for placement-keyed tables (health) only, and
+ * only where a placement holds more than one deal sheet. The update loop hands this list to the refresh
+ * so it can keep refreshing a single deal sheet per placement (see dealSheetSelection).
+ *
+ * @param {Array<{ deal_sheet_id?: unknown, placement_id?: unknown, table_id?: unknown }>} targets
+ * @returns {Map<string, string[]>}
+ */
+function buildStoredDealSheetIdsByPlacement(targets) {
+  const byPlacement = new Map();
+  for (const target of Array.isArray(targets) ? targets : []) {
+    if (!isPlacementKeyedDealSheetTable(target?.table_id)) continue;
+    const pid = target?.placement_id == null ? "" : String(target.placement_id).trim();
+    const dsid = target?.deal_sheet_id == null ? "" : String(target.deal_sheet_id).trim();
+    if (!pid || !dsid) continue;
+    const key = `${String(target.table_id).trim()}|${pid}`;
+    if (!byPlacement.has(key)) byPlacement.set(key, new Set());
+    byPlacement.get(key).add(dsid);
+  }
+  const out = new Map();
+  for (const [key, ids] of byPlacement) {
+    if (ids.size > 1) out.set(key, Array.from(ids));
+  }
+  return out;
+}
+
 function buildActiveUpdateRefreshParams(target, baseParams = {}) {
   const dealSheetId = target?.deal_sheet_id == null ? "" : String(target.deal_sheet_id).trim();
   const placementId = target?.placement_id == null ? "" : String(target.placement_id).trim();
@@ -3330,6 +3417,7 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
     datasetId: effectiveDatasetId,
     ...(domainTableId ? { tableIds: [domainTableId] } : {}),
   });
+  const storedDealSheetIdsByPlacement = buildStoredDealSheetIdsByPlacement(allTargets);
   const { priorityTargets, batchTargets: allBatchTargets } =
     splitActiveDealSheetUpdateTargetsByPlacementStatus(allTargets);
   const staleCutoffDays = isPositiveInt(params.terminal_stale_cutoff_days)
@@ -3468,6 +3556,7 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
   let not_found = 0;
   let no_baseline = 0;
   let skipped_date = 0;
+  let skipped_not_selected = 0;
   let errors = 0;
 
   async function processTarget(target) {
@@ -3490,6 +3579,12 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
       const { params, skipReason } = buildActiveUpdateRefreshParams(target, baseParams);
       if (!params) {
         return { action: "NOT_FOUND", reason: skipReason, inserted: 0 };
+      }
+      const storedDealSheetIds = params.placement_id
+        ? storedDealSheetIdsByPlacement.get(`${target.table_id}|${params.placement_id}`)
+        : null;
+      if (storedDealSheetIds && storedDealSheetIds.length > 1) {
+        params.stored_deal_sheet_ids = storedDealSheetIds;
       }
       if (params.deal_sheet_id && !params.placement_id) {
         logLine(
@@ -3580,12 +3675,13 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
         else if (r.action === "NOT_FOUND") not_found++;
         else if (r.action === "NO_BASELINE") no_baseline++;
         else if (r.action === "SKIPPED_DATE") skipped_date++;
+        else if (r.action === "SKIPPED_NOT_SELECTED_DEAL_SHEET") skipped_not_selected++;
         else if (r.action === "ERROR") errors++;
         else no_change++;
       }
       if (checked > 0 && checked % 100 === 0) {
         logLine(
-          `[update sync] progress checked=${checked}/${slice.length} appended=${appended} no_change=${no_change} not_found=${not_found} no_baseline=${no_baseline} skipped_date=${skipped_date} errors=${errors} elapsed=${formatDuration(Date.now() - startMs)}/${formatDuration(loopBudgetMs)}`
+          `[update sync] progress checked=${checked}/${slice.length} appended=${appended} no_change=${no_change} not_found=${not_found} no_baseline=${no_baseline} skipped_date=${skipped_date} skipped_not_selected_deal_sheet=${skipped_not_selected} errors=${errors} elapsed=${formatDuration(Date.now() - startMs)}/${formatDuration(loopBudgetMs)}`
         );
       }
     }
@@ -3692,7 +3788,7 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
 
   const elapsed = formatDuration(Date.now() - startMs);
   logLine(
-    `[update sync] === DONE === checked=${checked} appended=${appended} no_change=${no_change} not_found=${not_found} no_baseline=${no_baseline} skipped_date=${skipped_date} errors=${errors} priorityTotal=${priorityTotal} priorityChecked=${priorityChecked} batchTotal=${batchTotal} batchStaleSkipped=${batchStaleSkipped} batchCheckedThisRun=${batchCheckedThisRun} batchOffset=${batchOffset} batchOffsetEnd=${batchOffsetEnd} targetTotal=${targetTotal} hasMore=${hasMore ? "yes" : "no"} budgetExhausted=${budgetExhausted ? "yes" : "no"} priorityOffset=${priorityOffset}->${priorityOffsetEnd}/${priorityTotal} priorityStoppedEarly=${priorityStoppedEarly ? "yes" : "no"} prioritySkipped=${skippedPriorityCount} elapsed=${elapsed}`
+    `[update sync] === DONE === checked=${checked} appended=${appended} no_change=${no_change} not_found=${not_found} no_baseline=${no_baseline} skipped_date=${skipped_date} skipped_not_selected_deal_sheet=${skipped_not_selected} errors=${errors} priorityTotal=${priorityTotal} priorityChecked=${priorityChecked} batchTotal=${batchTotal} batchStaleSkipped=${batchStaleSkipped} batchCheckedThisRun=${batchCheckedThisRun} batchOffset=${batchOffset} batchOffsetEnd=${batchOffsetEnd} targetTotal=${targetTotal} hasMore=${hasMore ? "yes" : "no"} budgetExhausted=${budgetExhausted ? "yes" : "no"} priorityOffset=${priorityOffset}->${priorityOffsetEnd}/${priorityTotal} priorityStoppedEarly=${priorityStoppedEarly ? "yes" : "no"} prioritySkipped=${skippedPriorityCount} elapsed=${elapsed}`
   );
 
   return {
@@ -3702,6 +3798,7 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
     not_found,
     no_baseline,
     skipped_date,
+    skipped_not_selected_deal_sheet: skipped_not_selected,
     errors,
     // True when the loop stopped on its wall-clock budget rather than finishing the slice. The
     // trigger logs it so a short run is visibly a deliberate stop, not a silent truncation.
@@ -3759,6 +3856,7 @@ module.exports = {
   normalizeBulkPlacementIds,
   buildRefreshAdditionalCostLogsSummary,
   buildActiveUpdateRefreshParams,
+  buildStoredDealSheetIdsByPlacement,
   splitActiveDealSheetUpdateTargetsByPlacementStatus,
   filterStaleTerminalBatchTargets,
   buildRateChangeLogRow,
