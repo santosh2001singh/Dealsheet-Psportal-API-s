@@ -22,7 +22,12 @@ Object.freeze(DEAL_RECRUITER_HIERARCHY_TARGETS);
 
 /** Known manager_title synonyms (lowercase) per hierarchy column, as supplied by the business. */
 const HIERARCHY_DESIGNATION_SYNONYMS = {
-  ATL: ["atl", "associate team lead"],
+  ATL: [
+    "atl",
+    "associate team lead",
+    // Real Workspace title; "federal" is not in DESIGNATION_TITLE_TRAILING_QUALIFIER.
+    "associate team lead - federal",
+  ],
   SECONDARY_RECRUITER: ["secondary recruiter", "secondary rm", "secondary recruitment manager"],
   TEAM_LEAD: [
     "tl",

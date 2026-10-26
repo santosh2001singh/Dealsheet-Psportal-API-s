@@ -2454,6 +2454,8 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
   // PREVIOUS_RECRUITER_* is no longer written to the deal sheet (the frontend derives it); the
   // ownership log reads the recruiter handover from the deal sheet's version history instead.
 
+  rowsToInsert = await applyPreviousRecruiterIntoNewRecruiterHierarchyForRows(rowsToInsert);
+
   rowsToInsert = await applyDealRecruiterHierarchyForInsertRows(
     rowsToInsert,
     resolveBqDatasetTable(options)
@@ -6919,6 +6921,128 @@ async function applyDealRecruiterHierarchyForInsertRows(rows, options = {}, deps
 }
 
 /**
+ * Where the OUTGOING recruiter sits in the NEW recruiter's manager chain, or null.
+ *
+ * Matched on emp-no; on the name (cluster suffix stripped) only when either side has no emp-no. The
+ * designation comes from that level's manager_title, else from `titleColumnByEmpNo` (the person's
+ * one unambiguous directory title — some snapshots carry a NULL title). Only managed designations
+ * qualify: SECONDARY_RECRUITER / SECONDARY_AM are manual fields.
+ *
+ * @param {object} row - update-append row carrying __PREV_RECRUITER_NAME / __PREV_RECRUITER_EMP_NO
+ * @param {object[]} levelRows - the new recruiter's chain (fetchHierarchyLevelChainsByKey rows)
+ * @param {Map<string,string>|null} [titleColumnByEmpNo]
+ * @returns {{column: string, empNoColumn: string, name: string|null, empNo: string|null}|null}
+ */
+function findPreviousRecruiterSeatInChain(row, levelRows, titleColumnByEmpNo = null) {
+  if (!row || !Array.isArray(levelRows) || levelRows.length === 0) return null;
+  const prevEmp = normalizeHierarchyEmpNo(row.__PREV_RECRUITER_EMP_NO);
+  const prevName = normalizeHierarchyPersonName(row.__PREV_RECRUITER_NAME);
+  if (prevEmp === "" && prevName === "") return null;
+
+  for (const levelRow of levelRows) {
+    const chainEmp = normalizeHierarchyEmpNo(levelRow?.manager_employee_id);
+    const chainName = normalizeHierarchyPersonName(levelRow?.manager_name);
+    const isPrevious =
+      prevEmp !== "" && chainEmp !== "" ? chainEmp === prevEmp : prevName !== "" && chainName === prevName;
+    if (!isPrevious) continue;
+
+    const column =
+      resolveHierarchyColumnForTitle(levelRow?.manager_title)
+      ?? (chainEmp !== "" ? titleColumnByEmpNo?.get?.(chainEmp) ?? null : null);
+    if (column == null || !MANAGED_HIERARCHY_DESIGNATIONS.includes(column)) return null;
+    const target = DEAL_RECRUITER_HIERARCHY_TARGETS.find((t) => t.column === column);
+    if (!target) return null;
+    return {
+      column: target.column,
+      empNoColumn: target.empNoColumn,
+      name: normalizeExtensionRunrateBackfillValue(levelRow?.manager_name),
+      empNo:
+        normalizeExtensionRunrateBackfillValue(levelRow?.manager_employee_id)
+        ?? normalizeExtensionRunrateBackfillValue(row.__PREV_RECRUITER_EMP_NO),
+    };
+  }
+  return null;
+}
+
+/**
+ * Recruiter changed and the OUTGOING recruiter is now in the NEW recruiter's chain: they become that
+ * placement's organic (regular field) holder of that designation.
+ *
+ * Live case (placement 1472372, Oct 2026): Alex Smith (Recruitment Manager) handed the placement to
+ * Kartik Gupta, who reports to Alex. The appended row carried the frozen hierarchy with RM empty; the
+ * business wants RM = Alex Smith / CY3248, since he is in the new recruiter's hierarchy anyway.
+ *
+ * Runs on update-appends only (rows applyPreviousRecruiterOnRecruiterChange stamped with
+ * __PREV_RECRUITER_*). Reads the new recruiter's chain on the same snapshot rule as the insert-time
+ * hierarchy: on/before NEW_HIRE_DATE (current chain for Canada / Locums). Fills that one seat (overwriting whatever was frozen
+ * there) and nothing else: the rest of the hierarchy stays frozen, and the inorganic / ownership
+ * flows are unchanged (the inorganic filter drops a slot that already matches the regular field).
+ */
+async function applyPreviousRecruiterIntoNewRecruiterHierarchyForRows(rows, deps = {}) {
+  if (!rows || rows.length === 0) return rows;
+
+  const isCandidate = (row) =>
+    row?.__CARRIED_FORWARD_UPDATE === true
+    && row.ASSIGNMENT_RECRUITER_EMAIL != null
+    && String(row.ASSIGNMENT_RECRUITER_EMAIL).trim() !== ""
+    && (normalizeHierarchyEmpNo(row.__PREV_RECRUITER_EMP_NO) !== ""
+      || normalizeHierarchyPersonName(row.__PREV_RECRUITER_NAME) !== "")
+    && normalizeHierarchyEmpNo(row.__PREV_RECRUITER_EMP_NO) !== normalizeHierarchyEmpNo(row.RECRUITER_EMP_NO);
+  const candidates = rows.filter(isCandidate);
+  if (candidates.length === 0) return rows;
+
+  const directoryFetchFn = deps.directoryFetchFn ?? fetchEmployeeDirectoryByEmails;
+  const chainFetchFn = deps.chainFetchFn ?? fetchHierarchyLevelChainsByKey;
+  const titleColumnFetchFn = deps.titleColumnFetchFn ?? fetchAuthoritativeHierarchyColumnByEmpNo;
+
+  const emailOf = (row) => String(row.ASSIGNMENT_RECRUITER_EMAIL).trim().toLowerCase();
+  const directoryByEmail = await directoryFetchFn([...new Set(candidates.map(emailOf))]);
+  // Same snapshot rule as the insert-time hierarchy (fetchDealRecruiterHierarchyByPlacementId):
+  // the new recruiter's chain as it stood on/before NEW_HIRE_DATE; Canada / Locums take the
+  // current chain (no anchor + on_or_after = each level's most recent snapshot).
+  const targetKeyByRow = new Map();
+  const targets = [];
+  candidates.forEach((row, i) => {
+    const externalId = directoryByEmail.get(emailOf(row))?.externalId;
+    if (!externalId) return;
+    const key = String(i);
+    targetKeyByRow.set(row, key);
+    const live = usesLiveRecruiterHierarchy(row);
+    targets.push({ key, externalId, anchorDate: live ? null : row.NEW_HIRE_DATE ?? null, live });
+  });
+  if (targets.length === 0) return rows;
+  const chainByKey = new Map([
+    ...(await chainFetchFn(targets.filter((t) => !t.live), { direction: "on_or_before" })),
+    ...(await chainFetchFn(targets.filter((t) => t.live), { direction: "on_or_after" })),
+  ]);
+
+  // Directory title per previous-recruiter emp-no, for chain levels whose snapshot title is NULL.
+  // fetchAuthoritativeHierarchyColumnByEmpNo reads emp-nos off hierarchy columns, hence the shape.
+  const prevEmpRows = candidates
+    .map((row) => normalizeHierarchyEmpNo(row.__PREV_RECRUITER_EMP_NO))
+    .filter((emp) => emp !== "")
+    .map((emp) => ({ [DEAL_RECRUITER_HIERARCHY_TARGETS[0].empNoColumn]: emp }));
+  const titleColumnByEmpNo = await titleColumnFetchFn(prevEmpRows, {}, deps);
+
+  let filledCount = 0;
+  const out = rows.map((row) => {
+    const key = targetKeyByRow.get(row);
+    if (key == null) return row;
+    const seat = findPreviousRecruiterSeatInChain(row, chainByKey.get(key), titleColumnByEmpNo);
+    if (!seat || (seat.name == null && seat.empNo == null)) return row;
+    filledCount++;
+    return { ...row, [seat.column]: seat.name ?? HIERARCHY_ROLE_VACANT, [seat.empNoColumn]: seat.empNo };
+  });
+
+  if (filledCount > 0) {
+    logDetail(
+      `[enriched sync] [BigQuery insertAll] previous recruiter placed into new recruiter's hierarchy (regular field): ${filledCount}`
+    );
+  }
+  return out;
+}
+
+/**
  * Resolve LEVEL_2_CSM/LEVEL_3_CSM/LEVEL_4_CSM (ONSITE_AM's manager chain, hire-date-anchored) for
  * a batch of rows. Unlike the DEAL recruiter hierarchy, this always uses ONSITE_AM_EMAIL (never
  * recruiter email) and picks the LATEST snapshot on/before NEW_HIRE_DATE (falls back to the
@@ -9776,6 +9900,7 @@ async function finalizeDealSheetRowForResponse(row, baseline, options = {}) {
   }
   let arr = [current];
   arr = await applyExtensionInheritForInsertRows(arr, options);
+  arr = await applyPreviousRecruiterIntoNewRecruiterHierarchyForRows(arr);
   arr = await applyDealRecruiterHierarchyForInsertRows(arr, options);
   arr = applyExtensionStartDatesForInsertRows(arr);
   arr = applyOriginalStartDateForDealRows(arr);
@@ -9920,6 +10045,8 @@ module.exports = {
   rowNeedsDealRecruiterHierarchyBackfill,
   fetchDealRecruiterHierarchyByPlacementId,
   applyDealRecruiterHierarchyForInsertRows,
+  findPreviousRecruiterSeatInChain,
+  applyPreviousRecruiterIntoNewRecruiterHierarchyForRows,
   fetchHierarchyLevelChainsByKey,
   fetchDealSheetRecruiterChangePairsFromActive,
   buildInorganicHierarchyLogCandidate,
