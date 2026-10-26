@@ -183,6 +183,11 @@ const {
 } = require("./ownershipChangeLogRules");
 const { fetchDepartmentEmployeesByNames, resolveActiveOrManager } = require("./departmentDataStatus");
 const { backfillExtensionRehire } = require("./extensionRehire");
+const {
+  HIERARCHY_FROZEN_STATUS_PREFIXES,
+  isHierarchyFrozenStatus,
+  hierarchyOpenStatusSqlPredicate,
+} = require("./hierarchyFrozenStatus");
 const { backfillClusterRegions } = require("./clusterRegionResolver");
 // Required lazily inside the wrapper: extensionParentBackfill reads
 // EXTENSION_PARENT_DEAL_INHERIT_COLUMNS back off this module, so a top-level require here would be a
@@ -2433,7 +2438,9 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
         // must NOT be re-derived from the directory. Re-deriving would re-fill a field a
         // recruiter-hierarchy MOVE deliberately vacated (see applyRecruiterHierarchyMovesToDealSheet)
         // and put the same person in two fields. Freeze = set once at first insert.
-        filtered.push({ ...contractIdCarried.row, __CARRIED_FORWARD_UPDATE: true });
+        filtered.push(
+          applyFrozenStatusCsmCarryForward({ ...contractIdCarried.row, __CARRIED_FORWARD_UPDATE: true }, existing)
+        );
         continue;
       }
       unchangedSkipped++;
@@ -6983,6 +6990,8 @@ async function applyPreviousRecruiterIntoNewRecruiterHierarchyForRows(rows, deps
 
   const isCandidate = (row) =>
     row?.__CARRIED_FORWARD_UPDATE === true
+    // ENDED / DNS / DNA: hierarchy is final, the new recruiter's chain is not applied.
+    && !isHierarchyFrozenStatus(row.PLACEMENT_STATUS)
     && row.ASSIGNMENT_RECRUITER_EMAIL != null
     && String(row.ASSIGNMENT_RECRUITER_EMAIL).trim() !== ""
     && (normalizeHierarchyEmpNo(row.__PREV_RECRUITER_EMP_NO) !== ""
@@ -7105,10 +7114,30 @@ async function fetchOnsiteAmCsmHierarchyByKey(rows, options = {}, deps = {}) {
   return out;
 }
 
+const CSM_LEVEL_COLUMNS = Object.freeze(["LEVEL_2_CSM", "LEVEL_3_CSM", "LEVEL_4_CSM"]);
+
+/** An update-append (has a baseline) of a placement whose status is ENDED / DNS / DNA. */
+function isFrozenStatusUpdateRow(row) {
+  return row?.__CARRIED_FORWARD_UPDATE === true && isHierarchyFrozenStatus(row.PLACEMENT_STATUS);
+}
+
+/**
+ * Update-append of an ENDED / ENDED<30 / DID NOT START / DID NOT ACCEPT placement: its hierarchy is
+ * final, so LEVEL_2/3/4_CSM keep the stored values instead of being recomputed from ONSITE_AM_EMAIL.
+ * (They are not MANUAL_COLUMNS, so nothing else carries them.) Any other row is returned unchanged.
+ */
+function applyFrozenStatusCsmCarryForward(row, baseline) {
+  if (!baseline || !isFrozenStatusUpdateRow(row)) return row;
+  const out = { ...row };
+  for (const col of CSM_LEVEL_COLUMNS) out[col] = baseline[col] ?? null;
+  return out;
+}
+
 /**
  * Recomputes LEVEL_2_CSM/LEVEL_3_CSM/LEVEL_4_CSM on every row from the CURRENT ONSITE_AM_EMAIL
- * (unlike the recruiter hierarchy backfill, this is never frozen — it always tracks whoever the
- * current onsite AM is, same as ONSITE_AM_EMAIL itself). Rows with no ONSITE_AM_EMAIL get all
+ * (unlike the recruiter hierarchy backfill, this is not frozen at hire — it tracks whoever the
+ * current onsite AM is, same as ONSITE_AM_EMAIL itself — except on an ENDED / DNS / DNA
+ * update-append, which keeps the stored levels). Rows with no ONSITE_AM_EMAIL get all
  * three columns cleared to null.
  */
 async function applyOnsiteAmCsmHierarchyForRows(rows, options = {}, deps = {}) {
@@ -7119,6 +7148,9 @@ async function applyOnsiteAmCsmHierarchyForRows(rows, options = {}, deps = {}) {
 
   let updatedCount = 0;
   const out = rows.map((row, index) => {
+    // ENDED / DNS / DNA update-append: LEVEL_*_CSM were taken from the stored row
+    // (applyFrozenStatusCsmCarryForward) and stay as they are.
+    if (isFrozenStatusUpdateRow(row)) return row;
     const levels = levelsByIndex.get(String(index)) ?? { LEVEL_2_CSM: null, LEVEL_3_CSM: null, LEVEL_4_CSM: null };
     const changed =
       normalizeForCompare(row.LEVEL_2_CSM) !== normalizeForCompare(levels.LEVEL_2_CSM) ||
@@ -7453,7 +7485,7 @@ async function fetchCsmHierarchyDivergenceCandidates(options = {}, deps = {}) {
 }
 
 /**
- * Person-centric (emp-no) reconciliation of every active, non-ENDED placement's FROZEN regular
+ * Person-centric (emp-no) reconciliation of every active, non-ended placement's FROZEN regular
  * recruiter-hierarchy fields against the CURRENT recruiter's live manager chain. This is the single
  * scan that drives three outputs (see computeRecruiterHierarchyRoleChanges for the exact rules):
  *   - moves: a person already in a regular field was promoted/re-designated into a DIFFERENT managed
@@ -7462,7 +7494,8 @@ async function fetchCsmHierarchyDivergenceCandidates(options = {}, deps = {}) {
  *   - newPersons: an emp-no in the live chain that was NOT in the frozen set -> inorganic log only.
  *   - a frozen person who simply vanished from the chain is LEFT frozen (never vacated).
  *
- * Stops at PLACEMENT_STATUS ENDED (LIKE 'ENDED%'): once a placement ends, its hierarchy is final.
+ * Stops at a hierarchy-frozen status (ENDED / ENDED<30 / DID NOT START / DID NOT ACCEPT, see
+ * hierarchyFrozenStatus.js): once a placement reaches one, its hierarchy is final.
  * The comparison is stored-frozen-values vs the recruiter's LATEST snapshot, so the anchor date the
  * hierarchy was originally frozen at (NEW_HIRE_DATE for DEAL, START_DATE for EXTENSION) is already
  * baked into the stored values — every change detected here is inherently "after" that freeze.
@@ -7494,7 +7527,7 @@ async function fetchRecruiterHierarchyReconciliation(options = {}, deps = {}) {
                )
                WHERE rn = 1
                  AND TRIM(IFNULL(ASSIGNMENT_RECRUITER_EMAIL, '')) != ''
-                 AND NOT (UPPER(TRIM(IFNULL(PLACEMENT_STATUS, ''))) LIKE 'ENDED%')
+                 AND ${hierarchyOpenStatusSqlPredicate()}
                  AND (${nonBlankPredicate})`;
 
   const rows = await (deps.queryFn ?? queryObjects)(sql, 100000);
@@ -7765,7 +7798,8 @@ async function applyRecruiterHierarchyMovesToDealSheet(reconResults, options = {
  *
  * These domains have no inorganic hierarchy (see usesLiveRecruiterHierarchy): a person is
  * effective as soon as they are in the recruiter's chain. For every placement of `options.domain`
- * whose latest row is not ENDED (LIKE 'ENDED%', same stop as the health reconciliation), this
+ * whose latest row is not hierarchy-frozen (ENDED / ENDED<30 / DID NOT START / DID NOT ACCEPT, same
+ * stop as the health reconciliation), this
  * resolves the chain exactly as a fresh insert would — current directory snapshot, same
  * self-reference / duplicate-person vacate rules — and, when any managed field differs from the
  * stored one, appends a new version of the row with the chain replaced (via
@@ -7803,8 +7837,8 @@ async function applyLiveRecruiterHierarchyToDealSheet(options = {}, deps = {}) {
     ...fields,
   ];
   const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
-  // Latest row per placement FIRST, then the ENDED filter — filtering first would pick an older,
-  // not-yet-ended version of a placement that has since ended.
+  // Latest row per placement FIRST, then the frozen-status filter — filtering first would pick an
+  // older, not-yet-ended version of a placement that has since ended.
   const sql = `SELECT * EXCEPT(rn) FROM (
                  SELECT ${columns.join(", ")},
                    ROW_NUMBER() OVER (
@@ -7815,7 +7849,7 @@ async function applyLiveRecruiterHierarchyToDealSheet(options = {}, deps = {}) {
                  WHERE DEAL_SHEET_ID IS NOT NULL AND PLACEMENT_ID IS NOT NULL
                )
                WHERE rn = 1
-                 AND UPPER(TRIM(IFNULL(PLACEMENT_STATUS, ''))) NOT LIKE 'ENDED%'
+                 AND ${hierarchyOpenStatusSqlPredicate()}
                  AND UPPER(TRIM(IFNULL(DEAL_TYPE, ''))) IN ('DEAL', 'EXTENSION')
                  AND TRIM(IFNULL(ASSIGNMENT_RECRUITER_EMAIL, '')) != ''`;
   const stored = await queryFn(sql, 100000);
@@ -7940,6 +7974,8 @@ async function fetchDealSheetRecruiterChangePairsFromActive(options = {}) {
                  WHERE TRIM(IFNULL(l.ASSIGNMENT_RECRUITER_EMAIL, '')) != ''
                    AND LOWER(TRIM(IFNULL(l.ASSIGNMENT_RECRUITER_EMAIL, ''))) !=
                        LOWER(TRIM(IFNULL(p.ASSIGNMENT_RECRUITER_EMAIL, '')))
+                   -- hierarchy is final once the latest row is ENDED / DNS / DNA (hierarchyFrozenStatus.js)
+                   AND ${hierarchyOpenStatusSqlPredicate("l.PLACEMENT_STATUS")}
                )
                SELECT * FROM ranked
                WHERE rn <= 2
@@ -8576,6 +8612,8 @@ async function fetchActiveExtensionRowsForInorganic(options = {}, deps = {}) {
               AND UPPER(TRIM(IFNULL(DEAL_TYPE, ''))) = 'EXTENSION'`;
   });
 
+  // Latest row per placement first, then the frozen-status filter (ENDED / DNS / DNA: no new
+  // inorganic rows), so an older not-yet-ended version is never picked instead.
   const sql = `WITH all_rows AS (
                  ${unionParts.join("\n                 UNION ALL\n                 ")}
                )
@@ -8586,7 +8624,8 @@ async function fetchActiveExtensionRowsForInorganic(options = {}, deps = {}) {
                  ) AS rn
                  FROM all_rows
                )
-               WHERE rn = 1`;
+               WHERE rn = 1
+                 AND ${hierarchyOpenStatusSqlPredicate()}`;
   return await queryFn(sql, 100000);
 }
 
@@ -9896,7 +9935,7 @@ async function finalizeDealSheetRowForResponse(row, baseline, options = {}) {
     current = applyExtensionDateFreeze(current, baseline).row;
     current = applyOfferTimeStartDateFreeze(current, baseline).row;
     // Match the update-append path: hierarchy is frozen/carried-forward, not re-derived.
-    current = { ...current, __CARRIED_FORWARD_UPDATE: true };
+    current = applyFrozenStatusCsmCarryForward({ ...current, __CARRIED_FORWARD_UPDATE: true }, baseline);
   }
   let arr = [current];
   arr = await applyExtensionInheritForInsertRows(arr, options);
@@ -9921,6 +9960,9 @@ async function finalizeDealSheetRowForResponse(row, baseline, options = {}) {
 
 module.exports = {
   escapeSqlString,
+  HIERARCHY_FROZEN_STATUS_PREFIXES,
+  isHierarchyFrozenStatus,
+  hierarchyOpenStatusSqlPredicate,
   queryObjects,
   runDml,
   fetchExistingDealSheetIdsSet,
@@ -10064,6 +10106,7 @@ module.exports = {
   insertInorganicHierarchyLogBatch,
   fetchOnsiteAmCsmHierarchyByKey,
   applyOnsiteAmCsmHierarchyForRows,
+  applyFrozenStatusCsmCarryForward,
   pickDeliveryPocForRow,
   pickInorganicRestrictedDeliveryPocForRow,
   applyDeliveryPocForInsertRows,

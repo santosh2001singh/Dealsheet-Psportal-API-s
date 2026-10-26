@@ -66,6 +66,9 @@ Every change has an **anchor** placement (rule 4). From the anchor:
 >
 > **Example (Kayann again).** Onsite AM changed on 09-15 while 1466112 was running (09-13 → 10-17). Provisionally **10-18**. 1466705 is already booked, so the final date is its start, **11-19**.
 
+### Rule 5: nothing after ENDED / ENDED<30 / DID NOT START / DID NOT ACCEPT (2026-10-26)
+Once a placement's deal-sheet row carries one of these statuses, its ownership is final. Versions written in that status (except the placement's first version, which is the deal arriving) are skipped: no change is logged from them, and they are not the previous owner for what follows. If the placement goes back to STARTED / BOOKED, its next version is compared against its last version from before the freeze. The same rule stops the inorganic log, the hierarchy moves, the LEVEL_2/3/4_CSM recompute and the Canada / Locums live chain (`functions/src/hierarchyFrozenStatus.js`). This rule applies going forward only. Rows already in the table are not removed.
+
 ### Promotions (hierarchy moves, health)
 When the employee directory shows a person in a different designation than the seat the deal sheet froze, the deal sheet is corrected and two rows are logged: the old seat vacated (`NEW = NA`) and the new seat filled. Two guards:
 - **Not a promotion if the person already held the new designation when the placement was frozen** (DEAL: `NEW_HIRE_DATE`, else `START_DATE`; before the directory history starts, its earliest snapshot). The deal sheet is still corrected, but nothing is logged. This removed ~600 fake rows such as Maneet Gupta VP → AVP.

@@ -31,7 +31,12 @@
  *         START_DATE) -> the placement before it, so the next extension IS this placement and the
  *         date is its START_DATE
  *       - a placement that never started -> itself (rule 3's END_DATE + 1)
+ *
+ *  5. (2026-10-26) Nothing is read from a version written while the placement was ENDED / ENDED<30 /
+ *     DID NOT START / DID NOT ACCEPT, other than its first version (see isFrozenVersion).
  */
+
+const { isHierarchyFrozenStatus } = require("./hierarchyFrozenStatus");
 
 /** Where a row's OWNERSHIP_EFFECTIVE_DATE came from (column EFFECTIVE_DATE_SOURCE). */
 const OWNERSHIP_LOG_SOURCE = Object.freeze({
@@ -405,6 +410,17 @@ function hierarchySeatRoleSpec({ column, empNoColumn }) {
 // ---------------------------------------------------------------------------------------------
 
 /**
+ * A version written while the placement was already ENDED / ENDED<30 / DID NOT START / DID NOT ACCEPT
+ * (hierarchyFrozenStatus.js): its ownership is final, so the version is invisible to the timeline —
+ * no change is logged from it and it is not the "previous owner" for what follows. The placement's
+ * FIRST version never is (that is the deal arriving), and a placement back to STARTED / BOOKED is
+ * compared against its last version from before the freeze.
+ */
+function isFrozenVersion(row, versionIndex) {
+  return versionIndex > 0 && isHierarchyFrozenStatus(row?.PLACEMENT_STATUS);
+}
+
+/**
  * The version of `placement` that was current at `timeMs` and carries a usable value for `spec`.
  * Falls back to the placement's earliest usable version when none is that old (a contract rebuilt in
  * one go stamps every placement at the same moment, so "older" is not always available).
@@ -412,7 +428,8 @@ function hierarchySeatRoleSpec({ column, empNoColumn }) {
 function versionAsOf(placement, timeMs, spec) {
   let found = null;
   let earliest = null;
-  for (const row of placement.versions) {
+  for (const [vi, row] of placement.versions.entries()) {
+    if (isFrozenVersion(row, vi)) continue;
     const obs = spec.read(row);
     if (spec.isEmpty(obs)) continue;
     if (earliest == null) earliest = { row, obs };
@@ -440,6 +457,7 @@ function roleEventsForContract(placements, spec) {
       if (ref) carry = ref;
     }
     versions.forEach((row, vi) => {
+      if (isFrozenVersion(row, vi)) return;
       const obs = spec.read(row);
       if (carry == null) {
         carry = { row, obs };
@@ -693,6 +711,7 @@ module.exports = {
   dateOnly,
   addDays,
   isNeverStartedStatus,
+  isFrozenVersion,
   normalizeOwnerName,
   normalizeOwnerEmpNo,
   SAME_ARRIVAL_TOLERANCE_DAYS,

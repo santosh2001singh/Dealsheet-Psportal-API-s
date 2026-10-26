@@ -155,18 +155,65 @@ test("changed on a booked extension before it starts: effective from its START_D
 });
 
 test("DID NOT START: END_DATE + 1, never moved to a later extension", () => {
+  // The DID NOT START placement ARRIVED with the new owner (its first version), so it is the anchor.
   const versions = [
     P1("2026-08-19T09:00:00Z"),
-    P2("2026-08-19T09:10:00Z", { PLACEMENT_STATUS: "DID NOT START", END_DATE: "2026-09-13", TENTATIVE_END_DATE: null }),
     P2("2026-09-15T15:59:07Z", { PLACEMENT_STATUS: "DID NOT START", END_DATE: "2026-09-13", TENTATIVE_END_DATE: null, ...JESSICA }),
     P3("2026-08-19T20:03:05Z"),
     P3("2026-09-15T17:13:22Z", JESSICA),
   ];
-  const [r] = build(versions);
-  assert.equal(r.PLACEMENT_ID, "1466112");
+  const r = build(versions).find((row) => row.PLACEMENT_ID === "1466112");
+  assert.ok(r, "the change is logged on the DID NOT START placement");
   assert.equal(r.OWNERSHIP_EFFECTIVE_DATE, "2026-09-14");
   assert.equal(r.EFFECTIVE_DATE_SOURCE, OWNERSHIP_LOG_SOURCE.END_PLUS_1);
   assert.equal(r.EFFECTIVE_DATE_PLACEMENT_ID, "1466112");
+});
+
+// Rule 5 (2026-10-26): a version written while the placement is ENDED / ENDED<30 / DID NOT START /
+// DID NOT ACCEPT logs nothing; only the placement's first version (the deal arriving) counts.
+for (const status of ["ENDED", "ENDED<30", "DID NOT START", "DID NOT ACCEPT"]) {
+  test(`${status}: a change on a later version of that placement is not logged`, () => {
+    const o = { PLACEMENT_STATUS: status, END_DATE: "2026-09-13", TENTATIVE_END_DATE: null };
+    const rows = build([P2("2026-08-19T09:10:00Z", o), P2("2026-09-15T15:59:07Z", { ...o, ...JESSICA })]);
+    assert.equal(rows.length, 0);
+  });
+}
+
+test("frozen version skipped: the same change is logged on the open placement it reached", () => {
+  const dns = { PLACEMENT_STATUS: "DID NOT START", END_DATE: "2026-09-13", TENTATIVE_END_DATE: null };
+  const versions = [
+    P1("2026-08-19T09:00:00Z"),
+    P2("2026-08-19T09:10:00Z", dns),
+    P2("2026-09-15T15:59:07Z", { ...dns, ...JESSICA }),
+    P3("2026-08-19T20:03:05Z"),
+    P3("2026-09-15T17:13:22Z", JESSICA),
+  ];
+  const rows = build(versions);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].PLACEMENT_ID, "1466705");
+  assert.equal(rows[0].PREVIOUS_OWNER_NAME, "Elisa An");
+  assert.equal(rows[0].NEW_OWNER_NAME, "Jessica Van Essen");
+});
+
+test("a change on the version where the placement TURNS ended is not logged", () => {
+  const rows = build([
+    P2("2026-08-19T09:51:50Z"),
+    P2("2026-09-15T15:59:07Z", { PLACEMENT_STATUS: "ENDED", ...JESSICA }),
+  ]);
+  assert.equal(rows.length, 0);
+});
+
+test("back to STARTED: compared against the last version before the freeze", () => {
+  const rows = build([
+    P2("2026-08-19T09:51:50Z"),
+    P2("2026-09-01T10:00:00Z", { PLACEMENT_STATUS: "ENDED" }),
+    P2("2026-09-10T10:00:00Z", { PLACEMENT_STATUS: "ENDED", ...JESSICA }),
+    P2("2026-09-15T15:59:07Z", JESSICA),
+  ]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].PREVIOUS_OWNER_NAME, "Elisa An");
+  assert.equal(rows[0].NEW_OWNER_NAME, "Jessica Van Essen");
+  assert.equal(rows[0].LAST_UPDATED, NOW);
 });
 
 test("a never-started extension is skipped when looking for the next extension", () => {
