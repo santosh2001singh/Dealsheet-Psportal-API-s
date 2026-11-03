@@ -7,7 +7,6 @@
  * Active person is found and place them in the column their DESIGNATION maps to; if the whole chain
  * is inactive/unknown the slot becomes NA (null).
  */
-
 const config = require("./config");
 const { resolveHierarchyColumnForTitle } = require("./recruiterHierarchyDesignations");
 

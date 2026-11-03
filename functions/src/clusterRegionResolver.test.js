@@ -43,16 +43,21 @@ test("regional codes carry specialty in their last letter", () => {
 });
 
 // Legacy families predate the regional programme, so a blank specialty is the correct answer — not a
-// gap to be filled from the recruiter's current alignment. APC-2 ends in a digit, ENT-3 too, but
-// LOC-*/EXC-*/SPC-* could end in a letter, so the family prefix decides, not the final character.
+// gap to be filled from the recruiter's current alignment. LOC-*/EXC-*/SPC-* could end in a letter,
+// so the family prefix decides, not the final character.
 test("legacy cluster codes carry no specialty", () => {
-  for (const code of ["LOC-4", "LOC-12", "ENT-3", "APC-2", "EXC-1", "SPC-2", "Gov Region 1", "Gov School"]) {
+  for (const code of ["LOC-4", "LOC-12", "ENT-3", "EXC-1", "SPC-2", "Gov Region 1", "Gov School"]) {
     assert.equal(recruiterSpecialtyFromCode(code), null, `${code} has no specialty`);
   }
 });
 
-test("a blank or missing code has no specialty", () => {
-  for (const code of [null, undefined, "", "   "]) {
+// The report: an APC cluster IS the Allied specialty, though its last character is a digit.
+test("an APC cluster is Allied", () => {
+  assert.equal(recruiterSpecialtyFromCode("APC-2"), "Allied");
+});
+
+test("a blank, missing or NA code has no specialty", () => {
+  for (const code of [null, undefined, "", "   ", "NA"]) {
     assert.equal(recruiterSpecialtyFromCode(code), null);
   }
 });
@@ -71,8 +76,8 @@ test("a non-government client is not mistaken for one", () => {
   assert.equal(isGovernmentClient("Target", "LOC-1"), false);
   assert.equal(isGovernmentClient("Territory", "R1N"), false);
   assert.equal(isGovernmentClient(null, null), false);
-  // "Governor's ..." style names must not trip the prefix test.
-  assert.equal(isGovernmentClient("Target", "GOVERNORS-1"), false);
+  // getClusterType checks LOC / ENT / APC before GOV.
+  assert.equal(isGovernmentClient(null, "LOC-GOV"), false);
 });
 
 test("programme follows the cutover date for non-government clients", () => {
@@ -97,54 +102,88 @@ test("an unresolvable date falls back to cluster rules rather than claiming Regi
 
 // --- SQL shape -------------------------------------------------------------------------------------
 
-test("the resolved SQL implements the Step 1 date rule for both deal types", () => {
+// resolveAlignmentAsOfDate: deals split on the start date at the cutover, extensions past it read
+// the submission, and a Government client always reads the submission.
+test("the recruiter as-of date follows the report's cutover splits", () => {
   const sql = buildClusterRegionResolvedSql("cynet_health_deal_sheet", SQL_OPTS);
-  // EXTENSION -> EXTENSION_DATE then START_DATE; anything else -> SUBMISSION_DATE then START_DATE.
-  assert.match(sql, /COALESCE\(DATE\(EXTENSION_DATE\), START_DATE\)/);
-  assert.match(sql, /COALESCE\(DATE\(SUBMISSION_DATE\), START_DATE\)/);
+  assert.match(sql, /AND b\.sub IS NOT NULL THEN b\.sub/, "government client -> submission");
+  assert.match(sql, /WHEN b\.is_ext AND b\.post_june_ext THEN COALESCE\(b\.sub, b\.ost, b\.st\)/);
+  assert.match(sql, /WHEN b\.st >= DATE '2026-06-01' THEN b\.st/, "deal starting after the cutover -> start");
 });
 
-test("the recruiter side reads NEW_CLUSTER on/before and OLD_CLUSTER as the fallback", () => {
+// Only an extension of a contract started before the cutover leaves the Regional programme, and a
+// contract started after it reads every extension's recruiter region on its original start.
+test("an extension of a contract started after the cutover stays Regional on its start-date region", () => {
   const sql = buildClusterRegionResolvedSql("cynet_health_deal_sheet", SQL_OPTS);
-  assert.match(sql, /r\.EFFECTIVE_DATE <= b\.as_of_date/, "latest change on or before the placement");
-  assert.match(sql, /EFFECTIVE_DATE DESC/, "latest wins for the on/before tier");
-  assert.match(sql, /EFFECTIVE_DATE ASC/, "earliest row supplies the OLD_CLUSTER fallback");
-  assert.ok(sql.includes(RECRUITER_CODE_SOURCE.OLD_CLUSTER));
-  assert.ok(sql.includes(RECRUITER_CODE_SOURCE.NOT_IN_LOG));
+  assert.match(sql, /INITIAL_START_DATE    AS ost/);
+  assert.match(
+    sql,
+    /b\.is_ext AND NOT IFNULL\(b\.ost >= DATE '2026-06-01', FALSE\) AND IFNULL\(b\.ext >= DATE '2026-06-01', FALSE\) AS post_june_ext/
+  );
+  assert.match(sql, /WHEN b\.is_ext AND b\.ost >= DATE '2026-06-01' THEN b\.ost/);
 });
 
-test("the client side matches MSP case-insensitively and treats State as a /-delimited list", () => {
+test("the client cluster is looked up as of submission, then extension date, then start", () => {
   const sql = buildClusterRegionResolvedSql("cynet_health_deal_sheet", SQL_OPTS);
-  assert.match(sql, /LOWER\(TRIM\(IFNULL\(n\.MSP_Name, ''\)\)\)\s*= b\.msp_key/);
-  assert.match(sql, /IN UNNEST\(SPLIT\(UPPER\(TRIM\(IFNULL\(n\.State, ''\)\)\), '\/'\)\)/);
-  assert.match(sql, /n\.Date <= b\.as_of_date/, "3a is effective-dated");
+  assert.match(sql, /COALESCE\(b\.sub, IF\(b\.is_ext, b\.ext, NULL\), b\.st\) AS client_lookup_date/);
 });
 
-test("the health_system_cluster fallback accepts State='ALL' and is labelled not effective-dated", () => {
+// A blank NEW_CLUSTER is a removal, pre-2025 work reads 2025-10-31, and OLD_CLUSTER is never used.
+test("the recruiter log keeps removals, uses the pre-log reference and never OLD_CLUSTER", () => {
   const sql = buildClusterRegionResolvedSql("cynet_health_deal_sheet", SQL_OPTS);
-  assert.match(sql, /UPPER\(TRIM\(IFNULL\(h\.State, ''\)\)\) = 'ALL'/);
-  // That table has no date column, so the label has to say so — a reader must not mistake it for history.
-  assert.equal(CLIENT_CODE_SOURCE.HEALTH_SYSTEM_CLUSTER, "health_system_cluster (not effective-dated)");
-  assert.ok(sql.includes(CLIENT_CODE_SOURCE.HEALTH_SYSTEM_CLUSTER));
-  assert.ok(!/h\.Date/.test(sql), "no date filter is applied to the fallback table");
+  assert.match(sql, /TRIM\(IFNULL\(NEW_CLUSTER, ''\)\) AS new_code/);
+  assert.ok(!/OLD_CLUSTER/.test(sql.replace(/client_logs_new/g, "")), "OLD_CLUSTER is not read");
+  assert.match(sql, /l\.eff <= DATE '2025-10-31'/);
+  assert.ok(sql.includes(RECRUITER_CODE_SOURCE.REMOVED));
+  assert.ok(sql.includes(RECRUITER_CODE_SOURCE.BEFORE_LOG));
+  assert.ok(sql.includes("Cluster_Data.rec_cluster`"), "rec_cluster answers for a recruiter absent from the log");
 });
 
-test("WHY_BLANK distinguishes the three client-side failure modes", () => {
+test("the client side matches state as a /-delimited list or ALL, MSP only narrowing", () => {
+  const sql = buildClusterRegionResolvedSql("cynet_health_deal_sheet", SQL_OPTS);
+  assert.match(sql, /n\.state_up = 'ALL' OR r\.state_key IN UNNEST\(n\.state_list\)/);
+  assert.match(sql, /n_in_force_msp = 0 OR msp_hit/, "MSP narrows only when it matches");
+  assert.match(sql, /NOT n\.is_region_row/, "APC region rows are not client rows");
+  assert.match(sql, /r\.apc_ok OR NOT n\.is_apc/, "APC rows only when permitted");
+});
+
+test("health_system_cluster is the Cluster_Data copy, for Jan-May 2025 submissions only", () => {
+  const sql = buildClusterRegionResolvedSql("cynet_health_deal_sheet", SQL_OPTS);
+  assert.ok(sql.includes("`p.Cluster_Data.health_system_cluster`"));
+  assert.match(sql, /b\.sub BETWEEN DATE '2025-01-01' AND DATE '2025-05-31'/);
+  assert.match(sql, /WHEN 'NCDAC' THEN 'State of NC'/);
+});
+
+test("Regional rows read client_alignment and client_logs_new and show the Regional type", () => {
+  const sql = buildClusterRegionResolvedSql("cynet_health_deal_sheet", SQL_OPTS);
+  assert.ok(sql.includes("`p.Cluster_Data.client_alignment`"));
+  assert.ok(sql.includes("`p.Cluster_Data.client_logs_new`"));
+  assert.match(sql, /c\.division_up = b\.offering_up/, "the block must match the placement's speciality");
+  assert.match(sql, /IF\(p\.is_regional, 'Regional', p\.client_cluster_model_type\)/);
+});
+
+test("retired EXC codes display as Gov Region", () => {
+  const sql = buildClusterRegionResolvedSql("cynet_health_deal_sheet", SQL_OPTS);
+  assert.match(sql, /CONCAT\('Gov Region ', REGEXP_EXTRACT/);
+});
+
+test("WHY_BLANK names the failing side", () => {
   const sql = buildClusterRegionResolvedSql("cynet_health_deal_sheet", SQL_OPTS);
   for (const reason of [
     WHY_BLANK.CLIENT_ABSENT,
-    WHY_BLANK.MSP_MISMATCH,
-    WHY_BLANK.STATE_NOT_COVERED,
-    WHY_BLANK.RECRUITER_NOT_IN_LOG,
+    WHY_BLANK.CLIENT_DATA_ENDED,
+    WHY_BLANK.CLIENT_ADDED_LATER,
+    WHY_BLANK.RECRUITER_REMOVED,
+    WHY_BLANK.REGION_NOT_ALIGNED,
   ]) {
     assert.ok(sql.includes(reason), `${reason} is reported`);
   }
 });
 
-// MSP spellings are deliberately not aliased: a mismatch is surfaced as a data gap, not guessed at.
-test("no MSP alias table is applied", () => {
-  const sql = buildClusterRegionResolvedSql("cynet_health_deal_sheet", SQL_OPTS);
-  assert.ok(!/healthtrust workforce/i.test(sql), "no hand-rolled MSP aliasing");
+test("no value in the generated SQL breaks a string literal", () => {
+  for (const reason of Object.values(WHY_BLANK)) assert.ok(!reason.includes("'"), reason);
+  for (const src of Object.values(CLIENT_CODE_SOURCE)) assert.ok(!src.includes("'"), src);
+  for (const src of Object.values(RECRUITER_CODE_SOURCE)) assert.ok(!src.includes("'"), src);
 });
 
 // --- fill-if-empty ---------------------------------------------------------------------------------
@@ -169,6 +208,18 @@ test("the fill only touches rows where a blank column actually resolved to somet
   assert.match(sql, /AND s\.client_cluster_type IS NOT NULL/);
 });
 
+test("overwrite replaces differing values but never erases one with a blank resolution", () => {
+  const { sql } = buildClusterRegionFillSql({ ...SQL_OPTS, overwrite: true });
+  for (const [col, src] of [
+    ["RECRUITER_CLUSTER_REGION", "recruiter_code"],
+    ["CLIENT_CLUSTER_REGION", "client_code"],
+    ["CLUSTER_TYPE", "client_cluster_type"],
+  ]) {
+    assert.ok(sql.includes(`${col} = IFNULL(s.${src}, d.${col})`), `${col} keeps its value on a blank`);
+    assert.ok(sql.includes(`s.${src} IS NOT NULL AND IFNULL(TRIM(d.${col}), '') != s.${src}`));
+  }
+});
+
 // The deal sheet is append-only: one placement owns several rows (4,686 rows over 4,410 ids when this
 // was found). Without a one-row-per-id guard the UPDATE dies with "UPDATE/MERGE must match at most one
 // source row for each target row" — and it only passed earlier because the table transiently had no
@@ -183,9 +234,9 @@ test("the resolved set is deduped to one row per DEAL_SHEET_ID", () => {
 test("the fill covers the cynet health active table and no others", () => {
   const { sql } = buildClusterRegionFillSql(SQL_OPTS);
   assert.ok(sql.includes("cynet_health_deal_sheet"));
-  assert.ok(!sql.includes("ended"), "the ended table lacks the three columns");
-  assert.ok(!sql.includes("canada"), "canada is out of scope");
-  assert.ok(!sql.includes("locums"), "locums is out of scope");
+  assert.ok(!sql.includes("ended_deal_sheet"), "the ended table lacks the three columns");
+  assert.ok(!sql.includes("canada_deal_sheet"), "canada is out of scope");
+  assert.ok(!sql.includes("locums_deal_sheet"), "locums is out of scope");
 });
 
 test("explicit tableIds override the default pair", () => {
