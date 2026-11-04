@@ -234,6 +234,11 @@ const config = {
     collection: process.env.CONTRACT_ID_SEQUENCE_COLLECTION || "contractIdSequences",
   },
 
+  /** Contract ids a person assigned at approve time; the sync never overrides them (contractIdOverride.js). */
+  contractIdOverride: {
+    collection: process.env.CONTRACT_ID_OVERRIDE_COLLECTION || "contractIdOverrides",
+  },
+
   /** Employee directory used to resolve recruiter/hierarchy emp numbers by email */
   directoryEmployees: {
     datasetId: process.env.DIRECTORY_EMPLOYEES_DATASET || "MISC",

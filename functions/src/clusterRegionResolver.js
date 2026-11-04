@@ -8,7 +8,10 @@
  *
  * Scope is cynet_health_deal_sheet only — see CLUSTER_REGION_TABLE_IDS.
  *
- * Step 1 — recruiter's CLUSTER (rec_cluster_historical_data, keyed on ASSIGNMENT_RECRUITER_EMAIL).
+ * Step 1 — recruiter's CLUSTER (keyed on ASSIGNMENT_RECRUITER_EMAIL) from rr_project_data.Recruiter_Region_logs
+ *   since 2026-11-04, as a change log: a blank / NA region is "NA"; an END_DATE on/after 2026-05-31 with
+ *   nothing covering the next day adds "NA" from that day; archived rows are skipped. While that table
+ *   is empty, Cluster_Data.rec_cluster_historical_data is read instead.
  *   As-of date (resolveAlignmentAsOfDate):
  *     Government client and a SUBMISSION_DATE      -> SUBMISSION_DATE
  *   For an EXTENSION, "start" is the original start: INITIAL_START_DATE (the report's START_DATE).
@@ -61,7 +64,12 @@
 
 const config = require("./config");
 
+/** The report's recruiter region history since 2026-11-04 (recruiterRegionHistoryMap.js). */
+const RECRUITER_REGION_LOGS_TABLE_ID = "Recruiter_Region_logs";
+/** Read only while Recruiter Region Logs is empty, as the report does. */
 const RECRUITER_HISTORY_TABLE = "Cluster_Data.rec_cluster_historical_data";
+const REGION_LOG_NA = "NA";
+const REGION_LOG_REMOVALS_FROM = "2026-06-01";
 const RECRUITER_SNAPSHOT_TABLE = "Cluster_Data.rec_cluster";
 const NEW_CLUSTER_MODEL_TABLE = "Cluster_Data.new_cluster_model";
 /** The report reads the Cluster_Data copy, not the rr_project_data one. */
@@ -130,7 +138,7 @@ const AS_OF_DATE_SOURCE = Object.freeze({
 });
 
 const RECRUITER_CODE_SOURCE = Object.freeze({
-  LOG: "rec_cluster_historical_data",
+  LOG: "recruiter region log",
   PRE_LOG_REFERENCE: "log as of 2025-10-31 (pre-2025 placement)",
   SNAPSHOT: "rec_cluster (not in log)",
   REMOVED: "removed in log",
@@ -390,12 +398,15 @@ function clientClusterPassSql(p, req) {
  */
 function recruiterLogPassSql(p, req) {
   return `
+    -- On one date a region beats an "NA", as in the report's ascending sort.
     ${p}_on_before AS (
       SELECT r.DEAL_SHEET_ID, l.new_code
       FROM ${req} r
       JOIN rec_log l ON l.rec_email = r.rec_email
       WHERE r.as_of_date IS NOT NULL AND l.eff <= r.as_of_date
-      QUALIFY ROW_NUMBER() OVER (PARTITION BY r.DEAL_SHEET_ID ORDER BY l.eff DESC, l.new_code) = 1
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY r.DEAL_SHEET_ID ORDER BY l.eff DESC, IF(l.new_code = '${REGION_LOG_NA}', 1, 0), l.new_code
+      ) = 1
     ),
     -- Pre-2025 placements read the alignment in force on the reference date.
     ${p}_pre_ref AS (
@@ -403,7 +414,9 @@ function recruiterLogPassSql(p, req) {
       FROM ${req} r
       JOIN rec_log l ON l.rec_email = r.rec_email
       WHERE r.as_of_date < DATE '${LOG_ERA_START_DATE}' AND l.eff <= DATE '${PRE_LOG_REFERENCE_DATE}'
-      QUALIFY ROW_NUMBER() OVER (PARTITION BY r.DEAL_SHEET_ID ORDER BY l.eff DESC, l.new_code) = 1
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY r.DEAL_SHEET_ID ORDER BY l.eff DESC, IF(l.new_code = '${REGION_LOG_NA}', 1, 0), l.new_code
+      ) = 1
     ),
     ${p}_out AS (
       SELECT
@@ -434,6 +447,7 @@ function buildClusterRegionResolvedSql(tableId, options = {}) {
   const datasetId = options.datasetId;
   const dealFqn = fqn(datasetId, tableId, projectId);
   const recFqn = clusterDataFqn(RECRUITER_HISTORY_TABLE, projectId);
+  const rrlFqn = fqn(datasetId, RECRUITER_REGION_LOGS_TABLE_ID, projectId);
   const recSnapFqn = clusterDataFqn(RECRUITER_SNAPSHOT_TABLE, projectId);
   const ncmFqn = clusterDataFqn(NEW_CLUSTER_MODEL_TABLE, projectId);
   const hscFqn = clusterDataFqn(HEALTH_SYSTEM_CLUSTER_TABLE, projectId);
@@ -547,14 +561,54 @@ function buildClusterRegionResolvedSql(tableId, options = {}) {
       )
       WHERE n = 1 AND code_up = 'GOV SCHOOL' AND total >= 3 AND n_codes >= 2
     ),
+    -- buildRecruiterRegionHistoryMap: Recruiter Region Logs, one row per client, as a change log.
+    -- A blank / "NA" region is "NA" (on no region from that date).
+    rrl_rows AS (
+      SELECT
+        LOWER(TRIM(RECRUITER_EMAIL_ID)) AS rec_email,
+        SAFE_CAST(EFFECTIVE_DATE AS DATE) AS eff,
+        SAFE_CAST(END_DATE AS DATE) AS end_d,
+        IF(UPPER(TRIM(IFNULL(NEW_REGION_CODE, ''))) IN ('', '${REGION_LOG_NA}'), '${REGION_LOG_NA}', TRIM(NEW_REGION_CODE))
+          AS new_code
+      FROM ${rrlFqn}
+      WHERE IFNULL(IS_DELETED, FALSE) = FALSE
+        AND TRIM(IFNULL(RECRUITER_EMAIL_ID, '')) != ''
+        AND SAFE_CAST(EFFECTIVE_DATE AS DATE) IS NOT NULL
+    ),
+    -- An End Date with nothing covering the next day is a removal ("NA") from that day, but only
+    -- from ${REGION_LOG_REMOVALS_FROM} on; an earlier one left the region carrying on, as before.
+    rrl_removals AS (
+      SELECT DISTINCT r.rec_email, DATE_ADD(r.end_d, INTERVAL 1 DAY) AS eff, '${REGION_LOG_NA}' AS new_code
+      FROM rrl_rows r
+      WHERE r.new_code != '${REGION_LOG_NA}'
+        AND r.end_d IS NOT NULL
+        AND DATE_ADD(r.end_d, INTERVAL 1 DAY) >= DATE '${REGION_LOG_REMOVALS_FROM}'
+        AND NOT EXISTS (
+          SELECT 1 FROM rrl_rows o
+          WHERE o.rec_email = r.rec_email
+            AND o.eff <= DATE_ADD(r.end_d, INTERVAL 1 DAY)
+            AND IF(o.new_code = '${REGION_LOG_NA}',
+                   o.eff = DATE_ADD(r.end_d, INTERVAL 1 DAY),
+                   o.end_d IS NULL OR o.end_d >= DATE_ADD(r.end_d, INTERVAL 1 DAY))
+        )
+    ),
+    rrl_log AS (
+      SELECT DISTINCT rec_email, eff, new_code FROM rrl_rows
+      UNION DISTINCT
+      SELECT rec_email, eff, new_code FROM rrl_removals
+    ),
     rec_log AS (
-      -- A blank NEW_CLUSTER is KEPT: it records the recruiter being taken off a cluster.
+      SELECT rec_email, eff, new_code FROM rrl_log
+      UNION ALL
+      -- Fallback while Recruiter Region Logs is empty: the old history table, where a blank
+      -- NEW_CLUSTER is KEPT as a removal.
       SELECT
         LOWER(TRIM(EMAIL_ID)) AS rec_email,
         EFFECTIVE_DATE AS eff,
         TRIM(IFNULL(NEW_CLUSTER, '')) AS new_code
       FROM ${recFqn}
       WHERE EMAIL_ID IS NOT NULL AND TRIM(EMAIL_ID) != '' AND EFFECTIVE_DATE IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM rrl_rows)
     ),
     rec_snapshot AS (
       SELECT LOWER(TRIM(RECRUITER_EMAIL_ID)) AS rec_email, MIN(TRIM(CLUSTER_CODE)) AS code

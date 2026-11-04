@@ -7,6 +7,7 @@ const config = require("./config");
 const { applyDomainTuning } = config;
 const admin = require("firebase-admin");
 const { logLine, logDetail, setPipelineDetailQuiet, formatDuration } = require("./logger");
+const { fetchContractIdOverride } = require("./contractIdOverride");
 const {
   buildUrl,
   getNexusAccessToken,
@@ -1151,6 +1152,24 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   // "incoming null vs baseline null" as no change, so the row is filtered out and simply stays
   // unidentified.
   let contractRevalidation = null;
+  // An id the approver assigned (contractIdOverride.js) is a decision, not a match: re-judging it
+  // against run-rate could mint yet another id over it. The insert pipeline still enforces it.
+  let approverContractId = null;
+  try {
+    approverContractId = await fetchContractIdOverride(
+      effectiveTableId,
+      compareRow.DEAL_SHEET_ID,
+      compareRow.PLACEMENT_ID
+    );
+  } catch (overrideErr) {
+    logDetail(
+      `[refreshDealSheetByPlacementId] contract id override lookup failed (non-fatal): ${String(overrideErr?.message || overrideErr).slice(0, 200)}`
+    );
+  }
+  if (approverContractId != null) {
+    contractRevalidation = { repaired: false, skipped: "approver_assigned", contract_id: approverContractId };
+  }
+  if (approverContractId == null) {
   try {
     const verdict = await revalidateDealContractIdAgainstRunrate(compareRow, baseline, {
       datasetId: effectiveDatasetId,
@@ -1200,6 +1219,7 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     logDetail(
       `[refreshDealSheetByPlacementId] contract revalidation failed (non-fatal): ${String(revalErr?.message || revalErr).slice(0, 200)}`
     );
+  }
   }
 
 

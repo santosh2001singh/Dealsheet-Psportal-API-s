@@ -36,6 +36,8 @@ const { logLine, logError, withTimingAsync } = require("./logger");
 const { withRunLock } = require("./syncRunLock");
 const { startDateOnOrAfterUtcMin, effectiveMinFilterDate } = require("./columnMappings");
 const { transformOfferRejectedEndedRowsForBigQuery } = require("./offerRejectedRowTransform");
+const { assignNewContractIdForPlacement } = require("./contractIdOverride");
+const config = require("./config");
 
 admin.initializeApp();
 
@@ -584,6 +586,44 @@ exports.refreshDealSheetByPlacementId = onRequest(
         error: error.message,
         executionTimeMs,
       });
+    }
+  }
+);
+
+/**
+ * HTTP: give one DEAL placement a brand-new CONTRACT_ID (approver chose "new contract" in the run
+ * rate tool). Mints from the same Firestore counter the sync uses and records the decision so the
+ * sync keeps it — see contractIdOverride.js. Idempotent per placement.
+ *
+ * POST JSON (or GET query): deal_sheet_id, placement_id, bq_table (active deal sheet table,
+ * default cynet_health_deal_sheet), requested_by (approver email).
+ */
+exports.assignNewContractId = onRequest(
+  {
+    region: REGION,
+    timeoutSeconds: 120,
+    memory: "512MiB",
+  },
+  async (req, res) => {
+    if (req.method !== "POST" && req.method !== "GET") {
+      res.status(405).json({ success: false, error: "Method not allowed" });
+      return;
+    }
+    const input = { ...(req.query || {}), ...(req.body && typeof req.body === "object" ? req.body : {}) };
+    const str = (v) => (v == null ? "" : String(v).trim());
+    try {
+      const result = await assignNewContractIdForPlacement({
+        tableId: str(input.bq_table) || config.tableId,
+        dealSheetId: str(input.deal_sheet_id),
+        placementId: str(input.placement_id),
+        requestedBy: str(input.requested_by),
+      });
+      res.status(200).json({ success: true, result });
+    } catch (error) {
+      const statusByCode = { BAD_REQUEST: 400, NOT_FOUND: 404, NOT_A_DEAL: 409 };
+      const status = statusByCode[error?.code] ?? 500;
+      if (status === 500) logError("[assignNewContractId] FAILED", error);
+      res.status(status).json({ success: false, code: error?.code ?? null, error: error.message });
     }
   }
 );

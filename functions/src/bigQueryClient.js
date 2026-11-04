@@ -1117,6 +1117,25 @@ function applyContractIdCarryForward(incomingRow, baselineRow) {
 }
 
 /**
+ * Approver-assigned CONTRACT_IDs for one deal sheet table (contractIdOverride.js), for the
+ * append-on-change gate. A read failure yields an empty map: the batch then behaves exactly as it did
+ * before overrides existed, and the next run picks the overrides up.
+ * @returns {Promise<Map<string, string>>}
+ */
+async function loadContractIdOverridesForInsert(tableId, deps = {}) {
+  try {
+    const fetchFn =
+      deps.fetchFn ?? require("./contractIdOverride").fetchContractIdOverridesForTable;
+    return await fetchFn(tableId);
+  } catch (err) {
+    logDetail(
+      `[enriched sync] contract id overrides unavailable (continuing without): ${String(err?.message || err).slice(0, 200)}`
+    );
+    return new Map();
+  }
+}
+
+/**
  * Every column a DEAL row inherits from a matched legacy run-rate row, alongside CONTRACT_ID.
  *
  * When the match turns out to be wrong the id is not the only casualty: the whole entry was copied
@@ -2362,6 +2381,10 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
       datasetId: options.datasetId,
       tableId: options.tableId,
     });
+    // Lazy: contractIdOverride requires this module.
+    const { contractIdOverrideForRow } = require("./contractIdOverride");
+    const contractIdOverrides = await loadContractIdOverridesForInsert(resolveBqDatasetTable(options).tableId);
+    let contractIdOverrideReappended = 0;
 
     const filtered = [];
     let unchangedSkipped = 0;
@@ -2412,7 +2435,14 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
       // a manual column), so the gate compares the FINAL status. Without this an API row that maps
       // to plain ENDED would differ from a stored ENDED<30 on every run and append a 0-diff row.
       const endedStatusRow = applyEndedPlacementStatusByInitialStart(row, existing.INITIAL_START_DATE);
-      if (hasBusinessColumnChanges(endedStatusRow, existing, ignoreFieldsSet)) {
+      // An approver-assigned id (contractIdOverride.js) IS this placement's id, whatever the stored
+      // latest row says. A latest row that disagrees was appended by a run that read its baseline
+      // before the approve rewrote it, so it is re-appended even with no other change.
+      const overrideId = contractIdOverrideForRow(row, contractIdOverrides);
+      const overrideMismatch =
+        overrideId != null && normalizeContractIdOrNull(existing.CONTRACT_ID) !== overrideId;
+      if (overrideMismatch) contractIdOverrideReappended++;
+      if (hasBusinessColumnChanges(endedStatusRow, existing, ignoreFieldsSet) || overrideMismatch) {
         changedIncluded++;
         const carryForward = applyManualColumnsCarryForward(endedStatusRow, existing);
         manualColumnsCarriedTotal += carryForward.carriedCount;
@@ -2432,7 +2462,10 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
         if (moveRunrateAdjusted.forcedFalse) moveRunrateForcedFalse++;
         if (moveRunrateAdjusted.keptNull) moveRunrateKeptNull++;
         if (withRejectedReset?.IS_REJECTED === "False") isRejectedResetCount++;
-        const contractIdCarried = applyContractIdCarryForward(withRejectedReset, existing);
+        const contractIdCarried = applyContractIdCarryForward(
+          withRejectedReset,
+          overrideId != null ? { ...existing, CONTRACT_ID: overrideId } : existing
+        );
         if (contractIdCarried.carried) contractIdCarriedCount++;
         // Mark as an update-append (has a baseline): hierarchy is carried forward verbatim and
         // must NOT be re-derived from the directory. Re-deriving would re-fill a field a
@@ -2450,6 +2483,7 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
       `[enriched sync] [BigQuery insertAll] append-on-change(DEAL_SHEET_ID+PLACEMENT_ID): changedIncluded=${changedIncluded} noBaselineIncluded=${noBaselineIncluded} newRowSkippedByPlacementStatus=${newRowSkippedByPlacementStatus} missingPlacementIdCount=${missingPlacementIdCount} moveRunrateForcedFalse=${moveRunrateForcedFalse} moveRunrateKeptNull=${moveRunrateKeptNull} unchangedSkipped=${unchangedSkipped} remaining=${rowsToInsert.length}`
       + ` isRejectedResetCount=${isRejectedResetCount} manualColumnsCarriedTotal=${manualColumnsCarriedTotal}`
       + ` contractIdCarriedCount=${contractIdCarriedCount}`
+      + ` contractIdOverrides=${contractIdOverrides.size} contractIdOverrideReappended=${contractIdOverrideReappended}`
       + ` tentativeFrozenCount=${tentativeFrozenCount}`
       + ` newHireFrozenCount=${newHireFrozenCount}`
       + ` submissionFrozenCount=${submissionFrozenCount}`

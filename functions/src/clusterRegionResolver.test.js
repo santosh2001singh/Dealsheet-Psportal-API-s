@@ -139,6 +139,17 @@ test("the recruiter log keeps removals, uses the pre-log reference and never OLD
   assert.ok(sql.includes("Cluster_Data.rec_cluster`"), "rec_cluster answers for a recruiter absent from the log");
 });
 
+// buildRecruiterRegionHistoryMap: Recruiter Region Logs is the history, the old table only while it is empty.
+test("the recruiter history is Recruiter Region Logs, converted to the report's change log", () => {
+  const sql = buildClusterRegionResolvedSql("cynet_health_deal_sheet", SQL_OPTS);
+  assert.ok(sql.includes("`p.d.Recruiter_Region_logs`"));
+  assert.match(sql, /IFNULL\(IS_DELETED, FALSE\) = FALSE/, "archived rows are skipped");
+  assert.match(sql, /IN \('', 'NA'\), 'NA', TRIM\(NEW_REGION_CODE\)\)/, "blank region is NA");
+  assert.match(sql, /DATE_ADD\(r\.end_d, INTERVAL 1 DAY\) >= DATE '2026-06-01'/, "removals only from 6/1/2026");
+  assert.match(sql, /AND NOT EXISTS \(SELECT 1 FROM rrl_rows\)/, "old table only while the new one is empty");
+  assert.match(sql, /ORDER BY l\.eff DESC, IF\(l\.new_code = 'NA', 1, 0\), l\.new_code/, "region beats NA on a date");
+});
+
 test("the client side matches state as a /-delimited list or ALL, MSP only narrowing", () => {
   const sql = buildClusterRegionResolvedSql("cynet_health_deal_sheet", SQL_OPTS);
   assert.match(sql, /n\.state_up = 'ALL' OR r\.state_key IN UNNEST\(n\.state_list\)/);
