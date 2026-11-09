@@ -52,6 +52,19 @@
  *
  * Retired EXC-n codes display as "Gov Region n", as the report does.
  *
+ * Step 4 — PLACEMENT_TARGET / RECRUITER_TARGET, Regional rows only (CLUSTER_TYPE "Regional" after
+ *   this fill), as of the Step 1 date. The row's RECRUITER_CLUSTER_REGION (stored, else resolved) and
+ *   client (NEXUS_PARENT_CLIENT_ID, else PARENT_CLIENT_NAME — the alignment ids are parent ids, but
+ *   some differ from Nexus's) are looked up in:
+ *     PLACEMENT_TARGET -> rr_project_data.client_alignment_enriched: a row for that region + client in
+ *                         force on the date (EFFECTIVE_DATE / END_DATE, blank = open) -> "TARGET"
+ *     RECRUITER_TARGET -> rr_project_data.Region_alignment_enriched: the recruiter's (EMAIL) row for the
+ *                         client -> "Primary Target" / "Secondary Target" / "Third Target" from
+ *                         ACCOUNT_TYPE; a deleted row counts only when DELETED_AT is after the date
+ *   Anything else, and every non-Regional row, is "NA". Both are recomputed on every run.
+ *   The *_logs copies of the two tables hold no history yet, so a row added after the placement still
+ *   counts.
+ *
  * Known gaps versus the report: the regional anchor freeze (rebooking chains), the stored
  * finalized-row fallbacks, the speciality from combine_deal_head_count (OFFERING is used), the
  * ownership-updated recruiter email (ASSIGNMENT_RECRUITER_EMAIL is used), and the Firestore
@@ -59,6 +72,8 @@
  *
  * Writing: FILL-IF-EMPTY by default — all three columns are MANUAL_COLUMNS. options.overwrite
  * replaces existing values with the resolved ones (a blank resolution never erases a value).
+ * The two Step 4 columns are always rewritten when they differ (they are MANUAL_COLUMNS only so an
+ * update-append carries them forward).
  * The full per-row reasoning goes to the trace table — see buildClusterRegionTraceSql.
  */
 
@@ -77,6 +92,19 @@ const HEALTH_SYSTEM_CLUSTER_TABLE = "Cluster_Data.health_system_cluster";
 const CLIENT_ALIGNMENT_TABLE = "Cluster_Data.client_alignment";
 const CLIENT_LOG_TABLE = "Cluster_Data.client_logs_new";
 const REGION_ALIGNMENT_TABLE = "Cluster_Data.Region_alignment";
+/** Step 4 sources, in the deal sheet dataset. */
+const CLIENT_ALIGNMENT_ENRICHED_TABLE_ID = "client_alignment_enriched";
+const REGION_ALIGNMENT_ENRICHED_TABLE_ID = "Region_alignment_enriched";
+
+const TARGET_NA = "NA";
+const PLACEMENT_TARGET_VALUE = "TARGET";
+/** Region_alignment_enriched ACCOUNT_TYPE -> RECRUITER_TARGET, best first. "No Target Account" is NA. */
+const RECRUITER_TARGET_BY_ACCOUNT_TYPE = Object.freeze([
+  { match: "PRIMARY", value: "Primary Target" },
+  { match: "SECONDARY", value: "Secondary Target" },
+  { match: "3RD", value: "Third Target" },
+  { match: "THIRD", value: "Third Target" },
+]);
 
 /**
  * cynet health ACTIVE only.
@@ -433,13 +461,13 @@ function recruiterLogPassSql(p, req) {
 }
 
 /**
- * SQL for the resolved view of one deal sheet table: one row per DEAL_SHEET_ID with the three
+ * SQL for the resolved view of one deal sheet table: one row per DEAL_SHEET_ID with the five
  * column values plus the reasoning. Shared by the deal sheet fill and the trace table so the two can
  * never disagree.
  *
  * Returned as a CTE body (no trailing semicolon) selecting one row per deal sheet row.
  * @param {string} tableId
- * @param {object} [options] - { projectId, datasetId }
+ * @param {object} [options] - { projectId, datasetId, overwrite }
  * @returns {string}
  */
 function buildClusterRegionResolvedSql(tableId, options = {}) {
@@ -478,6 +506,7 @@ function buildClusterRegionResolvedSql(tableId, options = {}) {
           LOWER(TRIM(IFNULL(ASSIGNMENT_RECRUITER_EMAIL, ''))) AS rec_email,
           TRIM(IFNULL(PARENT_CLIENT_NAME, ''))         AS client_raw,
           UPPER(TRIM(IFNULL(PARENT_CLIENT_NAME, '')))  AS client_up,
+          SAFE_CAST(NEXUS_PARENT_CLIENT_ID AS INT64)   AS parent_client_id,
           UPPER(TRIM(IFNULL(MSP_NAME, '')))            AS msp_up,
           TRIM(IFNULL(CLIENT_STATE, ''))               AS state_raw,
           UPPER(TRIM(IFNULL(CLIENT_STATE, '')))        AS state_key,
@@ -819,6 +848,7 @@ function buildClusterRegionResolvedSql(tableId, options = {}) {
         b.existing_cluster_type,
         b.rec_email,
         b.client_up,
+        b.parent_client_id,
         b.client_lookup_date,
         b.post_june_ext,
         r.as_of_date,
@@ -867,6 +897,9 @@ function buildClusterRegionResolvedSql(tableId, options = {}) {
       p.existing_recruiter_region,
       p.existing_client_region,
       p.existing_cluster_type,
+      p.rec_email,
+      p.client_up,
+      p.parent_client_id,
       p.as_of_date,
       p.as_of_date_source,
       p.client_lookup_date,
@@ -930,11 +963,102 @@ function buildClusterRegionResolvedSql(tableId, options = {}) {
 }
 
 /**
- * Multi-statement SQL filling the three deal sheet columns on the cynet health table, and reporting
- * how many rows each UPDATE touched. Idempotent: a settled table updates 0.
+ * Step 4 over the materialised cluster/region resolution: `sourceTable` (a temp table holding
+ * buildClusterRegionResolvedSql's rows) plus placement_target / recruiter_target. Kept out of the
+ * resolver's CTE chain because BigQuery inlines a CTE at every reference, and reading the resolver
+ * twice fails with "Not enough resources for query planning".
+ * @param {string} sourceTable - unqualified temp table name
+ * @param {object} [options] - { projectId, datasetId, overwrite }
+ * @returns {string}
+ */
+function buildRegionTargetSql(sourceTable, options = {}) {
+  const projectId = options.projectId;
+  const datasetId = options.datasetId;
+  const caeFqn = fqn(datasetId, CLIENT_ALIGNMENT_ENRICHED_TABLE_ID, projectId);
+  const raeFqn = fqn(datasetId, REGION_ALIGNMENT_ENRICHED_TABLE_ID, projectId);
+  // The value a column holds after buildClusterRegionFillSql: a stored value wins unless overwriting.
+  const finalSql = (existing, resolvedExpr) =>
+    options.overwrite === true
+      ? `COALESCE(${resolvedExpr}, NULLIF(TRIM(${existing}), ''))`
+      : `COALESCE(NULLIF(TRIM(${existing}), ''), ${resolvedExpr})`;
+  const accountTypeCases = (field) =>
+    RECRUITER_TARGET_BY_ACCOUNT_TYPE.map(
+      ({ match, value }, i) =>
+        `WHEN STRPOS(UPPER(IFNULL(ACCOUNT_TYPE, '')), ${sqlStr(match)}) > 0 THEN ${field === "rank" ? i : sqlStr(value)}`
+    ).join(" ");
+
+  return `
+    WITH
+    target_req AS (
+      SELECT
+        o.DEAL_SHEET_ID, o.as_of_date, o.rec_email, o.client_up, o.parent_client_id,
+        UPPER(TRIM(IFNULL(${finalSql("o.existing_recruiter_region", "o.recruiter_code")}, ''))) AS region_up,
+        IFNULL(TRIM(${finalSql("o.existing_cluster_type", "o.client_cluster_type")}) = '${PROGRAMME.REGIONAL}', FALSE)
+          AS is_regional
+      FROM ${sourceTable} o
+    ),
+    cae_rows AS (
+      SELECT
+        UPPER(TRIM(REGION_CODE)) AS region_up,
+        SAFE_CAST(CLIENT_ID AS INT64) AS client_id,
+        UPPER(TRIM(IFNULL(CLIENT_NAME, ''))) AS client_up,
+        EFFECTIVE_DATE AS eff,
+        END_DATE AS end_d
+      FROM ${caeFqn}
+      WHERE TRIM(IFNULL(REGION_CODE, '')) != ''
+    ),
+    rae_rows AS (
+      SELECT * FROM (
+        SELECT
+          LOWER(TRIM(EMAIL)) AS rec_email,
+          SAFE_CAST(CLIENT_ID AS INT64) AS client_id,
+          UPPER(TRIM(IFNULL(CLIENT_NAME, ''))) AS client_up,
+          CASE ${accountTypeCases("value")} END AS target,
+          CASE ${accountTypeCases("rank")} END AS target_rank,
+          IFNULL(IS_DELETED, FALSE) AS is_deleted,
+          DATE(DELETED_AT) AS deleted_on
+        FROM ${raeFqn}
+        WHERE TRIM(IFNULL(EMAIL, '')) != ''
+      )
+      WHERE target IS NOT NULL
+    ),
+    placement_target_hit AS (
+      SELECT DISTINCT t.DEAL_SHEET_ID
+      FROM target_req t
+      JOIN cae_rows c
+        ON c.region_up = t.region_up
+       AND (c.client_id = t.parent_client_id OR (c.client_up != '' AND c.client_up = t.client_up))
+      WHERE t.is_regional AND t.region_up NOT IN ('', '${TARGET_NA}') AND t.as_of_date IS NOT NULL
+        AND (c.eff IS NULL OR c.eff <= t.as_of_date)
+        AND (c.end_d IS NULL OR c.end_d >= t.as_of_date)
+    ),
+    recruiter_target_pick AS (
+      SELECT t.DEAL_SHEET_ID, r.target
+      FROM target_req t
+      JOIN rae_rows r
+        ON r.rec_email = t.rec_email
+       AND (r.client_id = t.parent_client_id OR (r.client_up != '' AND r.client_up = t.client_up))
+      WHERE t.is_regional AND t.rec_email NOT IN ('', 'na') AND t.as_of_date IS NOT NULL
+        -- A row deleted later (recruiter left, client moved) still held on the placement's date.
+        AND (NOT r.is_deleted OR r.deleted_on > t.as_of_date)
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY t.DEAL_SHEET_ID ORDER BY r.target_rank) = 1
+    )
+    SELECT
+      o.*,
+      IF(ph.DEAL_SHEET_ID IS NOT NULL, '${PLACEMENT_TARGET_VALUE}', '${TARGET_NA}') AS placement_target,
+      IFNULL(rp.target, '${TARGET_NA}') AS recruiter_target
+    FROM ${sourceTable} o
+    LEFT JOIN placement_target_hit ph ON ph.DEAL_SHEET_ID = o.DEAL_SHEET_ID
+    LEFT JOIN recruiter_target_pick rp ON rp.DEAL_SHEET_ID = o.DEAL_SHEET_ID`;
+}
+
+/**
+ * Multi-statement SQL filling the deal sheet columns on the cynet health table, and reporting how
+ * many rows each UPDATE touched. Idempotent: a settled table updates 0.
  *
- * Default FILL-IF-EMPTY. overwrite: true replaces any value that differs from the resolved one; a
- * column that resolved to nothing is still left alone.
+ * Cluster/region columns: default FILL-IF-EMPTY. overwrite: true replaces any value that differs
+ * from the resolved one; a column that resolved to nothing is still left alone.
+ * PLACEMENT_TARGET / RECRUITER_TARGET always take the resolved value (never blank: "NA" at worst).
  * @param {object} [options] - { projectId, datasetId, tableIds, overwrite }
  * @returns {{sql: string, tableIds: string[]}}
  */
@@ -955,12 +1079,14 @@ function buildClusterRegionFillSql(options = {}) {
     overwrite
       ? `IFNULL(s.${src}, d.${col})`
       : `IFNULL(NULLIF(TRIM(IFNULL(d.${col}, '')), ''), s.${src})`;
+  const targetDiffers = (col, src) => `IFNULL(d.${col}, '') != s.${src}`;
 
   const statements = [];
   const selects = [];
   tableIds.forEach((tableId, i) => {
     const dealFqn = fqn(options.datasetId, tableId, options.projectId);
     const resolved = buildClusterRegionResolvedSql(tableId, options);
+    const clusterSrc = `cluster_${i}`;
     const src = `resolved_${i}`;
     const counter = `changed_${i}_rows`;
     // The eligibility predicate is spelled once and reused by the count and the UPDATE, so the two can
@@ -970,10 +1096,13 @@ function buildClusterRegionFillSql(options = {}) {
     const eligible = `
     ${needs("RECRUITER_CLUSTER_REGION", "recruiter_code")}
     OR ${needs("CLIENT_CLUSTER_REGION", "client_code")}
-    OR ${needs("CLUSTER_TYPE", "client_cluster_type")}`;
+    OR ${needs("CLUSTER_TYPE", "client_cluster_type")}
+    OR ${targetDiffers("PLACEMENT_TARGET", "placement_target")}
+    OR ${targetDiffers("RECRUITER_TARGET", "recruiter_target")}`;
 
     statements.push(`
-CREATE TEMP TABLE ${src} AS ${resolved};
+CREATE TEMP TABLE ${clusterSrc} AS ${resolved};
+CREATE TEMP TABLE ${src} AS ${buildRegionTargetSql(clusterSrc, options)};
 
 SET ${counter} = (
   SELECT COUNT(*)
@@ -986,10 +1115,12 @@ UPDATE ${dealFqn} d
 SET
   RECRUITER_CLUSTER_REGION = ${value("RECRUITER_CLUSTER_REGION", "recruiter_code")},
   CLIENT_CLUSTER_REGION = ${value("CLIENT_CLUSTER_REGION", "client_code")},
-  CLUSTER_TYPE = ${value("CLUSTER_TYPE", "client_cluster_type")}
+  CLUSTER_TYPE = ${value("CLUSTER_TYPE", "client_cluster_type")},
+  PLACEMENT_TARGET = s.placement_target,
+  RECRUITER_TARGET = s.recruiter_target
 FROM ${src} s
 WHERE d.DEAL_SHEET_ID = s.DEAL_SHEET_ID
-  -- Only touch rows where at least one of the three would change.
+  -- Only touch rows where at least one column would change.
   AND (${eligible}
   );`);
     selects.push(`SELECT '${tableId}' AS table_id, ${counter} AS changed_rows`);
@@ -1003,7 +1134,8 @@ WHERE d.DEAL_SHEET_ID = s.DEAL_SHEET_ID
 }
 
 /**
- * SQL rebuilding the trace table from scratch (CREATE OR REPLACE) with one row per deal sheet row.
+ * Multi-statement SQL rebuilding the trace table from scratch (CREATE OR REPLACE) with one row per
+ * deal sheet row.
  * Full reasoning lives here rather than on the deal sheet.
  * @param {object} [options] - { projectId, datasetId, tableIds, traceTableId }
  * @returns {{sql: string, tableIds: string[], traceTableId: string}}
@@ -1016,8 +1148,12 @@ function buildClusterRegionTraceSql(options = {}) {
   const traceTableId = String(options.traceTableId || CLUSTER_TRACE_TABLE_ID).trim();
   const traceFqn = fqn(options.datasetId, traceTableId, options.projectId);
 
-  const parts = tableIds.map((tableId) => {
-    const resolved = buildClusterRegionResolvedSql(tableId, options);
+  const statements = tableIds.map(
+    (tableId, i) => `
+CREATE TEMP TABLE cluster_${i} AS ${buildClusterRegionResolvedSql(tableId, options)};
+CREATE TEMP TABLE resolved_${i} AS ${buildRegionTargetSql(`cluster_${i}`, options)};`
+  );
+  const parts = tableIds.map((tableId, i) => {
     return `
 SELECT
   '${tableId}' AS SOURCE_TABLE,
@@ -1042,16 +1178,18 @@ SELECT
   client_cluster_type   AS CLIENT_CLUSTER_TYPE,
   programme             AS PROGRAMME,
   why_blank             AS WHY_BLANK,
+  placement_target      AS PLACEMENT_TARGET,
+  recruiter_target      AS RECRUITER_TARGET,
   CURRENT_TIMESTAMP()   AS COMPUTED_AT
-FROM (${resolved})`;
+FROM resolved_${i}`;
   });
 
-  const sql = `CREATE OR REPLACE TABLE ${traceFqn} AS\n${parts.join("\nUNION ALL\n")};`;
+  const sql = `${statements.join("\n")}\n\nCREATE OR REPLACE TABLE ${traceFqn} AS\n${parts.join("\nUNION ALL\n")};`;
   return { sql, tableIds, traceTableId };
 }
 
 /**
- * Fill the three deal sheet columns, then rebuild the trace table. Both idempotent.
+ * Fill the deal sheet columns, then rebuild the trace table. Both idempotent.
  * @param {object} [options] - { projectId, datasetId, tableIds, skipTrace, overwrite }
  * @param {object} deps - { queryFn(sql): Promise<object[]> }
  * @returns {Promise<{updated:number|null, byTable:Object<string,number>, traceTableId:string|null}>}
@@ -1095,6 +1233,9 @@ module.exports = {
   PRE_LOG_REFERENCE_DATE,
   SPOT_PROJECT_CODES,
   PROGRAMME,
+  TARGET_NA,
+  PLACEMENT_TARGET_VALUE,
+  RECRUITER_TARGET_BY_ACCOUNT_TYPE,
   AS_OF_DATE_SOURCE,
   RECRUITER_CODE_SOURCE,
   CLIENT_CODE_SOURCE,
@@ -1103,6 +1244,7 @@ module.exports = {
   recruiterSpecialtyFromCode,
   resolveProgramme,
   buildClusterRegionResolvedSql,
+  buildRegionTargetSql,
   buildClusterRegionFillSql,
   buildClusterRegionTraceSql,
   backfillClusterRegions,

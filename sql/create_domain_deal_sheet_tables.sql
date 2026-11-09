@@ -192,6 +192,10 @@ CREATE TABLE IF NOT EXISTS `cynetdatabase.rr_project_data.cynet_health_deal_shee
   -- step writes it.
   CLIENT_CLUSTER_REGION STRING,
   CLUSTER_TYPE STRING,
+  -- Regional programme: "TARGET" / "NA" and "Primary Target" / "Secondary Target" / "Third Target" /
+  -- "NA". Filled post-sync by clusterRegionResolver.js (Step 4).
+  PLACEMENT_TARGET STRING,
+  RECRUITER_TARGET STRING,
   LAST_UPDATED TIMESTAMP,
   DELIVERY_DIRECTOR STRING,
   ATL_EMP_NO STRING,
@@ -265,6 +269,8 @@ ALTER TABLE `cynetdatabase.rr_project_data.cynet_health_canada_deal_sheet`
   DROP COLUMN IF EXISTS CLIENT_CLUSTER_REGION,
   DROP COLUMN IF EXISTS RECRUITER_CLUSTER_REGION,
   DROP COLUMN IF EXISTS CLUSTER_TYPE,
+  DROP COLUMN IF EXISTS PLACEMENT_TARGET,
+  DROP COLUMN IF EXISTS RECRUITER_TARGET,
   DROP COLUMN IF EXISTS HOURLY_GP,
   DROP COLUMN IF EXISTS FIFTYTWO_TENURE_RTO_LASTDATE,
   DROP COLUMN IF EXISTS FIFTYTWO_TENURE_CANDIDATE_STATUS,
@@ -318,3 +324,15 @@ ALTER TABLE `cynetdatabase.rr_project_data.cynet_locums_deal_sheet`
   ADD COLUMN IF NOT EXISTS DIRECT_MANAGER STRING,
   ADD COLUMN IF NOT EXISTS CREDENTIALED_DATE DATE,
   ADD COLUMN IF NOT EXISTS SHIFTS STRING;
+
+-- Regional target flags (2026-11-04). Filled by clusterRegionResolver.js Step 4 on the deal sheet;
+-- the run-rate and all_CH_Deal_sheet_data copies are filled by one-off SQL.
+ALTER TABLE `cynetdatabase.rr_project_data.cynet_health_deal_sheet`
+  ADD COLUMN IF NOT EXISTS PLACEMENT_TARGET STRING,
+  ADD COLUMN IF NOT EXISTS RECRUITER_TARGET STRING;
+ALTER TABLE `cynetdatabase.rr_project_data.all_CH_data_runrate`
+  ADD COLUMN IF NOT EXISTS PLACEMENT_TARGET STRING,
+  ADD COLUMN IF NOT EXISTS RECRUITER_TARGET STRING;
+ALTER TABLE `cynetdatabase.rr_project_data.all_CH_Deal_sheet_data`
+  ADD COLUMN IF NOT EXISTS PLACEMENT_TARGET STRING,
+  ADD COLUMN IF NOT EXISTS RECRUITER_TARGET STRING;

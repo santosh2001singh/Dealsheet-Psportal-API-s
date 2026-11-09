@@ -3178,7 +3178,7 @@ async function syncOwnershipChangeLogEffectiveDatesFromExtensions(params = {}) {
   //  5) EXTENSION rows whose parent DEAL was synced AFTER them: insert-time inherit found no parent,
   //     so CONTRACT_ID / SKU_NUMBER / hierarchy / ops were left null. Nothing else goes back for them.
   //  6) RECRUITER_CLUSTER_REGION / CLIENT_CLUSTER_REGION / CLUSTER_TYPE on the cynet health tables
-  //     (fill-if-empty), plus the cluster trace rebuild. Post-sync because the recruiter history and
+  //     (fill-if-empty), PLACEMENT_TARGET / RECRUITER_TARGET (recomputed), plus the cluster trace rebuild. Post-sync because the recruiter history and
   //     the client cluster tables move independently of any one placement.
   let empNoNaResult = { updated: null };
   try {

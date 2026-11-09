@@ -2091,6 +2091,10 @@ const MANUAL_COLUMNS = new Set([
   "PO_RECEIVED",
   "PRIMARY_SALES_PERSON",
   "RECRUITER_CLUSTER_REGION",
+  // Regional target flags — derived, but owned by the post-sync cluster/region pass
+  // (clusterRegionResolver.js Step 4). Listed so an update-append carries the last value forward.
+  "PLACEMENT_TARGET",
+  "RECRUITER_TARGET",
   "RECRUITMENT_MENTOR",
   "REJECTION_REASON",
   "RM",

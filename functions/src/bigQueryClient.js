@@ -9835,7 +9835,8 @@ async function backfillExtensionParentInheritForDealSheets(options = {}) {
 }
 
 /**
- * Fill RECRUITER_CLUSTER_REGION / CLIENT_CLUSTER_REGION / CLUSTER_TYPE on the cynet health deal sheet
+ * Fill RECRUITER_CLUSTER_REGION / CLIENT_CLUSTER_REGION / CLUSTER_TYPE (+ PLACEMENT_TARGET /
+ * RECRUITER_TARGET, recomputed every run) on the cynet health deal sheet
  * (active + ended) with where each side sat AT THE TIME OF THE PLACEMENT, then rebuild the trace table
  * holding the full per-row reasoning. See clusterRegionResolver.js for the rules.
  *
