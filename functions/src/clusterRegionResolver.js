@@ -58,12 +58,14 @@
  *   some differ from Nexus's) are looked up in:
  *     PLACEMENT_TARGET -> rr_project_data.client_alignment_enriched: a row for that region + client in
  *                         force on the date (EFFECTIVE_DATE / END_DATE, blank = open) -> "TARGET"
- *     RECRUITER_TARGET -> rr_project_data.Region_alignment_enriched: the recruiter's (EMAIL) row for the
- *                         client -> "Primary Target" / "Secondary Target" / "Third Target" from
- *                         ACCOUNT_TYPE; a deleted row counts only when DELETED_AT is after the date
+ *     RECRUITER_TARGET -> rr_project_data.Recruiter_Region_logs: the recruiter's (RECRUITER_EMAIL_ID)
+ *                         entry for the client (NEW_CLIENT_ID / NEW_CLIENT_NAME) in force on the date
+ *                         (EFFECTIVE_DATE..END_DATE, blank end = open) -> "Primary Target" /
+ *                         "Secondary Target" / "Third Target" from NEW_ACCOUNT_TYPE. The current
+ *                         Region_alignment_enriched list is not used: a client taken off a recruiter
+ *                         is hard-deleted there, and one added later would count for older placements.
  *   Anything else, and every non-Regional row, is "NA". Both are recomputed on every run.
- *   The *_logs copies of the two tables hold no history yet, so a row added after the placement still
- *   counts.
+ *   client_alignment_enriched carries no dates yet, so a client added to a region later still counts.
  *
  * Known gaps versus the report: the regional anchor freeze (rebooking chains), the stored
  * finalized-row fallbacks, the speciality from combine_deal_head_count (OFFERING is used), the
@@ -94,11 +96,10 @@ const CLIENT_LOG_TABLE = "Cluster_Data.client_logs_new";
 const REGION_ALIGNMENT_TABLE = "Cluster_Data.Region_alignment";
 /** Step 4 sources, in the deal sheet dataset. */
 const CLIENT_ALIGNMENT_ENRICHED_TABLE_ID = "client_alignment_enriched";
-const REGION_ALIGNMENT_ENRICHED_TABLE_ID = "Region_alignment_enriched";
 
 const TARGET_NA = "NA";
 const PLACEMENT_TARGET_VALUE = "TARGET";
-/** Region_alignment_enriched ACCOUNT_TYPE -> RECRUITER_TARGET, best first. "No Target Account" is NA. */
+/** Recruiter_Region_logs NEW_ACCOUNT_TYPE -> RECRUITER_TARGET, best first. "No Target Account" is NA. */
 const RECRUITER_TARGET_BY_ACCOUNT_TYPE = Object.freeze([
   { match: "PRIMARY", value: "Primary Target" },
   { match: "SECONDARY", value: "Secondary Target" },
@@ -975,7 +976,7 @@ function buildRegionTargetSql(sourceTable, options = {}) {
   const projectId = options.projectId;
   const datasetId = options.datasetId;
   const caeFqn = fqn(datasetId, CLIENT_ALIGNMENT_ENRICHED_TABLE_ID, projectId);
-  const raeFqn = fqn(datasetId, REGION_ALIGNMENT_ENRICHED_TABLE_ID, projectId);
+  const rrlFqn = fqn(datasetId, RECRUITER_REGION_LOGS_TABLE_ID, projectId);
   // The value a column holds after buildClusterRegionFillSql: a stored value wins unless overwriting.
   const finalSql = (existing, resolvedExpr) =>
     options.overwrite === true
@@ -984,7 +985,7 @@ function buildRegionTargetSql(sourceTable, options = {}) {
   const accountTypeCases = (field) =>
     RECRUITER_TARGET_BY_ACCOUNT_TYPE.map(
       ({ match, value }, i) =>
-        `WHEN STRPOS(UPPER(IFNULL(ACCOUNT_TYPE, '')), ${sqlStr(match)}) > 0 THEN ${field === "rank" ? i : sqlStr(value)}`
+        `WHEN STRPOS(UPPER(IFNULL(NEW_ACCOUNT_TYPE, '')), ${sqlStr(match)}) > 0 THEN ${field === "rank" ? i : sqlStr(value)}`
     ).join(" ");
 
   return `
@@ -1007,20 +1008,21 @@ function buildRegionTargetSql(sourceTable, options = {}) {
       FROM ${caeFqn}
       WHERE TRIM(IFNULL(REGION_CODE, '')) != ''
     ),
-    rae_rows AS (
+    rrl_target_rows AS (
       SELECT * FROM (
         SELECT
-          LOWER(TRIM(EMAIL)) AS rec_email,
-          SAFE_CAST(CLIENT_ID AS INT64) AS client_id,
-          UPPER(TRIM(IFNULL(CLIENT_NAME, ''))) AS client_up,
+          LOWER(TRIM(RECRUITER_EMAIL_ID)) AS rec_email,
+          SAFE_CAST(NEW_CLIENT_ID AS INT64) AS client_id,
+          UPPER(TRIM(IFNULL(NEW_CLIENT_NAME, ''))) AS client_up,
           CASE ${accountTypeCases("value")} END AS target,
           CASE ${accountTypeCases("rank")} END AS target_rank,
-          IFNULL(IS_DELETED, FALSE) AS is_deleted,
-          DATE(DELETED_AT) AS deleted_on
-        FROM ${raeFqn}
-        WHERE TRIM(IFNULL(EMAIL, '')) != ''
+          SAFE_CAST(EFFECTIVE_DATE AS DATE) AS eff,
+          SAFE_CAST(END_DATE AS DATE) AS end_d
+        FROM ${rrlFqn}
+        WHERE IFNULL(IS_DELETED, FALSE) = FALSE
+          AND TRIM(IFNULL(RECRUITER_EMAIL_ID, '')) != ''
       )
-      WHERE target IS NOT NULL
+      WHERE target IS NOT NULL AND eff IS NOT NULL
     ),
     placement_target_hit AS (
       SELECT DISTINCT t.DEAL_SHEET_ID
@@ -1035,12 +1037,13 @@ function buildRegionTargetSql(sourceTable, options = {}) {
     recruiter_target_pick AS (
       SELECT t.DEAL_SHEET_ID, r.target
       FROM target_req t
-      JOIN rae_rows r
+      JOIN rrl_target_rows r
         ON r.rec_email = t.rec_email
        AND (r.client_id = t.parent_client_id OR (r.client_up != '' AND r.client_up = t.client_up))
       WHERE t.is_regional AND t.rec_email NOT IN ('', 'na') AND t.as_of_date IS NOT NULL
-        -- A row deleted later (recruiter left, client moved) still held on the placement's date.
-        AND (NOT r.is_deleted OR r.deleted_on > t.as_of_date)
+        -- The recruiter held the client on the placement's date.
+        AND r.eff <= t.as_of_date
+        AND (r.end_d IS NULL OR r.end_d >= t.as_of_date)
       QUALIFY ROW_NUMBER() OVER (PARTITION BY t.DEAL_SHEET_ID ORDER BY r.target_rank) = 1
     )
     SELECT

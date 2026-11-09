@@ -13,6 +13,7 @@ const {
   recruiterSpecialtyFromCode,
   resolveProgramme,
   buildClusterRegionResolvedSql,
+  buildRegionTargetSql,
   buildClusterRegionFillSql,
   buildClusterRegionTraceSql,
   backfillClusterRegions,
@@ -316,4 +317,36 @@ test("an unreadable count result reports null rather than a wrong zero", async (
 
 test("backfillClusterRegions requires a queryFn", async () => {
   await assert.rejects(() => backfillClusterRegions(SQL_OPTS, {}), /requires deps\.queryFn/);
+});
+
+// --- Step 4: PLACEMENT_TARGET / RECRUITER_TARGET -----------------------------------------------------
+
+test("PLACEMENT_TARGET reads client_alignment_enriched by region + parent client id or name", () => {
+  const sql = buildRegionTargetSql("cluster_0", SQL_OPTS);
+  assert.ok(sql.includes("`p.d.client_alignment_enriched`"));
+  assert.match(sql, /c\.region_up = t\.region_up/);
+  assert.match(sql, /c\.client_id = t\.parent_client_id OR \(c\.client_up != '' AND c\.client_up = t\.client_up\)/);
+});
+
+test("RECRUITER_TARGET reads Recruiter_Region_logs in force on the placement date", () => {
+  const sql = buildRegionTargetSql("cluster_0", SQL_OPTS);
+  assert.ok(sql.includes("`p.d.Recruiter_Region_logs`"));
+  assert.ok(!sql.includes("Region_alignment_enriched"), "the current snapshot is not a history");
+  assert.match(sql, /r\.eff <= t\.as_of_date/);
+  assert.match(sql, /r\.end_d IS NULL OR r\.end_d >= t\.as_of_date/);
+  assert.match(sql, /NEW_ACCOUNT_TYPE/);
+});
+
+test("targets apply to Regional rows only and fall back to NA", () => {
+  const sql = buildRegionTargetSql("cluster_0", SQL_OPTS);
+  assert.match(sql, /= 'Regional', FALSE\)\s+AS is_regional/);
+  assert.match(sql, /IFNULL\(rp\.target, 'NA'\) AS recruiter_target/);
+  assert.match(sql, /'TARGET', 'NA'\) AS placement_target/);
+});
+
+test("the fill reads the targets from a temp table, not a second inlined resolver", () => {
+  const { sql } = buildClusterRegionFillSql(SQL_OPTS);
+  assert.match(sql, /CREATE TEMP TABLE cluster_0 AS/);
+  assert.match(sql, /CREATE TEMP TABLE resolved_0 AS\s+WITH\s+target_req/);
+  assert.match(sql, /RECRUITER_TARGET = s\.recruiter_target/);
 });
