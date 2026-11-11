@@ -64,16 +64,16 @@ it is the single source of truth; do not add a fourth private copy.
 | ON | 1.2155 | 1.0337 |
 | BC | 1.2258 | **1.0000** |
 | NS | 1.2013 | 1.0195 |
-| NL | **1.213888** | 1.0254 |
+| NL | **1.2072** | 1.0254 |
 | AB MB SK QC NB | 1.1818 | **null — "No business"** |
 
 Two deliberate departures from the older sheet formulas, both confirmed with the business:
 - **AB group**: the sheet multiplied PAY_RATE by 1.04 before the 1.1818 loading, but the 4% vacation
   is already inside 18.18%. The extra 1.04 double-counted it, so it was dropped.
 - **NL**: Finance's email states the loading two ways that disagree — the table says 20.72%
-  (→ 1.2072), the note says "Pay Rate + 4% Vacation + 16.72%" (→ 1.04 × 1.1672 = **1.213888**).
-  The code follows the NOTE, which matches the legacy run-rate sheet. If Finance ever confirms the
-  flat total instead, change `NL.t4` back to 1.2072 and re-run `sql/backfill_canada_nl_margins.sql`.
+  (→ 1.2072), the note says "Pay Rate + 4% Vacation + 16.72%" (→ 1.04 × 1.1672 = 1.213888).
+  The business confirmed the flat **20.72%** on 2026-11-11; the code used the note's 1.213888 until then.
+  The RR-Dashboard's `canadaPerDiemRecalc.js` must use the same multiplier.
 
 A "No business" province + T4A yields a **NULL** pay rate, never an invented 1.0 multiplier.
 

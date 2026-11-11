@@ -11,7 +11,7 @@ const {
 const { hasBusinessColumnChanges, applyManualColumnsCarryForward } = require("./bigQueryClient");
 const { computeChangedFields } = require("./syncService");
 
-// SKU CH1423's shape: 57.70 * 1.213888 + 70 / 11.25 = 76.26, exactly the run-rate figure.
+// SKU CH1423's shape: 57.70 * 1.2072 + 70 / 11.25 = 75.88.
 function nlRow(overrides = {}) {
   return {
     DEAL_SHEET_ID: 5000001,
@@ -47,7 +47,7 @@ test("NL row with no Nexus per diem defaults to 70 and loads it into T4_PAY_RATE
     const out = enrich(nlRow({ WEEKLY_PER_DIEM_NON_TAXED: nexus }));
     assert.equal(out.WEEKLY_PER_DIEM_NON_TAXED, CANADA_NL_DEFAULT_WEEKLY_PER_DIEM, String(nexus));
     assert.equal(out[CANADA_NL_PER_DIEM_DEFAULTED_FLAG], true);
-    assert.equal(out.T4_PAY_RATE, 76.26);
+    assert.equal(out.T4_PAY_RATE, 75.88);
   }
 });
 
@@ -68,18 +68,18 @@ test("a per diem the user edited survives the next sync and recomputes the chain
   const incoming = enrich(nlRow());
   const out = applyCanadaNlPerDiemCarryForward(incoming, storedWithPerDiem(50));
   assert.equal(out.WEEKLY_PER_DIEM_NON_TAXED, 50);
-  // 57.70 * 1.213888 + 50 / 11.25 = 74.49
-  assert.equal(out.T4_PAY_RATE, 74.49);
-  assert.equal(out.FINAL_PAY_RATE, 74.49);
-  assert.equal(out.FINAL_COST, 76.72);
-  assert.equal(out.CALCULATED_MARGIN, 23.28);
-  assert.equal(out.GROSS_MARGIN, 25.51);
+  // 57.70 * 1.2072 + 50 / 11.25 = 74.1
+  assert.equal(out.T4_PAY_RATE, 74.1);
+  assert.equal(out.FINAL_PAY_RATE, 74.1);
+  assert.equal(out.FINAL_COST, 76.32);
+  assert.equal(out.CALCULATED_MARGIN, 23.68);
+  assert.equal(out.GROSS_MARGIN, 25.9);
 });
 
 test("a typed 0 is a deliberate value and is kept too", () => {
   const out = applyCanadaNlPerDiemCarryForward(enrich(nlRow()), storedWithPerDiem(0));
   assert.equal(out.WEEKLY_PER_DIEM_NON_TAXED, 0);
-  assert.equal(out.T4_PAY_RATE, 70.04);
+  assert.equal(out.T4_PAY_RATE, 69.66);
 });
 
 test("the edited row reads as unchanged, so the sync does not append over it", () => {
@@ -95,8 +95,8 @@ test("a genuine Nexus change still appends, carrying the edited per diem", () =>
   assert.equal(hasBusinessColumnChanges(incoming, stored, new Set()), true);
   const { row } = applyManualColumnsCarryForward(incoming, stored);
   assert.equal(row.WEEKLY_PER_DIEM_NON_TAXED, 50);
-  // 60 * 1.213888 + 50 / 11.25 = 77.28
-  assert.equal(row.T4_PAY_RATE, 77.28);
+  // 60 * 1.2072 + 50 / 11.25 = 76.88
+  assert.equal(row.T4_PAY_RATE, 76.88);
 });
 
 test("a real Nexus per diem wins over the stored value", () => {
