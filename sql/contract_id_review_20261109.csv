@@ -1,0 +1,31 @@
+cur_id,legacy_id,deal_start,legacy_initial_start,reason
+CHC23171,CHC21193,2026-04-01,2026-02-02,DEAL start != contract initial start
+CHC23172,CHC21158,2026-04-01,2026-02-02,DEAL start != contract initial start
+CHC23173,CHC22092,2026-05-25,2025-05-27,DEAL start != contract initial start
+CHC23256,CHC23540,2026-09-28,2026-09-28,legacy id also minted
+CHC23445,CHC23478,2026-10-05,2026-10-21,legacy id also minted
+CHC23565,CHC21412,2026-04-01,2026-03-02,DEAL start != contract initial start
+CHC23566,CHC20620,2026-04-01,2026-01-09,DEAL start != contract initial start
+CHC23569,CHC21135,2026-04-01,2026-02-02,DEAL start != contract initial start
+CHC23576,CHC21530,2026-06-14,2026-03-16,DEAL start != contract initial start
+CHC23598,CHC22004,2026-07-05,2026-05-04,DEAL start != contract initial start
+CHC23609,CHC22742,2026-08-03,2026-09-01,DEAL start != contract initial start
+CHC23656,CHC22269,2026-08-17,2026-07-20,DEAL start != contract initial start
+CHC23663,CHC20745,2026-09-21,2025-11-24,DEAL start != contract initial start
+CHC23684,CHC21460,2026-04-01,2026-03-16,DEAL start != contract initial start
+CHC23828,CHC23926,2026-11-02,2026-11-02,legacy id also minted
+CHC23861,CHC23833,2026-06-29,2026-06-29,legacy id also minted
+CHC23862,CHC21756,2026-07-06,2026-04-06,DEAL start != contract initial start
+CHC23865,CHC23844,2026-08-17,2026-08-17,legacy id also minted
+CHC23875,CHC22425,2026-10-04,2026-07-07,DEAL start != contract initial start
+CHC23892,CHC22610,2026-08-04,2026-08-03,DEAL start != contract initial start
+CHC23952,CHC24019,2026-10-19,2026-10-19,legacy id also minted
+CHC23998,CHC23895,2026-10-26,2026-10-26,legacy id also minted
+CHC24011,CHC23748,2026-10-05,2026-10-06,legacy id also minted
+CHC24055,CHC23959,2026-11-02,2026-11-02,legacy id also minted
+CHC24115,CHC23249,2026-09-14,2026-09-14,legacy id also minted
+CHC24133,CHC24171,2026-11-17,2026-11-24,legacy id also minted
+CHC24147,CHC22822,2026-09-07,2026-10-12,DEAL start != contract initial start
+CHC24188,CHC23771,2026-10-12,2026-10-12,legacy id also minted
+CHC24206,CHC23675,2026-10-26,2026-10-26,legacy id also minted
+CHC24207,CHC24110,2026-11-23,2026-11-23,legacy id also minted

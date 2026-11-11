@@ -1308,11 +1308,13 @@ async function fetchRunrateWindowForContractId(contractId, options = {}) {
       ? options.datasetId.trim()
       : config.datasetId;
   const runrateTableId = resolveRunrateTableIdForDealSheetTable(options.tableId);
+  // Same window start as the insert-time match, so a DEAL matched there is not re-minted here.
+  const { windowStartSql } = legacyRunrateWindowStartSql(runrateTableId);
   const sql = `
     SELECT
-      MIN(START_DATE) AS window_start_date,
+      MIN(${windowStartSql}) AS window_start_date,
       MAX(COALESCE(END_DATE, TENTATIVE_END_DATE)) AS window_end_date
-    FROM \`${config.projectId}.${datasetId}.${runrateTableId}\`
+    FROM \`${config.projectId}.${datasetId}.${runrateTableId}\` r
     WHERE UPPER(TRIM(CAST(CONTRACT_ID AS STRING))) = '${escapeSqlString(normalized.toUpperCase())}'
       AND START_DATE IS NOT NULL
       AND COALESCE(END_DATE, TENTATIVE_END_DATE) IS NOT NULL
@@ -4126,6 +4128,37 @@ function buildSpanKeyString(spanKey) {
 }
 
 /**
+ * SQL for where a run-rate row's contract window opens, against alias `r`.
+ *
+ * Health only: the window opens at the contract's INITIAL_START_DATE, not START_DATE. Approving an
+ * extension rewrites the contract's run-rate row in place, so START_DATE becomes the latest
+ * segment's start and the DEAL's own dates fall before the window. Live case (CANDIDATE_ID 23541963
+ * "Linda Anyachebelu", Nov 2026): CHC22241 started 2026-06-08, the 09-13 extension was approved over
+ * it, and DEAL 1458001 (06-08..09-12) then matched nothing and minted CHC23640 — which extension
+ * 1470549 inherited. LEAST guards a bad INITIAL_START_DATE later than the row's own start.
+ * Canada / Locums keep START_DATE until the same case is confirmed there.
+ *
+ * The exact-hit test accepts the contract's initial start (a DEAL) or the latest segment's start
+ * (an extension); outside health it stays the bare START_DATE test so that SQL does not change.
+ *
+ * @param {string} runrateTableId
+ * @returns {{windowStartSql: string, exactStartHitSql: string}}
+ */
+function legacyRunrateWindowStartSql(runrateTableId) {
+  if (runrateTableId !== config.runrateTableId) {
+    return {
+      windowStartSql: "r.START_DATE",
+      exactStartHitSql: "r.START_DATE IN UNNEST(w.probe_dates)",
+    };
+  }
+  const windowStartSql = "LEAST(COALESCE(r.INITIAL_START_DATE, r.START_DATE), r.START_DATE)";
+  return {
+    windowStartSql,
+    exactStartHitSql: `(${windowStartSql} IN UNNEST(w.probe_dates) OR r.START_DATE IN UNNEST(w.probe_dates))`,
+  };
+}
+
+/**
  * Legacy CONTRACT_ID / SKU_NUMBER for brand-new DEAL rows that the run-rate table already knows.
  *
  * Most placements landing here as DEAL_TYPE='DEAL' are not new business — they were already tracked
@@ -4191,6 +4224,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
       : resolveRunrateTableIdForDealSheetTable(options.tableId);
   const runrateFqn = `\`${config.projectId}.${datasetId}.${runrateTableId}\``;
   const includeHierarchy = options.includeHierarchy === true;
+  const { windowStartSql, exactStartHitSql } = legacyRunrateWindowStartSql(runrateTableId);
 
   const keyed = [];
   const nexusKeys = new Set();
@@ -4267,15 +4301,15 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
           w.pc_id AS pc_id,
           r.CONTRACT_ID AS contract_id,
           r.SKU_NUMBER AS sku_number,
-          -- The matched run-rate row is the contract, so its START_DATE is the contract's true
+          -- The matched run-rate row is the contract, so its window start is the contract's true
           -- initial start. A deal sheet splits one contract into several placement-level rows on
           -- every rate / ownership change, and each of those carries its OWN start; taking it from
           -- here keeps every row of the contract on the same INITIAL_START_DATE.
-          r.START_DATE AS initial_start_date,
+          ${windowStartSql} AS initial_start_date,
           -- The matched row's own window, carried out so the per-row guard in the result loop can
           -- check THIS row's dates against it (see legacyWindowCoversAnyOwnDate). The probe dates
           -- are pooled per identity, so a hit here may have been won by a SIBLING row's date.
-          r.START_DATE AS window_start_date,
+          ${windowStartSql} AS window_start_date,
           COALESCE(r.END_DATE, r.TENTATIVE_END_DATE) AS window_end_date,
           ${manualSelect},
           ROW_NUMBER() OVER (
@@ -4299,10 +4333,10 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
             -- discriminator that actually distinguishes them: the real contract spans every one of
             -- the placement's dates, the stub spans one.
             ORDER BY
-              CASE WHEN r.START_DATE IN UNNEST(w.probe_dates) THEN 0 ELSE 1 END ASC,
+              CASE WHEN ${exactStartHitSql} THEN 0 ELSE 1 END ASC,
               (
                 SELECT COUNT(1) FROM UNNEST(w.probe_dates) AS pd
-                WHERE pd BETWEEN r.START_DATE AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE)
+                WHERE pd BETWEEN ${windowStartSql} AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE)
               ) DESC,
               r.START_DATE DESC,
               r.CONTRACT_ID ASC,
@@ -4319,7 +4353,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
          -- The probe column comes from the CROSS JOIN UNNEST in the wanted CTE rather than an EXISTS
          -- subquery, which BigQuery rejects inside a join predicate. One matching probe date is
          -- enough, and the PARTITION BY collapses the duplicate rows a multi-probe hit produces.
-         AND probe BETWEEN r.START_DATE AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE)
+         AND probe BETWEEN ${windowStartSql} AND COALESCE(r.END_DATE, r.TENTATIVE_END_DATE)
          -- Client half: Nexus ids when BOTH sides carry them, else the names. Ids are exact where
          -- names are not — the two tables spell the same facility differently often enough that
          -- 749 candidate/client pairs match by id and fail by name, with none matching by name
@@ -4400,7 +4434,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
           CAST(r.INTERNAL_JOB_ID AS STRING) AS job,
           r.CONTRACT_ID AS contract_id,
           r.SKU_NUMBER AS sku_number,
-          r.START_DATE AS initial_start_date,
+          ${windowStartSql} AS initial_start_date,
           ${manualSelect},
           ROW_NUMBER() OVER (
             PARTITION BY CAST(r.CANDIDATE_ID AS STRING), CAST(r.INTERNAL_JOB_ID AS STRING)
@@ -10072,6 +10106,7 @@ module.exports = {
   fetchMaxContractIdSeqForTable,
   fetchContractIdsForExtensions,
   fetchLegacyContractIdentityForDealRows,
+  legacyRunrateWindowStartSql,
   fetchLocumsRunrateIdentityForDealRows,
   buildLegacyContractLookupKey,
   runrateEntryForResolvedContract,
