@@ -260,6 +260,24 @@ const config = {
     tableId: process.env.DEPARTMENT_DATA_TABLE || "Ph and India",
   },
 
+  /**
+   * AITA candidate webhook (Health only, aitaWebhook.js). Off unless AITA_WEBHOOK_ENABLED=true, so a
+   * deploy never starts sending on its own.
+   */
+  aitaWebhook: {
+    enabled: String(process.env.AITA_WEBHOOK_ENABLED || "").trim().toLowerCase() === "true",
+    url: process.env.AITA_WEBHOOK_URL || "",
+    token: process.env.AITA_WEBHOOK_TOKEN || "",
+    sourceTableId: process.env.AITA_WEBHOOK_SOURCE_TABLE || "cynet_health_deal_sheet",
+    outboxTableId: process.env.AITA_WEBHOOK_OUTBOX_TABLE || "aita_webhook_outbox",
+    knownCandidatesTableId:
+      process.env.AITA_WEBHOOK_KNOWN_CANDIDATES_TABLE || "aita_webhook_known_candidates",
+    timeoutMs: parseInt(process.env.AITA_WEBHOOK_TIMEOUT_MS || "10000", 10),
+    concurrency: parseInt(process.env.AITA_WEBHOOK_CONCURRENCY || "5", 10),
+    maxAttempts: parseInt(process.env.AITA_WEBHOOK_MAX_ATTEMPTS || "5", 10),
+    maxEventsPerRun: parseInt(process.env.AITA_WEBHOOK_MAX_EVENTS_PER_RUN || "200", 10),
+  },
+
   peoplestrong: {
     authUrl:
       process.env.PS_AUTH_URL ||

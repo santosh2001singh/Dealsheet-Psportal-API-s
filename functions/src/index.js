@@ -13,6 +13,8 @@
  * 6. rateChangeLogSyncTrigger — scheduled rate-change logs (BigQuery CONTRACT_ID scan)
  * 7. bulkBackfillByPlacementId — HTTP bulk Nexus backfill (no BQ baseline checks)
  * 8. inorganicHierarchyLogSync — HTTP manual/debug trigger for the audit log scan (see 4.)
+ * 9. aitaWebhookSyncTriggerHealth — scheduled AITA candidate webhook (Health STARTED / ENDED /
+ *    ENDED<30); aitaWebhookSyncHealth is its HTTP twin (dry_run=true to preview)
  */
 
 const { onRequest } = require("firebase-functions/v2/https");
@@ -37,6 +39,7 @@ const { withRunLock } = require("./syncRunLock");
 const { startDateOnOrAfterUtcMin, effectiveMinFilterDate } = require("./columnMappings");
 const { transformOfferRejectedEndedRowsForBigQuery } = require("./offerRejectedRowTransform");
 const { assignNewContractIdForPlacement } = require("./contractIdOverride");
+const { runAitaWebhookSyncHealth } = require("./aitaWebhook");
 const config = require("./config");
 
 admin.initializeApp();
@@ -1344,3 +1347,71 @@ exports.rateChangeLogSyncTrigger = onSchedule(
 // separate schedule — it runs as the last step of dealSheetSyncUpdateTrigger above, right after
 // syncExistingActiveDealSheetUpdatesFromBigQuery, on the same invocation/schedule.
 
+/**
+ * Scheduled: AITA candidate webhook for Health (see aitaWebhook.js).
+ *
+ * :50 past each weekday hour, after the Health insert (:00) and update (:30) triggers have written
+ * that hour's status changes. Reads cynet_health_deal_sheet only, never touches the sync, and is a
+ * no-op until AITA_WEBHOOK_ENABLED=true. One run at a time: two overlapping runs would both see the
+ * same new keys and POST them twice.
+ */
+exports.aitaWebhookSyncTriggerHealth = onSchedule(
+  {
+    schedule: "50 8-19 * * 1-5",
+    timeZone: "America/New_York",
+    region: REGION,
+    timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
+    memory: "512MiB",
+  },
+  async (event) => {
+    logLine(
+      `[aitaWebhookSyncTriggerHealth] Gen2 onSchedule region=${REGION} scheduleTime=${event.scheduleTime || "n/a"} jobName=${event.jobName || "n/a"}`
+    );
+    return withTimingAsync("aitaWebhookSyncTriggerHealth", async () => {
+      const { ran, result } = await withRunLock(
+        "aita-webhook-health",
+        { label: "aitaWebhookSyncTriggerHealth" },
+        () => runAitaWebhookSyncHealth()
+      );
+      if (!ran) {
+        logLine("[aitaWebhookSyncTriggerHealth] SKIPPED: previous run still in progress");
+        return { skipped: true, reason: "run already in progress" };
+      }
+      return result;
+    });
+  }
+);
+
+/**
+ * HTTP: manual AITA webhook run for Health. ?dry_run=true returns the events a run would send
+ * without POSTing or writing the outbox.
+ */
+exports.aitaWebhookSyncHealth = onRequest(
+  {
+    region: REGION,
+    timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
+    memory: "512MiB",
+  },
+  async (req, res) => {
+    const dryRun = String(req.query?.dry_run || "").trim().toLowerCase() === "true";
+    try {
+      if (dryRun) {
+        res.status(200).json({ success: true, result: await runAitaWebhookSyncHealth({ dryRun }) });
+        return;
+      }
+      const { ran, result } = await withRunLock(
+        "aita-webhook-health",
+        { label: "aitaWebhookSyncHealth" },
+        () => runAitaWebhookSyncHealth({ dryRun })
+      );
+      if (!ran) {
+        res.status(409).json({ success: false, error: "run already in progress" });
+        return;
+      }
+      res.status(200).json({ success: true, result });
+    } catch (error) {
+      logError("[aitaWebhookSyncHealth] FAILED", error);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
