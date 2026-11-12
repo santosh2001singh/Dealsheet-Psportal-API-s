@@ -57,6 +57,7 @@ const {
 const { computeBonusTotals } = require("../bonusTotals");
 const { computeWeekSplit } = require("../weekSplit");
 const { computeNewRateFamily } = require("../w2PayRateNew");
+const { getBillingOvertimeLabel } = require("../billingOvertime");
 const {
   sanitizeCanadaDealSheetRow,
   isCanadaDealSheetRow,
@@ -434,6 +435,8 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
   }
 
   const fetchTerminationDetails = options?.fetchTerminationDetails === true;
+  // Off for the ended-table sync: billing overtime applies to the active cynet health table only.
+  const applyBillingOvertime = options?.applyBillingOvertime !== false;
 
   const allowedSubmittalCodesCsv =
     options && String(options.allowedSubmittalCodes || "").trim()
@@ -988,7 +991,6 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
 
     const dealSheetPart = mapDealSheetDetailToBq(detail);
     const hoursRow = hoursByDs.get(String(dealSheetId)) ?? null;
-    const hoursPart = mapDealSheetHoursDetailsToBq(hoursRow, clientStateNorm);
     const revenueRow = revByDs.get(String(dealSheetId)) ?? null;
     const addCostRows = additionalCostsByDs.get(String(dealSheetId)) ?? [];
     const travelRows = travelAllowancesByDs.get(String(dealSheetId)) ?? [];
@@ -1059,6 +1061,14 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       CLIENT_STATE: clientStateNorm,
     };
     const isLocumsRecruiter = isLocumsDealSheetRow(locumsIdentity);
+    // Active cynet health only: any billing overtime on the submittal fills REGULAR_HOURS_* and
+    // switches the NEW-rate family to the regular-hours split, the same as a CA / AK placement.
+    // Canada, locums and every ended table keep the state rule and carry no OVERTIME_ID / OVERTIME.
+    const healthOvertimeId = !applyBillingOvertime || isCanadaRecruiter || isLocumsRecruiter
+      ? null
+      : submittalPart?.OVERTIME_ID ?? null;
+    const hoursPart = mapDealSheetHoursDetailsToBq(hoursRow, clientStateNorm, healthOvertimeId);
+    const overtimeLabel = await getBillingOvertimeLabel(healthOvertimeId, accessToken);
     // Built here rather than with the other parts above because the target column depends on the
     // row: Locums takes hourly revenue in GROSS_MARGIN, every other division in MARGIN.
     const revenuePart = mapDealSheetRevenueDetailsToBq(revenueRow, locumsIdentity);
@@ -1153,6 +1163,8 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       // CLIENT_TYPE / TYPE_OF_CLIENT are intentionally absent: manual columns since Aug 2026,
       // carried forward from the baseline row by applyManualColumnsCarryForward.
       LINE_OF_BUSINESS: lineOfBusiness,
+      OVERTIME_ID: healthOvertimeId,
+      OVERTIME: overtimeLabel,
       START_DATE: startDates.START_DATE,
       OFFER_TIME_START_DATE: startDates.OFFER_TIME_START_DATE,
       // DID NOT ACCEPT: END_DATE = the job-based START_DATE here, before DAYS_WORKED is derived below.

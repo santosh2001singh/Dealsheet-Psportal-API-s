@@ -13,7 +13,7 @@ const {
   computeLocumsDerivedPlacementFields,
 } = require("./locumsDerivedPlacementFields");
 const { normalizeContractIdOrNull } = require("./contractIdFormat");
-const { usesRegularHoursOtSplit } = require("./w2PayRateNew");
+const { usesRegularHoursOtSplit, normalizeOvertimeId } = require("./w2PayRateNew");
 
 /**
  * Convert value to number or null
@@ -680,11 +680,11 @@ function mapJobProfessionSpecialtyFromJob(job) {
  * Map deal sheet hours details to BigQuery schema.
  * SCHEDULE_HOURS_1 / SCHEDULE_HOURS_2 default to 0 when source value is null/blank
  * so BigQuery always stores a number (not NULL).
- * REGULAR_HOURS_* are populated when clientState is CA or AK (regular-hours OT split);
- * all other states (and blank/null state) get 0 for those two columns.
+ * REGULAR_HOURS_* are populated when clientState is CA or AK, or the submittal carries a billing
+ * overtime (regular-hours OT split); everything else (and blank/null state) gets 0 for those two.
  */
-function mapDealSheetHoursDetailsToBq(hoursRow, clientState) {
-  const useRegularHours = usesRegularHoursOtSplit(clientState);
+function mapDealSheetHoursDetailsToBq(hoursRow, clientState, overtimeId = null) {
+  const useRegularHours = usesRegularHoursOtSplit(clientState, overtimeId);
 
   if (!hoursRow) {
     return {
@@ -1423,6 +1423,8 @@ function mapJobSubmittalToBq(submittalRow, jobObj) {
     START_DATE: startDate,
     TENTATIVE_END_DATE: tentativeDate,
     END_DATE: computeBqEndDateFromSubmittal(submittalRow, jobObj || null),
+    // /api/billing-overtimes/ id; any id switches the NEW-rate family to the regular-hours split.
+    OVERTIME_ID: normalizeOvertimeId(submittalRow?.overtime),
   };
 }
 
@@ -1905,6 +1907,9 @@ const API_OWNED_COLUMNS = new Set([
   "SCHEDULE_HOURS_2",
   "REGULAR_HOURS_1",
   "REGULAR_HOURS_2",
+  // Submittal billing overtime (id + /api/billing-overtimes/ label). Cynet Health only.
+  "OVERTIME_ID",
+  "OVERTIME",
   "MARGIN",
   "ADDITIONAL_BONUS",
   "RATE_CHANGE",

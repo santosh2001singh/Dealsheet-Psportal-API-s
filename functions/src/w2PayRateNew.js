@@ -29,12 +29,27 @@ function parseBillableOrientationFraction(value) {
 }
 
 /**
- * CA and AK use REGULAR_HOURS_1/2 vs schedule hours for the NEW-rate OT split.
+ * Submittal `overtime` (a /api/billing-overtimes/ id) as a positive integer, else null.
+ * @param {*} overtimeId
+ * @returns {number|null}
+ */
+function normalizeOvertimeId(overtimeId) {
+  if (overtimeId == null || String(overtimeId).trim() === "") return null;
+  const n = Number(overtimeId);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/**
+ * CA and AK use REGULAR_HOURS_1/2 vs schedule hours for the NEW-rate OT split, and so does any
+ * placement whose submittal carries a billing overtime (business rule, Nov 2026: any id at all —
+ * "After 40 Hours", "Never", custom — since the deal sheet's regular hours already reflect it).
  * All other states use the 40-hour weekly OT threshold.
  * @param {string|null|undefined} clientState
+ * @param {*} [overtimeId] submittal `overtime` / row OVERTIME_ID
  * @returns {boolean}
  */
-function usesRegularHoursOtSplit(clientState) {
+function usesRegularHoursOtSplit(clientState, overtimeId = null) {
+  if (normalizeOvertimeId(overtimeId) != null) return true;
   const s = clientState == null ? "" : String(clientState).trim().toUpperCase();
   return s === "CA" || s === "AK";
 }
@@ -47,7 +62,7 @@ function computeW2PayRateNew(row) {
   if (placement === "") return { W2_PAY_RATE_NEW: null };
   if (placement === "FT" || placement === "INTERNAL") return { W2_PAY_RATE_NEW: 0 };
 
-  const useRegularHours = usesRegularHoursOtSplit(row?.CLIENT_STATE);
+  const useRegularHours = usesRegularHoursOtSplit(row?.CLIENT_STATE, row?.OVERTIME_ID);
 
   const sh1 = toNumberOrZero(row?.SCHEDULE_HOURS_1);
   const sh2 = toNumberOrZero(row?.SCHEDULE_HOURS_2);
@@ -126,7 +141,7 @@ function computeFinalBillRateNew(row) {
   const fwh = toNumberOrZero(row?.FIRST_WEEK_HOURS);
   const swh = toNumberOrZero(row?.SECOND_WEEK_HOURS);
 
-  const useRegularHours = usesRegularHoursOtSplit(row?.CLIENT_STATE);
+  const useRegularHours = usesRegularHoursOtSplit(row?.CLIENT_STATE, row?.OVERTIME_ID);
 
   const gross = useRegularHours
     ? rh1 * fwh * br
@@ -174,6 +189,7 @@ function computeNewRateFamily(row) {
 }
 
 module.exports = {
+  normalizeOvertimeId,
   usesRegularHoursOtSplit,
   computeW2PayRateNew,
   computeFinalPayRateNew,

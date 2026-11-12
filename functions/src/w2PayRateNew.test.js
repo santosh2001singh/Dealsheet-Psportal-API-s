@@ -285,3 +285,44 @@ test("computeNewMargin returns null when bill rate or cost is null", () => {
   assert.equal(computeNewMargin(row, null, 80), null);
   assert.equal(computeNewMargin(row, 100, null), null);
 });
+
+test("usesRegularHoursOtSplit: any submittal billing overtime id switches to regular hours", () => {
+  assert.equal(usesRegularHoursOtSplit("NY", 3), true);
+  assert.equal(usesRegularHoursOtSplit("NY", "8"), true);
+  assert.equal(usesRegularHoursOtSplit("NY", null), false);
+  assert.equal(usesRegularHoursOtSplit("NY", ""), false);
+  assert.equal(usesRegularHoursOtSplit("NY", 0), false);
+  assert.equal(usesRegularHoursOtSplit("CA", null), true);
+});
+
+test("mapDealSheetHoursDetailsToBq keeps regular hours for a non-CA/AK row with overtime", () => {
+  const hours = { total_assignment_hrs: 468, scheduled_hrs_1: 36, scheduled_hrs_2: 36, regular_hrs_1: 24, regular_hrs_2: 24 };
+  const withOt = mapDealSheetHoursDetailsToBq(hours, "NY", 1);
+  assert.equal(withOt.REGULAR_HOURS_1, 24);
+  assert.equal(withOt.REGULAR_HOURS_2, 24);
+  const noOt = mapDealSheetHoursDetailsToBq(hours, "NY", null);
+  assert.equal(noOt.REGULAR_HOURS_1, 0);
+  assert.equal(noOt.REGULAR_HOURS_2, 0);
+});
+
+test("computeNewRateFamily: NY row with OVERTIME_ID matches the same row in CA", () => {
+  const base = {
+    PLACEMENT_TYPE: "TRAVEL",
+    SCHEDULE_HOURS_1: 36, SCHEDULE_HOURS_2: 36,
+    REGULAR_HOURS_1: 24, REGULAR_HOURS_2: 24,
+    FIRST_WEEK_HOURS: 6.5, SECOND_WEEK_HOURS: 6.5,
+    PAY_RATE: 40, OT_RATE: 60, BILL_RATE: 100, CLIENT_OT_RATE: 150,
+    CLIENT_MSP_FEE: 0.03, PO_HOURS: 468, NBO_HOURS: 0,
+  };
+  const ny = computeNewRateFamily({ ...base, CLIENT_STATE: "NY", OVERTIME_ID: 1 });
+  const ca = computeNewRateFamily({ ...base, CLIENT_STATE: "CA" });
+  const nyNoOt = computeNewRateFamily({ ...base, CLIENT_STATE: "NY" });
+  assert.deepEqual(ny, ca);
+  assert.notDeepEqual(ny, nyNoOt);
+});
+
+test("mapJobSubmittalToBq carries the submittal billing overtime id", () => {
+  const { mapJobSubmittalToBq } = require("./columnMappings");
+  assert.equal(mapJobSubmittalToBq({ id: 1474462, overtime: 3 }, null).OVERTIME_ID, 3);
+  assert.equal(mapJobSubmittalToBq({ id: 1474462, overtime: null }, null).OVERTIME_ID, null);
+});

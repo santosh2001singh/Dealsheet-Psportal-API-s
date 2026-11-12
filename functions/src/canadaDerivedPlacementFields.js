@@ -485,6 +485,9 @@ const CANADA_EXCLUDED_API_OWNED_COLUMNS = new Set([
   "ASSOCIATE_SALES_PERSON",
   // Candidate referrer — added for Cynet Health only (Oct 2026)
   "SOURCER_NAME",
+  // Submittal billing overtime — Cynet Health only (Nov 2026)
+  "OVERTIME_ID",
+  "OVERTIME",
 ]);
 Object.freeze(CANADA_EXCLUDED_API_OWNED_COLUMNS);
 

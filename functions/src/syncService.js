@@ -2102,6 +2102,8 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
         fetchTerminationDetails: true,
         // Locums alone fetches job rates, to fill the client-side codes its deal sheets omit.
         syncDomain,
+        // Billing overtime is for the active cynet health table only, never an ended table.
+        applyBillingOvertime: !useEndedDomainRouting && !/ended/i.test(effectiveTableId),
       });
     // Domain-scoped run: drop rows belonging to the other domains before anything touches BigQuery,
     // so a canada/locums run can never write to (or allocate ids against) cynet health.
