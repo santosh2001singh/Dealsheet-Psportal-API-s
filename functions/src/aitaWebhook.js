@@ -310,8 +310,11 @@ async function countOutboxRows(settings, deps) {
 }
 
 /**
- * Go-live snapshot, pure SQL: every CANDIDATE_ID already in the table becomes "known" (never sent), and
- * every current in-scope key is recorded as `baseline` (no payload, never sent).
+ * Go-live snapshot, pure SQL: every CANDIDATE_ID that has already WORKED (a STARTED / ENDED / ENDED<30
+ * row) becomes "known" (never sent), and every current in-scope key is recorded as `baseline` (no
+ * payload, never sent). Candidates whose deal sheet exists but has not started yet are NOT known — they
+ * are new hires and their first STARTED must go out (bug fixed Nov 16 2026: seeding every CANDIDATE_ID
+ * silently blocked new hires whose deal sheet was created before go-live).
  */
 async function seedBaseline(settings, deps) {
   const dml = deps.runDml || runDml;
@@ -320,6 +323,7 @@ async function seedBaseline(settings, deps) {
     SELECT DISTINCT CANDIDATE_ID, CURRENT_TIMESTAMP()
     FROM ${fqn(settings, settings.sourceTableId)}
     WHERE CANDIDATE_ID IS NOT NULL
+      AND UPPER(TRIM(PLACEMENT_STATUS)) IN (${AITA_PLACEMENT_STATUSES.map((s) => `'${s}'`).join(", ")})
       AND CANDIDATE_ID NOT IN (SELECT CANDIDATE_ID FROM ${fqn(settings, settings.knownCandidatesTableId)})`);
   return dml(`
     INSERT INTO ${fqn(settings, settings.outboxTableId)}
@@ -384,11 +388,14 @@ async function insertOutboxEvents(events, settings, deps) {
 async function recordAttempts(results, settings, deps) {
   if (results.length === 0) return 0;
   const dml = deps.runDml || runDml;
+  // Every field is CAST: a bare NULL in a STRUCT literal is typed INT64 by BigQuery, so an all-success
+  // batch (LAST_ERROR NULL on every row) failed with "INT64 cannot be assigned to LAST_ERROR" (Nov 16 2026).
   const rows = results
     .map(
       (r) =>
-        `STRUCT(${sqlStr(r.eventKey)} AS EVENT_KEY, ${sqlStr(r.state)} AS STATE, ${sqlInt(r.attempts)} AS ATTEMPTS, ` +
-        `${sqlInt(r.httpStatus)} AS LAST_HTTP_STATUS, ${sqlStr(r.error)} AS LAST_ERROR)`
+        `STRUCT(CAST(${sqlStr(r.eventKey)} AS STRING) AS EVENT_KEY, CAST(${sqlStr(r.state)} AS STRING) AS STATE, ` +
+        `CAST(${sqlInt(r.attempts)} AS INT64) AS ATTEMPTS, CAST(${sqlInt(r.httpStatus)} AS INT64) AS LAST_HTTP_STATUS, ` +
+        `CAST(${sqlStr(r.error)} AS STRING) AS LAST_ERROR)`
     )
     .join(",\n");
   return dml(`
