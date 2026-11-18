@@ -76,20 +76,20 @@ test("a null or non-object row is never locums", () => {
 test("a GOV-desk row takes the locums derivations, not health's", () => {
   const out = computeDerivedPlacementFields(GOV_ROW);
   assert.equal("CALCULATED_MARGIN" in out, true, "locums fills CALCULATED_MARGIN");
-  // ...and must NOT emit GROSS_MARGIN, which is the API's hourly_revenue on this table.
-  assert.equal("GROSS_MARGIN" in out, false, "computing it would clobber Nexus's figure");
+  // Since Nov 2026 locums computes the sheet's GROSS_MARGIN; MARGIN stays Nexus's hourly_revenue.
+  assert.equal("GROSS_MARGIN" in out, true);
   assert.equal("MARGIN" in out, false);
   assert.equal("NET_MARGIN" in out, false);
 });
 
-test("Nexus's hourly revenue reaches GROSS_MARGIN on a GOV-desk row", () => {
-  // The live payload for deal sheet 5161506.
+test("Nexus's hourly revenue reaches MARGIN on a GOV-desk row", () => {
+  // The live payload for deal sheet 5161506. Nov 2026: locums takes it in MARGIN, as health does.
   const out = mapDealSheetRevenueDetailsToBq(
     { hourly_revenue: 250.25, gross_margin_percentage: 100 },
     GOV_ROW
   );
-  assert.equal(out.GROSS_MARGIN, 250.25);
-  assert.equal(out.MARGIN, undefined, "the locums table has no MARGIN column");
+  assert.equal(out.MARGIN, 250.25);
+  assert.equal(out.GROSS_MARGIN, undefined);
 });
 
 test("the sanitizer strips the *_NEW family from a GOV-desk row", () => {

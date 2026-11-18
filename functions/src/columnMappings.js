@@ -706,19 +706,13 @@ function mapDealSheetHoursDetailsToBq(hoursRow, clientState, overtimeId = null) 
 /**
  * Map deal sheet revenue details to BigQuery schema
  */
-function mapDealSheetRevenueDetailsToBq(revenueRow, locumsRow) {
+function mapDealSheetRevenueDetailsToBq(revenueRow) {
   if (!revenueRow) return {};
-  // MARGIN is the deal sheet's hourly revenue straight from the API — not a computed margin.
-  // (Canada relies on this: its derived step fills CALCULATED_MARGIN and leaves MARGIN alone.)
+  // MARGIN is the deal sheet's hourly revenue straight from the API — not a computed margin. Every
+  // division takes it here, Locums included since Nov 2026 (same as Cynet Health): Locums'
+  // GROSS_MARGIN is now the sheet's computed gross margin, and CALCULATED_MARGIN the sheet's MARGIN.
   const hourlyRevenue = toNumberOrNull(revenueRow.hourly_revenue);
   const gpPercentage = toNumberOrNull(revenueRow.gross_margin_percentage);
-  // Locums retired MARGIN in favour of Canada's naming: the same hourly revenue lands in
-  // GROSS_MARGIN, while its derived step fills CALCULATED_MARGIN. Keyed on the ROW, so a GOV-desk
-  // row (@cynethealth.com with OFFERING=LOCUMS) puts its revenue in the same column as the rest of
-  // the locums table rather than in a MARGIN column that table no longer has.
-  if (isLocumsDealSheetRow(locumsRow)) {
-    return { GP_PERCENTAGE: gpPercentage, GROSS_MARGIN: hourlyRevenue };
-  }
   return { GP_PERCENTAGE: gpPercentage, MARGIN: hourlyRevenue };
 }
 
@@ -1930,6 +1924,7 @@ const API_OWNED_COLUMNS = new Set([
   "FINAL_COST",
   "FINAL_OT_PAY_RATE",
   "FINAL_HOLIDAY_PAY_RATE",
+  "FINAL_DT_PAY_RATE",
   "FINAL_CALL_BACK_PAY_RATE",
   "NET_MARGIN",
   "GROSS_MARGIN",

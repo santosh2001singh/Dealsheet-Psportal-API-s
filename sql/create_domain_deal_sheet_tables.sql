@@ -306,6 +306,13 @@ ALTER TABLE `cynetdatabase.rr_project_data.cynet_locums_deal_sheet`
   ADD COLUMN IF NOT EXISTS FINAL_HOLIDAY_PAY_RATE FLOAT64,
   ADD COLUMN IF NOT EXISTS FINAL_CALL_BACK_PAY_RATE FLOAT64;
 
+-- Nov 2026: Locums margins follow Cynet Health — MARGIN = Nexus hourly_revenue, GROSS_MARGIN = the
+-- sheet's computed gross margin, CALCULATED_MARGIN = the sheet's MARGIN. FINAL_DT_PAY_RATE added
+-- with the sheet's DT formula. Applied 2026-11-18.
+ALTER TABLE `cynetdatabase.rr_project_data.cynet_locums_deal_sheet`
+  ADD COLUMN IF NOT EXISTS MARGIN FLOAT64,
+  ADD COLUMN IF NOT EXISTS FINAL_DT_PAY_RATE FLOAT64;
+
 -- Locums-only: manual loading fraction (0.15 = 15%) that replaces the FINAL_PAY_RATE burden ladder
 -- with (1 + value). Entered by hand in the tool, so the sync treats it as a MANUAL_COLUMN.
 ALTER TABLE `cynetdatabase.rr_project_data.cynet_locums_deal_sheet`

@@ -1069,9 +1069,7 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
       : submittalPart?.OVERTIME_ID ?? null;
     const hoursPart = mapDealSheetHoursDetailsToBq(hoursRow, clientStateNorm, healthOvertimeId);
     const overtimeLabel = await getBillingOvertimeLabel(healthOvertimeId, accessToken);
-    // Built here rather than with the other parts above because the target column depends on the
-    // row: Locums takes hourly revenue in GROSS_MARGIN, every other division in MARGIN.
-    const revenuePart = mapDealSheetRevenueDetailsToBq(revenueRow, locumsIdentity);
+    const revenuePart = mapDealSheetRevenueDetailsToBq(revenueRow);
     const hoursPartForRow = isCanadaRecruiter ? pickCanadaDealSheetHoursPart(hoursPart) : hoursPart;
     const bonusTotalsPart = isCanadaRecruiter
       ? {}

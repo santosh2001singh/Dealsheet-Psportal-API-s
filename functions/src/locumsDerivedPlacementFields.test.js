@@ -91,7 +91,7 @@ test("margins: net and gross from bill rate minus pay/cost", () => {
   assert.equal(out.FINAL_PAY_RATE, 109);
   assert.equal(out.FINAL_COST, 109);
   assert.equal(out.CALCULATED_MARGIN, 40.19);
-  // MARGIN is retired on Locums: GROSS_MARGIN carries Nexus's hourly revenue instead.
+  // MARGIN is Nexus's hourly revenue, never derived here.
   assert.equal("MARGIN" in out, false);
   assert.equal("NET_MARGIN" in out, false);
 });
@@ -150,9 +150,38 @@ test("Gainwell exception uses final bill rate for W2 and final pay", () => {
     START_DATE: "2025-01-01",
   }));
   assert.equal(out.FINAL_BILL_RATE, 200);
+  // TYPE is 1099 (not blank), so the sheet's Gainwell rule does not apply -> normal 1099 formula.
+  assert.equal(out.W2_PAY_RATE, 150);
+  assert.equal(out.FINAL_PAY_RATE, 163.5);
+  assert.equal(out.ENTITY, "Locum");
+});
+
+test("W2 Gainwell rule keys on blank TYPE, even when ENTITY is Locum", () => {
+  const out = computeLocumsDerivedPlacementFields(baseRow({
+    ENTITY: "Locum",
+    PARENT_CLIENT_NAME: "Gainwell Technologies",
+    SPECIALTY: "CRNA",
+    BILL_RATE: 200,
+    CLIENT_MSP_FEE: 0,
+    PAY_RATE: 150,
+    PAYMENT_TYPE: null,
+    START_DATE: "2025-01-01",
+  }));
   assert.equal(out.W2_PAY_RATE, 200);
   assert.equal(out.FINAL_PAY_RATE, 200);
-  assert.equal(out.ENTITY, "Locum");
+});
+
+test("W2 Gainwell rule skips Dentist", () => {
+  const out = computeLocumsDerivedPlacementFields(baseRow({
+    PARENT_CLIENT_NAME: "Gainwell Technologies",
+    SPECIALTY: "Dentist",
+    BILL_RATE: 200,
+    CLIENT_MSP_FEE: 0,
+    PAY_RATE: 100,
+    PAYMENT_TYPE: null,
+    START_DATE: "2025-01-01",
+  }));
+  assert.notEqual(out.W2_PAY_RATE, 200);
 });
 
 test("sanitizeLocumsDealSheetRow strips NEW rate family columns", () => {
@@ -332,7 +361,7 @@ test("a blank-string LOADING_COST_EXCEPTION falls back to the ladder", () => {
 
 test("Gainwell exception outranks LOADING_COST_EXCEPTION", () => {
   const out = computeLocumsDerivedPlacementFields(loadingRow({
-    ENTITY: "",
+    PAYMENT_TYPE: null,
     PARENT_CLIENT_NAME: "Gainwell Technologies",
     SPECIALTY: "CRNA",
     LOADING_COST_EXCEPTION: 0.15,
@@ -358,14 +387,39 @@ test("blank PAYMENT_TYPE: DP still moves CALCULATED_MARGIN", () => {
   assert.notEqual(withDp.CALCULATED_MARGIN, withoutDp.CALCULATED_MARGIN);
 });
 
-test("the derived step writes CALCULATED_MARGIN and never MARGIN / NET_MARGIN", () => {
-  // GROSS_MARGIN is Nexus's hourly_revenue (mapDealSheetRevenueDetailsToBq), so the derived step
-  // must leave it alone too — otherwise the API figure would be overwritten on every sync.
+test("the derived step writes CALCULATED_MARGIN + GROSS_MARGIN and never MARGIN / NET_MARGIN", () => {
+  // MARGIN is Nexus's hourly_revenue (mapDealSheetRevenueDetailsToBq), so the derived step must
+  // leave it alone — otherwise the API figure would be overwritten on every sync.
   const out = computeLocumsDerivedPlacementFields(loadingRow());
   assert.equal("CALCULATED_MARGIN" in out, true);
+  assert.equal("GROSS_MARGIN" in out, true);
   assert.equal("MARGIN" in out, false);
   assert.equal("NET_MARGIN" in out, false);
-  assert.equal("GROSS_MARGIN" in out, false);
+});
+
+test("GROSS_MARGIN follows the sheet: TYPE blank uses W2, 1099 uses FINAL PAY, FT is 0", () => {
+  const blank = computeLocumsDerivedPlacementFields(baseRow({
+    PLACEMENT_TYPE: "CT", PAYMENT_TYPE: null, BILL_RATE: 200, CLIENT_MSP_FEE: 0,
+    PAY_RATE: 100, SCHEDULE_HOURS_1: 40, PROJECT_DURATION: 13, START_DATE: "2025-01-01",
+  }));
+  assert.equal(blank.W2_PAY_RATE, 114);
+  assert.equal(blank.GROSS_MARGIN, 86);
+  const t1099 = computeLocumsDerivedPlacementFields(baseRow({
+    PLACEMENT_TYPE: "CT", PAYMENT_TYPE: "1099", BILL_RATE: 200, CLIENT_MSP_FEE: 0,
+    PAY_RATE: 100, START_DATE: "2025-01-01",
+  }));
+  assert.equal(t1099.GROSS_MARGIN, 91);
+  const ft = computeLocumsDerivedPlacementFields(baseRow({ PLACEMENT_TYPE: "FT", BILL_RATE: 200 }));
+  assert.equal(ft.GROSS_MARGIN, 0);
+});
+
+test("FINAL_DT_PAY_RATE follows the Holiday rule on DT_RATE", () => {
+  const out = computeLocumsDerivedPlacementFields(baseRow({
+    PLACEMENT_TYPE: "CT", PAYMENT_TYPE: "1099", DT_RATE: 200,
+  }));
+  assert.equal(out.FINAL_DT_PAY_RATE, 218);
+  const ft = computeLocumsDerivedPlacementFields(baseRow({ PLACEMENT_TYPE: "FT", DT_RATE: 200 }));
+  assert.equal(ft.FINAL_DT_PAY_RATE, null);
 });
 
 test("LOADING_COST_EXCEPTION is a manual column so the sync never blanks it", () => {
@@ -416,4 +470,52 @@ test("GM_OT is blank unless BOTH rates are non-zero", () => {
       JSON.stringify(over)
     );
   }
+});
+
+test("premium rates: LOADING_COST_EXCEPTION replaces 1.09 on 1099", () => {
+  const out = computeLocumsDerivedPlacementFields(baseRow({
+    PLACEMENT_TYPE: "CT",
+    PAYMENT_TYPE: "1099",
+    OT_RATE: 100,
+    HOLIDAY_RATE: 200,
+    CALL_BACK_RATE: 50,
+    LOADING_COST_EXCEPTION: 0.15,
+  }));
+  assert.equal(out.FINAL_OT_PAY_RATE, 115);
+  assert.equal(out.FINAL_HOLIDAY_PAY_RATE, 230);
+  assert.equal(out.FINAL_CALL_BACK_PAY_RATE, 57.5);
+});
+
+test("premium rates: LOADING_COST_EXCEPTION 0 means no loading on 1099", () => {
+  const out = computeLocumsDerivedPlacementFields(baseRow({
+    PLACEMENT_TYPE: "CT",
+    PAYMENT_TYPE: "1099",
+    OT_RATE: 100,
+    LOADING_COST_EXCEPTION: 0,
+  }));
+  assert.equal(out.FINAL_OT_PAY_RATE, 100);
+});
+
+test("premium rates: Gainwell stays 1.23 even with LOADING_COST_EXCEPTION", () => {
+  const out = computeLocumsDerivedPlacementFields(baseRow({
+    PLACEMENT_TYPE: "CT",
+    PAYMENT_TYPE: null,
+    PARENT_CLIENT_NAME: "Gainwell Technologies",
+    OT_RATE: 100,
+    LOADING_COST_EXCEPTION: 0.15,
+  }));
+  assert.equal(out.FINAL_OT_PAY_RATE, 123);
+});
+
+test("premium rates: C2C takes 1.09 on Holiday and Call Back but not OT", () => {
+  const out = computeLocumsDerivedPlacementFields(baseRow({
+    PLACEMENT_TYPE: "CT",
+    PAYMENT_TYPE: "C2C",
+    OT_RATE: 100,
+    HOLIDAY_RATE: 100,
+    CALL_BACK_RATE: 100,
+  }));
+  assert.equal(out.FINAL_OT_PAY_RATE, null);
+  assert.equal(out.FINAL_HOLIDAY_PAY_RATE, 109);
+  assert.equal(out.FINAL_CALL_BACK_PAY_RATE, 109);
 });

@@ -96,11 +96,16 @@ function isTypeBlank(row) {
   return String(typeVal).trim() === "";
 }
 
+/**
+ * Gainwell rule for W2 PAY RATE and FINAL PAY RATE, from the sheet (Nov 2026):
+ *   (CL="")*(Z="Gainwell Technologies")*(W<>"Dentist") -> AM (FINAL BILL RATE)
+ * CL is TYPE (PAYMENT_TYPE), not ENTITY. The old ENTITY test never fired on locums rows anyway,
+ * since every locums row is stamped ENTITY = "Locum".
+ */
 function isGainwellException(row) {
-  const entity = row?.ENTITY == null ? "" : String(row.ENTITY).trim();
   const parent = row?.PARENT_CLIENT_NAME == null ? "" : String(row.PARENT_CLIENT_NAME).trim();
   const position = row?.SPECIALTY == null ? "" : String(row.SPECIALTY).trim().toUpperCase();
-  return entity === "" && parent === "Gainwell Technologies" && position !== "DENTIST";
+  return isTypeBlank(row) && parent === "Gainwell Technologies" && position !== "DENTIST";
 }
 
 function spanBase(scheduleHours1, initialWeeks) {
@@ -266,11 +271,8 @@ function computeLocumsFinalCost(finalPayRate) {
 }
 
 /**
- * CALCULATED_MARGIN = FINAL_BILL_RATE - FINAL_COST.
- *
- * The sheet calls this "Net Margin", but the Locums table now follows the Canada naming: the
- * computed figure lives in CALCULATED_MARGIN, and GROSS_MARGIN carries Nexus's own hourly_revenue
- * (see mapDealSheetRevenueDetailsToBq). FT placements are 0.
+ * CALCULATED_MARGIN = FINAL_BILL_RATE - FINAL_COST — the sheet's MARGIN column (AN).
+ * FT placements are 0. Nexus's hourly_revenue goes to MARGIN (see mapDealSheetRevenueDetailsToBq).
  */
 function computeLocumsCalculatedMargin(row, finalBillRate, finalCost) {
   const placementType = row?.PLACEMENT_TYPE == null ? "" : String(row.PLACEMENT_TYPE).trim().toUpperCase();
@@ -281,13 +283,9 @@ function computeLocumsCalculatedMargin(row, finalBillRate, finalCost) {
 }
 
 /**
- * The sheet's gross margin: FINAL_BILL_RATE minus the pay figure that applies to this row.
- *
- * NOT written to GROSS_MARGIN — that column holds Nexus's hourly_revenue. Kept because the value is
- * still the sheet's own gross margin; it is no longer stored, so the derived step leaves both
- * GROSS_MARGIN and the retired MARGIN column alone.
+ * GROSS_MARGIN — the sheet's GROSS MARGIN column (AO), as on Cynet Health (Nov 2026):
+ *   FT -> 0; TYPE blank -> FINAL_BILL_RATE - W2_PAY_RATE; else FINAL_BILL_RATE - FINAL_PAY_RATE.
  */
-// eslint-disable-next-line no-unused-vars
 function computeLocumsSheetGrossMargin(row, finalBillRate, w2PayRate, finalPayRate) {
   const placementType = row?.PLACEMENT_TYPE == null ? "" : String(row.PLACEMENT_TYPE).trim().toUpperCase();
   if (placementType === "FT") return 0;
@@ -357,13 +355,27 @@ function isGainwellParentClient(row) {
   return parent === "Gainwell Technologies";
 }
 
+function isTypeC2C(row) {
+  const typeVal = row?.PAYMENT_TYPE;
+  if (typeVal == null) return false;
+  return String(typeVal).trim().toUpperCase() === "C2C";
+}
+
 /**
- * Locumns FINAL_*_PAY_RATE burden on pay-side base rates (OT / Holiday / Call Back).
+ * Locumns FINAL_*_PAY_RATE burden on pay-side base rates (OT / Holiday / Call Back), per the sheet
+ * (Nov 2026):
+ *   A="" -> "", A="INTERNAL"/"FT" -> NA,
+ *   CL=1099 -> base x IF(DP<>"", 1+DP, 1.09),
+ *   CL="C2C" -> same as 1099 (Holiday / DT / Call Back only — the OT formula has no C2C branch),
+ *   Z="Gainwell Technologies" -> base x 1.23,
+ *   else NA.
+ * DP is LOADING_COST_EXCEPTION; it only replaces the 1.09, never the Gainwell 1.23.
  * @param {Record<string, *>} row
  * @param {unknown} baseRateRaw
+ * @param {{ allowC2C?: boolean }} [opts]
  * @returns {number|null}
  */
-function computeLocumsBurdenedPremiumRate(row, baseRateRaw) {
+function computeLocumsBurdenedPremiumRate(row, baseRateRaw, opts = {}) {
   const placementType = normPlacementType(row?.PLACEMENT_TYPE);
   if (placementType == null) return null;
   if (placementType === "FT" || placementType === "INTERNAL") return null;
@@ -371,7 +383,11 @@ function computeLocumsBurdenedPremiumRate(row, baseRateRaw) {
   const baseRate = toNumberOrNull(baseRateRaw);
   if (baseRate == null) return null;
 
-  if (isType1099(row)) return round2(baseRate * 1.09);
+  if (isType1099(row) || (opts.allowC2C && isTypeC2C(row))) {
+    const loadingFraction = loadingCostExceptionFraction(row);
+    const multiplier = loadingFraction != null ? 1 + loadingFraction : 1.09;
+    return round2(baseRate * multiplier);
+  }
   if (isGainwellParentClient(row)) return round2(baseRate * 1.23);
   return null;
 }
@@ -381,11 +397,15 @@ function computeLocumsFinalOtPayRate(row) {
 }
 
 function computeLocumsFinalHolidayPayRate(row) {
-  return computeLocumsBurdenedPremiumRate(row, row?.HOLIDAY_RATE);
+  return computeLocumsBurdenedPremiumRate(row, row?.HOLIDAY_RATE, { allowC2C: true });
+}
+
+function computeLocumsFinalDtPayRate(row) {
+  return computeLocumsBurdenedPremiumRate(row, row?.DT_RATE, { allowC2C: true });
 }
 
 function computeLocumsFinalCallBackPayRate(row) {
-  return computeLocumsBurdenedPremiumRate(row, row?.CALL_BACK_RATE);
+  return computeLocumsBurdenedPremiumRate(row, row?.CALL_BACK_RATE, { allowC2C: true });
 }
 
 /**
@@ -403,14 +423,16 @@ function computeLocumsDerivedPlacementFields(row) {
     FINAL_PAY_RATE: finalPayRate,
     FINAL_BILL_RATE: finalBillRate,
     FINAL_COST: finalCost,
-    // MARGIN and NET_MARGIN are retired on Locums: the computed figure is CALCULATED_MARGIN, and
-    // GROSS_MARGIN is Nexus's hourly_revenue, written by mapDealSheetRevenueDetailsToBq.
+    // Same shape as Cynet Health: CALCULATED_MARGIN = sheet MARGIN, GROSS_MARGIN = sheet GROSS
+    // MARGIN, and MARGIN = Nexus's hourly_revenue (written by mapDealSheetRevenueDetailsToBq).
     CALCULATED_MARGIN: computeLocumsCalculatedMargin(row, finalBillRate, finalCost),
+    GROSS_MARGIN: computeLocumsSheetGrossMargin(row, finalBillRate, w2PayRate, finalPayRate),
     GM_OT: computeGmOt(row),
     DAYS_WORKED: computeDaysWorked(row),
     ENTITY: LOCUMS_ENTITY,
     FINAL_OT_PAY_RATE: computeLocumsFinalOtPayRate(row),
     FINAL_HOLIDAY_PAY_RATE: computeLocumsFinalHolidayPayRate(row),
+    FINAL_DT_PAY_RATE: computeLocumsFinalDtPayRate(row),
     FINAL_CALL_BACK_PAY_RATE: computeLocumsFinalCallBackPayRate(row),
   };
 }

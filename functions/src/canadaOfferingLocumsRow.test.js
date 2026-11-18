@@ -51,10 +51,10 @@ test("Nexus hourly_revenue lands in MARGIN for the canada row", () => {
     { CLIENT_STATE: "ON", OFFERING: "LOCUMS", ASSIGNMENT_RECRUITER_EMAIL: "stella.s@cynethealth.ca" }
   );
   assert.deepEqual(out, { GP_PERCENTAGE: 39.85, MARGIN: 49.81 });
-  // A US locums row still takes it in GROSS_MARGIN.
+  // A US locums row takes it in MARGIN too (Nov 2026).
   assert.deepEqual(
     mapDealSheetRevenueDetailsToBq({ hourly_revenue: 10, gross_margin_percentage: 5 }, { CLIENT_STATE: "TX", OFFERING: "LOCUMS" }),
-    { GP_PERCENTAGE: 5, GROSS_MARGIN: 10 }
+    { GP_PERCENTAGE: 5, MARGIN: 10 }
   );
 });
 

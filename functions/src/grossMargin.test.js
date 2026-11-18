@@ -135,11 +135,11 @@ test("canada rows keep LINE_OF_BUSINESS and EXT_OR_REHIRE_BY_RMG", () => {
   assert.equal(canada.EXT_OR_REHIRE_BY_RMG, "EXTENSION");
 });
 
-test("locums derived fields do not compute GROSS_MARGIN", () => {
+test("locums derived fields compute the sheet GROSS_MARGIN", () => {
   const out = computeDerivedPlacementFields(
     healthRow({ ASSIGNMENT_RECRUITER_EMAIL: "recruiter@cynetlocums.com" })
   );
-  assert.ok(!Object.prototype.hasOwnProperty.call(out, "GROSS_MARGIN"));
+  assert.ok(Object.prototype.hasOwnProperty.call(out, "GROSS_MARGIN"));
 });
 
 // ---------------------------------------------------------------------------
