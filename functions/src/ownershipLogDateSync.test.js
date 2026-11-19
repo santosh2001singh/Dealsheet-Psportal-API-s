@@ -37,7 +37,9 @@ const provisional = {
   ID: "a'1",
   PLACEMENT_ID: "1466112",
   EDITED_BY: null,
-  START_DATE: "2026-09-13",
+  // Stored format (START_DATE swap): START_DATE = original start, EXTENSION_START_DATE = own start.
+  START_DATE: "2023-09-24",
+  EXTENSION_START_DATE: "2026-09-13",
   INITIAL_START_DATE: "2023-09-24",
   OWNERSHIP_EFFECTIVE_DATE: "2026-10-18",
   END_DATE_PREVIOUS_OWNER: "2026-10-17",
@@ -84,6 +86,19 @@ test("date sync: only the row whose dates changed is written; data team rows are
   assert.ok(!merges[0].includes("'b2'"), "the settled row is not written");
   assert.ok(merges[0].includes("DATE '2026-11-19'"));
   assert.ok(merges[0].includes("'EXTENSION_START'"));
+});
+
+test("date sync: a row still in the old format (START_DATE = own start) is moved to the stored format", async () => {
+  const merges = [];
+  const oldFormat = { ...settled, ID: "c3", START_DATE: "2026-09-13", EXTENSION_START_DATE: null };
+  const result = await withWrites(true, () =>
+    syncStoredOwnershipChangeLogDates(
+      { versions },
+      { queryFn: async () => [oldFormat], runDmlFn: async (sql) => { merges.push(sql); return 1; } }
+    )
+  );
+  assert.equal(result.updated, 1);
+  assert.ok(merges[0].includes("'c3', DATE '2023-09-24', DATE '2026-09-13', DATE '2023-09-24'"));
 });
 
 test("date sync: steady state issues no DML", async () => {

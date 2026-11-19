@@ -230,6 +230,13 @@ const config = {
    */
   submissionDateFreezeEnabled: process.env.SUBMISSION_DATE_FREEZE_ENABLED !== "false",
 
+  /**
+   * START_DATE swap (Nov 2026, see startDateSwap.js): cynet_health_deal_sheet and the Health run-rate
+   * table store START_DATE = original start and EXTENSION_START_DATE = the placement's own start.
+   * When false, rows are written in the old format again. Reads handle both formats either way.
+   */
+  startDateSwapWriteEnabled: process.env.START_DATE_SWAP_WRITE_ENABLED !== "false",
+
   /** Parent Firestore document for deal-sheet sync state (subcollections below) */
   firestoreWorkspace: {
     collection: process.env.FIRESTORE_WORKSPACE_COLLECTION || "workspaces",

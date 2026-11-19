@@ -108,7 +108,9 @@ test("insert-time: new extension vs stored segment -> ONSITE_AM + LEVEL_2_CSM ro
   assert.equal(am.PLACEMENT_ID, "1466877");
   assert.equal(am.CONTRACT_ID, "CHC22109");
   assert.equal(am.SKU_NO, "H134596_H15172");
-  assert.equal(am.START_DATE, "2026-08-23");
+  // Stored format (START_DATE swap): START_DATE = original start, EXTENSION_START_DATE = own start.
+  assert.equal(am.START_DATE, "2026-05-25");
+  assert.equal(am.EXTENSION_START_DATE, "2026-08-23");
   assert.equal(am.INITIAL_START_DATE, "2026-05-25");
   assert.equal(am.OWNERSHIP_EFFECTIVE_DATE, "2026-08-23");
   assert.equal(am.END_DATE_PREVIOUS_OWNER, "2026-08-22");

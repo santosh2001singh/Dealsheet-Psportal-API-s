@@ -80,6 +80,7 @@
  */
 
 const config = require("./config");
+const { readableFqnSql } = require("./startDateSwap");
 
 /** The report's recruiter region history since 2026-11-04 (recruiterRegionHistoryMap.js). */
 const RECRUITER_REGION_LOGS_TABLE_ID = "Recruiter_Region_logs";
@@ -474,7 +475,8 @@ function recruiterLogPassSql(p, req) {
 function buildClusterRegionResolvedSql(tableId, options = {}) {
   const projectId = options.projectId;
   const datasetId = options.datasetId;
-  const dealFqn = fqn(datasetId, tableId, projectId);
+  // Read through the START_DATE swap shim: `st` below is the placement's own start.
+  const dealFqn = readableFqnSql(fqn(datasetId, tableId, projectId));
   const recFqn = clusterDataFqn(RECRUITER_HISTORY_TABLE, projectId);
   const rrlFqn = fqn(datasetId, RECRUITER_REGION_LOGS_TABLE_ID, projectId);
   const recSnapFqn = clusterDataFqn(RECRUITER_SNAPSHOT_TABLE, projectId);

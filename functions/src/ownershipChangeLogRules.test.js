@@ -119,7 +119,9 @@ test("END_DATE wins over TENTATIVE_END_DATE for the provisional date", () => {
 
 test("the row carries the placement's START_DATE, INITIAL_START_DATE, SKU and contract", () => {
   const [r] = build(kayann());
-  assert.equal(r.START_DATE, "2026-09-13");
+  // Stored format (START_DATE swap): START_DATE = original start, EXTENSION_START_DATE = own start.
+  assert.equal(r.START_DATE, "2023-09-24");
+  assert.equal(r.EXTENSION_START_DATE, "2026-09-13");
   assert.equal(r.INITIAL_START_DATE, "2023-09-24");
   assert.equal(r.SKU_NO, "H9198");
   assert.equal(r.CONTRACT_ID, "CHC12569");
@@ -420,7 +422,8 @@ const storedRow = (overrides = {}) => ({
   PLACEMENT_ID: "1466112",
   CONTRACT_ID: "CHC12569",
   EDITED_BY: null,
-  START_DATE: { value: "2026-09-13" },
+  START_DATE: { value: "2023-09-24" },
+  EXTENSION_START_DATE: { value: "2026-09-13" },
   INITIAL_START_DATE: { value: "2023-09-24" },
   OWNERSHIP_EFFECTIVE_DATE: { value: "2026-10-18" },
   END_DATE_PREVIOUS_OWNER: { value: "2026-10-17" },
@@ -433,7 +436,8 @@ test("date sync: a provisional row becomes final once the next extension is book
   const change = resolveStoredOwnershipLogDates(storedRow(), indexOf(kayann()));
   assert.deepEqual(change, {
     ID: "row-1",
-    START_DATE: "2026-09-13",
+    START_DATE: "2023-09-24",
+    EXTENSION_START_DATE: "2026-09-13",
     INITIAL_START_DATE: "2023-09-24",
     OWNERSHIP_EFFECTIVE_DATE: "2026-11-19",
     END_DATE_PREVIOUS_OWNER: "2026-11-18",

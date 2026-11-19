@@ -4,6 +4,7 @@
  */
 
 const config = require("./config");
+const { toStoredStartRowsForTable, storedStartFieldsForLog } = require("./startDateSwap");
 const { applyDomainTuning } = config;
 const admin = require("firebase-admin");
 const { logLine, logDetail, setPipelineDetailQuiet, formatDuration } = require("./logger");
@@ -389,6 +390,30 @@ async function writeTerminationReasonLogRows(terminationLogRows, insertIdBase, p
  *      DEAL_SHEET_ID + PLACEMENT_ID + ADDITIONAL_COST_ID) and skip when nothing
  *      meaningful changed (see `hasAdditionalCostLogChange`).
  */
+/**
+ * START_DATE / EXTENSION_START_DATE on additional-cost log rows, in the log tables' stored format.
+ *
+ * The log rows are cut at enrich time, before the insert pipeline settles INITIAL_START_DATE
+ * (run-rate match, parent-DEAL inherit), so the original start is only known on the FINAL deal row.
+ * Each log row takes its dates from the final row of the same deal sheet + placement. A log row with
+ * no final row (the placement was not inserted, so the row is dropped below anyway) gets the shape
+ * from what it carries.
+ * @param {object[]} logRows
+ * @param {object[]|undefined} finalRows - insertResult.finalRows (internal format)
+ */
+function applyLogStartDatesFromFinalRows(logRows, finalRows) {
+  const byKey = new Map();
+  for (const fr of Array.isArray(finalRows) ? finalRows : []) {
+    const key = buildDealSheetPlacementCompositeKey(fr?.DEAL_SHEET_ID, fr?.PLACEMENT_ID);
+    if (key) byKey.set(key, fr);
+  }
+  return logRows.map((row) => {
+    const key = buildDealSheetPlacementCompositeKey(row?.DEAL_SHEET_ID, row?.PLACEMENT_ID);
+    const deal = key ? byKey.get(key) : null;
+    return { ...row, ...storedStartFieldsForLog(deal ?? row) };
+  });
+}
+
 async function writeAdditionalCostLogRows(additionalCostLogRows, insertIdBase, params = {}, options = {}) {
   if (!additionalCostLogRows || additionalCostLogRows.length === 0) return { inserted: 0 };
   if (!domainWritesEnrichLogs(params)) {
@@ -398,7 +423,7 @@ async function writeAdditionalCostLogRows(additionalCostLogRows, insertIdBase, p
     return { inserted: 0, skippedDomain: true };
   }
 
-  let rowsToWrite = additionalCostLogRows;
+  let rowsToWrite = applyLogStartDatesFromFinalRows(additionalCostLogRows, options.finalRows);
 
   const insertedKeys = options.insertedKeys instanceof Set ? options.insertedKeys : null;
   if (insertedKeys) {
@@ -674,7 +699,8 @@ function buildRateChangeLogRow(latestRow, previousRow = null, options = {}) {
     CANDIDATE_NAME: latestRow?.CANDIDATE_NAME ?? null,
     RATE_CHANGE_EFFECTIVE_DATE: effectiveOverride || toRateChangeEffectiveDate(latestRow),
     PLACEMENT_STATUS: latestRow?.PLACEMENT_STATUS ?? null,
-    START_DATE: latestRow?.START_DATE ?? null,
+    // Log tables store START_DATE = original start, EXTENSION_START_DATE = the placement's own start.
+    ...storedStartFieldsForLog(latestRow),
     END_DATE: latestRow?.END_DATE ?? null,
     ASSIGNMENT_RECRUITER: latestRow?.ASSIGNMENT_RECRUITER ?? null,
     ASSIGNMENT_RECRUITER_EMAIL: latestRow?.ASSIGNMENT_RECRUITER_EMAIL ?? null,
@@ -1289,6 +1315,7 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   if (action === "INSERTED" && additionalCostLogRows.length > 0) {
     additionalCostLogWriteResult = await writeAdditionalCostLogRows(additionalCostLogRows, 0, logParams, {
       insertedKeys: insertResult.insertedKeys instanceof Set ? insertResult.insertedKeys : new Set(),
+      finalRows: insertResult.finalRows,
     });
   }
 
@@ -1296,6 +1323,7 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   if (action === "INSERTED" && terminationLogRows.length > 0) {
     terminationReasonLogWriteResult = await writeTerminationReasonLogRows(terminationLogRows, 0, logParams, {
       insertedKeys: insertResult.insertedKeys instanceof Set ? insertResult.insertedKeys : new Set(),
+      finalRows: insertResult.finalRows,
     });
   }
 
@@ -1318,6 +1346,9 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     );
     responseData = row;
   }
+  // The pipeline works in the internal START_DATE format; answer in the format the table stores, so
+  // the caller sees the same START_DATE / EXTENSION_START_DATE it would read back from BigQuery.
+  [responseData] = toStoredStartRowsForTable([responseData], effectiveTableId);
 
   // Ownership logs for this placement were written by the insert above (insert-time path in
   // insertEnrichedDealSheetBatch, built from the contract's version history), so nothing is
@@ -1559,6 +1590,7 @@ async function backfillPlacementRecordFromNexus(params = {}) {
   if (action === "INSERTED" && additionalCostLogRows.length > 0) {
     additionalCostLogWriteResult = await writeAdditionalCostLogRows(additionalCostLogRows, 0, logParams, {
       insertedKeys: insertResult.insertedKeys instanceof Set ? insertResult.insertedKeys : new Set(),
+      finalRows: insertResult.finalRows,
     });
   }
 
@@ -1566,6 +1598,7 @@ async function backfillPlacementRecordFromNexus(params = {}) {
   if (action === "INSERTED" && terminationLogRows.length > 0) {
     terminationReasonLogWriteResult = await writeTerminationReasonLogRows(terminationLogRows, 0, logParams, {
       insertedKeys: insertResult.insertedKeys instanceof Set ? insertResult.insertedKeys : new Set(),
+      finalRows: insertResult.finalRows,
     });
   }
 
@@ -2153,7 +2186,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
         additionalCostLogRows,
         totalRowsInserted,
         params,
-        { insertedKeys: insertedKeysForLogs }
+        { insertedKeys: insertedKeysForLogs, finalRows: result.finalRows }
       );
       errorBatches += logResult.errorBatches || 0;
     }
@@ -3882,6 +3915,7 @@ module.exports = {
   splitActiveDealSheetUpdateTargetsByPlacementStatus,
   filterStaleTerminalBatchTargets,
   buildRateChangeLogRow,
+  applyLogStartDatesFromFinalRows,
   extractRateSnapshotFields,
   buildContractSegmentRateChangeLogRow,
   parseBooleanLike,

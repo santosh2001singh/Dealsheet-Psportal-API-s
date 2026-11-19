@@ -46,6 +46,7 @@
  */
 
 const config = require("./config");
+const { readableTableSql } = require("./startDateSwap");
 const {
   ACTIVE_DEAL_SHEET_TABLE_IDS,
   ENDED_DEAL_SHEET_TABLE_IDS,
@@ -290,7 +291,7 @@ function buildExtensionRehireSql(options = {}) {
         COALESCE(START_DATE, TENTATIVE_END_DATE) AS start_key,
         LAST_UPDATED AS date_and_time,
         ${EXT_OR_REHIRE_COLUMN} AS current_value
-      FROM ${fqn(projectId, datasetId, tableId)}${
+      FROM ${readableTableSql(projectId, datasetId, tableId)}${
         // Data-team run-rate rows carry no DEAL_TYPE (~22k in all_CH_data_runrate, 2026-10-13) and keep
         // their hand-set value. Only the rows that came from the deal sheet (DEAL_TYPE set) are written.
         runrateUpdateTableIds.includes(tableId)
@@ -310,7 +311,7 @@ function buildExtensionRehireSql(options = {}) {
     ${PARENT_CLIENT_KEY_SQL} AS parent_client_key,
     START_DATE AS hist_start,
     UPPER(TRIM(CAST(PLACEMENT_STATUS AS STRING))) IN (${sqlStringList(STARTED_PLACEMENT_STATUSES)}) AS hist_started
-  FROM ${fqn(projectId, datasetId, tableId)}
+  FROM ${readableTableSql(projectId, datasetId, tableId)}
   WHERE UPPER(TRIM(CAST(PLACEMENT_STATUS AS STRING))) IN (${sqlStringList(RUNRATE_ELIGIBLE_PLACEMENT_STATUSES)})`
     )
     .join("\n");

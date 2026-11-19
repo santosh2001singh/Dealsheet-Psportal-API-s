@@ -37,6 +37,7 @@
  */
 
 const { isHierarchyFrozenStatus } = require("./hierarchyFrozenStatus");
+const { storedStartFieldsForLog } = require("./startDateSwap");
 
 /** Where a row's OWNERSHIP_EFFECTIVE_DATE came from (column EFFECTIVE_DATE_SOURCE). */
 const OWNERSHIP_LOG_SOURCE = Object.freeze({
@@ -221,6 +222,19 @@ function filterNewOwnershipLogRows(candidates, existingRows) {
 // ---------------------------------------------------------------------------------------------
 // Placements and contracts
 // ---------------------------------------------------------------------------------------------
+
+/**
+ * START_DATE / EXTENSION_START_DATE for a log row about `placement`. The rules below work on the
+ * placement's own start (`placement.start`, read through the START_DATE swap shim); the log table
+ * stores START_DATE = original start and EXTENSION_START_DATE = own start (startDateSwap.js).
+ */
+function logStartDates(placement) {
+  return storedStartFieldsForLog({
+    START_DATE: placement?.start,
+    INITIAL_START_DATE: placement?.initialStart,
+    DEAL_TYPE: placement?.dealType,
+  });
+}
 
 /**
  * One placement as the rules see it, from its latest deal-sheet version.
@@ -604,7 +618,8 @@ function buildOwnershipChangeLogRowsFromIndex(index, options) {
         PLACEMENT_ID: placement.pid,
         CANDIDATE_NAME: placement.candidateName,
         CANDIDATE_EMAIL: placement.candidateEmail,
-        START_DATE: placement.start,
+        // Stored format: START_DATE = original start, EXTENSION_START_DATE = this placement's own start.
+        ...logStartDates(placement),
         INITIAL_START_DATE: placement.initialStart,
         OWNERSHIP_EFFECTIVE_DATE: dates.effectiveDate,
         END_DATE_PREVIOUS_OWNER: dates.endDatePreviousOwner,
@@ -631,6 +646,7 @@ function buildOwnershipChangeLogRowsFromIndex(index, options) {
 /** Columns the date sync owns on a system row. */
 const SYNCED_DATE_COLUMNS = Object.freeze([
   "START_DATE",
+  "EXTENSION_START_DATE",
   "INITIAL_START_DATE",
   "OWNERSHIP_EFFECTIVE_DATE",
   "END_DATE_PREVIOUS_OWNER",
@@ -683,7 +699,7 @@ function resolveStoredOwnershipLogDates(row, index) {
   }
 
   const target = {
-    START_DATE: stamped.start,
+    ...logStartDates(stamped),
     INITIAL_START_DATE: stamped.initialStart,
     OWNERSHIP_EFFECTIVE_DATE: dates.effectiveDate,
     END_DATE_PREVIOUS_OWNER: dates.endDatePreviousOwner,
@@ -692,6 +708,7 @@ function resolveStoredOwnershipLogDates(row, index) {
   };
   const stored = {
     START_DATE: dateOnly(row.START_DATE),
+    EXTENSION_START_DATE: dateOnly(row.EXTENSION_START_DATE),
     INITIAL_START_DATE: dateOnly(row.INITIAL_START_DATE),
     OWNERSHIP_EFFECTIVE_DATE: dateOnly(row.OWNERSHIP_EFFECTIVE_DATE),
     END_DATE_PREVIOUS_OWNER: dateOnly(row.END_DATE_PREVIOUS_OWNER),

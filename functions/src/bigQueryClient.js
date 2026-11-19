@@ -9,6 +9,14 @@ const config = require("./config");
 const { logDetail, logError } = require("./logger");
 const { shouldExcludeRowFromBigQuery } = require("./bqRowExclusions");
 const {
+  readableTableSql,
+  placementStartSqlExpr,
+  isStartDateSwapTable,
+  isStartDateSwapWriteEnabled,
+  toStoredStartRowsForTable,
+  storedStartSetSqlForNewInitial,
+} = require("./startDateSwap");
+const {
   ACTIVE_DEAL_SHEET_TABLE_IDS,
   ENDED_DEAL_SHEET_TABLE_IDS,
   resolveActiveDealSheetTableId,
@@ -290,7 +298,7 @@ async function fetchExistingDealSheetIdsSet(dealSheetIds, options = {}) {
     const chunk = uniq.slice(i, i + chunkSize);
     const inList = chunk.map((v) => `'${escapeSqlString(v)}'`).join(", ");
     const sql = `SELECT CAST(DEAL_SHEET_ID AS STRING) AS deal_sheet_id 
-                 FROM \`${config.projectId}.${datasetId}.${tableId}\` 
+                 FROM ${readableTableSql(config.projectId, datasetId, tableId)} 
                  WHERE CAST(DEAL_SHEET_ID AS STRING) IN (${inList})`;
     const rows = await queryObjects(sql, chunk.length);
     for (const row of rows) {
@@ -328,7 +336,7 @@ async function fetchExistingPlacementIdsSet(placementIds, options = {}) {
     const chunk = uniq.slice(i, i + chunkSize);
     const inList = chunk.map((v) => `'${escapeSqlString(v)}'`).join(", ");
     const sql = `SELECT CAST(PLACEMENT_ID AS STRING) AS placement_id
-                 FROM \`${config.projectId}.${datasetId}.${tableId}\`
+                 FROM ${readableTableSql(config.projectId, datasetId, tableId)}
                  WHERE CAST(PLACEMENT_ID AS STRING) IN (${inList})`;
     const rows = await queryObjects(sql, chunk.length);
     for (const row of rows) {
@@ -367,7 +375,7 @@ async function fetchPlacementStatusesByPlacementIds(placementIds, options = {}) 
     const sql = `SELECT
       CAST(PLACEMENT_ID AS STRING) AS placement_id,
       UPPER(TRIM(CAST(PLACEMENT_STATUS AS STRING))) AS placement_status
-    FROM \`${config.projectId}.${datasetId}.${tableId}\`
+    FROM ${readableTableSql(config.projectId, datasetId, tableId)}
     WHERE CAST(PLACEMENT_ID AS STRING) IN (${inList})`;
     const rows = await queryObjects(sql, chunk.length * 5);
     for (const row of rows) {
@@ -413,7 +421,7 @@ async function fetchLatestRowsByDealSheetIds(dealSheetIds, options = {}) {
                        PARTITION BY CAST(DEAL_SHEET_ID AS STRING)
                        ORDER BY LAST_UPDATED DESC NULLS LAST
                      ) AS _rn
-                   FROM \`${config.projectId}.${datasetId}.${tableId}\`
+                   FROM ${readableTableSql(config.projectId, datasetId, tableId)}
                    WHERE CAST(DEAL_SHEET_ID AS STRING) IN (${inList})
                  )
                  WHERE _rn = 1`;
@@ -476,7 +484,7 @@ async function fetchExistingRateChangeLogContractKeysSet(contractIds, options = 
     const chunk = uniq.slice(i, i + chunkSize);
     const inList = chunk.map((v) => `'${escapeSqlString(v)}'`).join(", ");
     const sql = `SELECT CONTRACT_ID, RATE_CHANGE_EFFECTIVE_DATE
-                 FROM \`${config.projectId}.${datasetId}.${tableId}\`
+                 FROM ${readableTableSql(config.projectId, datasetId, tableId)}
                  WHERE CAST(CONTRACT_ID AS STRING) IN (${inList})`;
     const rows = await queryObjects(sql, chunk.length * 5);
     for (const row of rows) {
@@ -555,7 +563,7 @@ async function buildActiveDealSheetSchemaSafeUnionParts(datasetId, whereClause =
       have.has(c) ? `\`${c}\`` : `CAST(NULL AS ${typeByCol.get(c)}) AS \`${c}\``
     );
     return `SELECT ${proj.join(", ")}, '${escapeSqlString(t)}' AS _src `
-      + `FROM \`${config.projectId}.${datasetId}.${t}\`${where}`;
+      + `FROM ${readableTableSql(config.projectId, datasetId, t)}${where}`;
   });
 }
 
@@ -648,7 +656,7 @@ async function fetchLatestTwoRowsByDealSheetIdsAcrossActive(dealSheetIds, option
   if (uniq.length === 0) return out;
 
   const unionParts = ACTIVE_DEAL_SHEET_TABLE_IDS.map((tableId) => {
-    const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
+    const fqn = readableTableSql(config.projectId, datasetId, tableId);
     const src = escapeSqlString(tableId);
     return `SELECT * EXCEPT(_table_rn)
             FROM (
@@ -763,7 +771,7 @@ async function fetchLatestAdditionalCostLogRowsByKeys(logRows, options = {}) {
                        PARTITION BY CAST(DEAL_SHEET_ID AS STRING), CAST(PLACEMENT_ID AS STRING), CAST(ADDITIONAL_COST_ID AS STRING)
                        ORDER BY LAST_UPDATED DESC NULLS LAST
                      ) AS _rn
-                   FROM \`${config.projectId}.${datasetId}.${tableId}\`
+                   FROM ${readableTableSql(config.projectId, datasetId, tableId)}
                    WHERE ${wherePairs}
                  )
                  WHERE _rn = 1`;
@@ -832,7 +840,7 @@ async function fetchLatestTerminationReasonLogRowsByKeys(logRows, options = {}) 
                        PARTITION BY CAST(PLACEMENT_ID AS STRING), CAST(TERMINATION_DETAIL_ID AS STRING)
                        ORDER BY LAST_UPDATED DESC NULLS LAST
                      ) AS _rn
-                   FROM \`${config.projectId}.${datasetId}.${tableId}\`
+                   FROM ${readableTableSql(config.projectId, datasetId, tableId)}
                    WHERE ${wherePairs}
                  )
                  WHERE _rn = 1`;
@@ -885,7 +893,7 @@ async function fetchLatestRowsByDealSheetPlacementPairs(rows, options = {}) {
                        PARTITION BY CAST(DEAL_SHEET_ID AS STRING), CAST(PLACEMENT_ID AS STRING)
                        ORDER BY LAST_UPDATED DESC NULLS LAST
                      ) AS _rn
-                   FROM \`${config.projectId}.${datasetId}.${tableId}\`
+                   FROM ${readableTableSql(config.projectId, datasetId, tableId)}
                    WHERE ${wherePairs}
                  )
                  WHERE _rn = 1`;
@@ -1314,7 +1322,7 @@ async function fetchRunrateWindowForContractId(contractId, options = {}) {
     SELECT
       MIN(${windowStartSql}) AS window_start_date,
       MAX(COALESCE(END_DATE, TENTATIVE_END_DATE)) AS window_end_date
-    FROM \`${config.projectId}.${datasetId}.${runrateTableId}\` r
+    FROM ${readableTableSql(config.projectId, datasetId, runrateTableId)} r
     WHERE UPPER(TRIM(CAST(CONTRACT_ID AS STRING))) = '${escapeSqlString(normalized.toUpperCase())}'
       AND START_DATE IS NOT NULL
       AND COALESCE(END_DATE, TENTATIVE_END_DATE) IS NOT NULL
@@ -1364,7 +1372,18 @@ async function repairStoredContractIdForPlacement(params = {}, options = {}) {
   // insert). The stored value came off the wrong contract's chain. Left alone when the row has no
   // usable START_DATE, rather than writing a null the insert path would then have to re-derive.
   if (!missing.has("INITIAL_START_DATE")) {
-    sets.push("INITIAL_START_DATE = START_DATE");
+    if (isStartDateSwapTable(tableId)) {
+      // Swap table: START_DATE holds the original start, so the placement's own start has to be read
+      // back through the shim expression. The new original start is that own start, which also puts
+      // START_DATE / EXTENSION_START_DATE back in the stored format for it.
+      const ownStart = placementStartSqlExpr();
+      sets.push(`INITIAL_START_DATE = ${ownStart}`);
+      if (isStartDateSwapWriteEnabled()) {
+        sets.push(...storedStartSetSqlForNewInitial(ownStart));
+      }
+    } else {
+      sets.push("INITIAL_START_DATE = START_DATE");
+    }
   }
 
   const sql = `
@@ -1850,7 +1869,7 @@ async function fetchOfferRejectedExtensionEndedDatesByPlacementId(rows, options 
       (t) =>
         `SELECT CANDIDATE_ID AS candidate_nexus_id, LOWER(TRIM(PARENT_CLIENT_NAME)) AS pc_norm, `
         + `PLACEMENT_STATUS AS placement_status, START_DATE AS start_date, END_DATE AS end_date, `
-        + `CAST(LAST_UPDATED AS STRING) AS order_ts FROM \`${config.projectId}.${datasetId}.${t}\``
+        + `CAST(LAST_UPDATED AS STRING) AS order_ts FROM ${readableTableSql(config.projectId, datasetId, t)}`
     )
     .join("\n          UNION ALL\n          ");
   const fromDealSheets = await runForSource(dealUnionSql, eligible);
@@ -1863,7 +1882,7 @@ async function fetchOfferRejectedExtensionEndedDatesByPlacementId(rows, options 
     const runrateSql =
       `SELECT CANDIDATE_ID AS candidate_nexus_id, LOWER(TRIM(PARENT_CLIENT_NAME)) AS pc_norm, `
       + `PLACEMENT_STATUS AS placement_status, START_DATE AS start_date, END_DATE AS end_date, `
-      + `CAST(NULL AS STRING) AS order_ts FROM \`${config.projectId}.${datasetId}.${runrateTableId}\``;
+      + `CAST(NULL AS STRING) AS order_ts FROM ${readableTableSql(config.projectId, datasetId, runrateTableId)}`;
     const fromRunrate = await runForSource(runrateSql, unmatched);
     for (const [k, v] of fromRunrate) if (!out.has(k)) out.set(k, v);
   }
@@ -2127,7 +2146,8 @@ async function insertAll(rows, options = {}) {
   const { datasetId, tableId } = resolveBqDatasetTable(options);
   const table = bigquery.dataset(datasetId).table(tableId);
 
-  const { buffer } = buildLoadJobPayload(rows, options);
+  // START_DATE swap: the pipeline works in the internal format; the swap tables store the other one.
+  const { buffer } = buildLoadJobPayload(toStoredStartRowsForTable(rows, tableId), options);
 
   const loadOptions = {
     sourceFormat: "NEWLINE_DELIMITED_JSON",
@@ -2724,9 +2744,11 @@ async function insertEnrichedDealSheetBatchRouted(combinedRows, insertIdBase, op
   let base = insertIdBase;
   const parts = [];
   const insertedKeys = new Set();
+  const finalRows = [];
   for (const [tableId, rows] of groups) {
     parts.push(`${tableId}=${rows.length}`);
     const r = await insertEnrichedDealSheetBatch(rows, base, { ...options, tableId });
+    if (Array.isArray(r.finalRows)) finalRows.push(...r.finalRows);
     inserted += r.inserted;
     attempted += r.attempted;
     errorBatches += r.errorBatches;
@@ -2739,7 +2761,7 @@ async function insertEnrichedDealSheetBatchRouted(combinedRows, insertIdBase, op
     logDetail(`[enriched sync] [BigQuery insertAll] routed partitions: ${parts.join(", ")}`);
   }
 
-  return { inserted, attempted, errorBatches, insertedKeys };
+  return { inserted, attempted, errorBatches, insertedKeys, finalRows };
 }
 
 /**
@@ -2957,7 +2979,7 @@ async function insertTerminationReasonLogBatch(logRows, insertIdBase, options = 
  */
 async function getDealSheetRowCount(options = {}) {
   const { datasetId, tableId } = resolveBqDatasetTable(options);
-  const sql = `SELECT COUNT(1) AS row_count FROM \`${config.projectId}.${datasetId}.${tableId}\``;
+  const sql = `SELECT COUNT(1) AS row_count FROM ${readableTableSql(config.projectId, datasetId, tableId)}`;
   const rows = await queryObjects(sql, 1);
   const n = rows?.[0]?.row_count;
   return n == null ? null : Number(n);
@@ -2975,7 +2997,7 @@ async function getActiveDealSheetTotalRowCount(options = {}) {
       ? options.datasetId.trim()
       : config.datasetId;
   const sumExpr = ACTIVE_DEAL_SHEET_TABLE_IDS.map(
-    (tid) => `(SELECT COUNT(1) FROM \`${config.projectId}.${datasetId}.${tid}\`)`
+    (tid) => `(SELECT COUNT(1) FROM ${readableTableSql(config.projectId, datasetId, tid)})`
   ).join(" + ");
   const sql = `SELECT ${sumExpr} AS row_count`;
   const rows = await queryObjects(sql, 1);
@@ -3030,7 +3052,7 @@ async function fetchActiveDealSheetUpdateTargets(options = {}) {
           PARTITION BY CAST(DEAL_SHEET_ID AS STRING)
           ORDER BY LAST_UPDATED DESC NULLS LAST
         ) AS _rn
-      FROM \`${config.projectId}.${datasetId}.${tableId}\`
+      FROM ${readableTableSql(config.projectId, datasetId, tableId)}
       WHERE DEAL_SHEET_ID IS NOT NULL
     )
     WHERE _rn = 1`;
@@ -3063,7 +3085,7 @@ async function fetchActiveDealSheetUpdateTargets(options = {}) {
           PARTITION BY CAST(PLACEMENT_ID AS STRING)
           ORDER BY LAST_UPDATED DESC NULLS LAST
         ) AS _rn
-      FROM \`${config.projectId}.${datasetId}.${tableId}\`
+      FROM ${readableTableSql(config.projectId, datasetId, tableId)}
       WHERE DEAL_SHEET_ID IS NULL AND PLACEMENT_ID IS NOT NULL
     )
     WHERE _rn = 1`;
@@ -3136,7 +3158,7 @@ async function fetchDistinctPlacementIdsFromTable(options = {}) {
       ? `AND LAST_UPDATED >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL ${lookbackDays} DAY)`
       : "";
   const sql = `SELECT DISTINCT CAST(PLACEMENT_ID AS STRING) AS placement_id
-               FROM \`${config.projectId}.${datasetId}.${tableId}\`
+               FROM ${readableTableSql(config.projectId, datasetId, tableId)}
                WHERE PLACEMENT_ID IS NOT NULL
                ${whereLookback}
                ${limit > 0 ? `LIMIT ${limit}` : ""}`;
@@ -3187,7 +3209,7 @@ async function fetchLatestRowsByPlacementIds(placementIds, options = {}) {
                        PARTITION BY CAST(PLACEMENT_ID AS STRING)
                        ORDER BY LAST_UPDATED DESC NULLS LAST
                      ) AS _rn
-                   FROM \`${config.projectId}.${datasetId}.${tableId}\`
+                   FROM ${readableTableSql(config.projectId, datasetId, tableId)}
                    WHERE CAST(PLACEMENT_ID AS STRING) IN (${inList})
                  )
                  WHERE _rn = 1`;
@@ -3360,7 +3382,7 @@ function buildActiveDealSheetsUnionSql(datasetId, tableId, extraColumns = []) {
   const columnList = columns.join(", ");
   return tableIds.map(
     (tid) =>
-      `SELECT ${columnList} FROM \`${config.projectId}.${datasetId}.${tid}\``
+      `SELECT ${columnList} FROM ${readableTableSql(config.projectId, datasetId, tid)}`
   ).join(" UNION ALL ");
 }
 
@@ -3455,7 +3477,7 @@ function buildActiveChangeScanUnionParts(datasetId, domain = null) {
     ? [resolveActiveDealSheetTableIdForDomain(domain)]
     : ACTIVE_DEAL_SHEET_TABLE_IDS;
   return tableIds.map((tableId) => {
-    const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
+    const fqn = readableTableSql(config.projectId, datasetId, tableId);
     const src = escapeSqlString(tableId);
     const columnList = buildActiveChangeScanColumnList(tableId);
     return `SELECT ${columnList}, '${src}' AS _src FROM ${fqn} WHERE DEAL_SHEET_ID IS NOT NULL AND PLACEMENT_ID IS NOT NULL`;
@@ -3499,7 +3521,7 @@ async function fetchMaxContractIdSeqForTable(tableId, options = {}) {
   const parts = tables.map(
     (t) =>
       `SELECT MAX(CAST(REGEXP_EXTRACT(CONTRACT_ID, r'^${cfg.prefix}(\\d+)$') AS INT64)) AS max_seq
-       FROM \`${config.projectId}.${datasetId}.${t}\`
+       FROM ${readableTableSql(config.projectId, datasetId, t)}
        WHERE REGEXP_CONTAINS(CONTRACT_ID, r'${pattern}')`
   );
   const sql = `SELECT MAX(max_seq) AS max_seq FROM (${parts.join(" UNION ALL ")})`;
@@ -3637,7 +3659,7 @@ async function fetchEmployeeDirectoryByEmails(emails, options = {}) {
             PARTITION BY LOWER(TRIM(email))
             ORDER BY (status = 'ACTIVE') DESC, (external_id IS NOT NULL) DESC, updated_at DESC
           ) AS rn
-        FROM \`${config.projectId}.${datasetId}.${tableId}\`
+        FROM ${readableTableSql(config.projectId, datasetId, tableId)}
         WHERE LOWER(TRIM(email)) IN (${inList})
           AND (external_id IS NOT NULL OR employee_id IS NOT NULL)
       )
@@ -4222,7 +4244,7 @@ async function fetchLegacyContractIdentityForDealRows(rows, options = {}) {
     typeof options.runrateTableId === "string" && options.runrateTableId.trim() !== ""
       ? options.runrateTableId.trim()
       : resolveRunrateTableIdForDealSheetTable(options.tableId);
-  const runrateFqn = `\`${config.projectId}.${datasetId}.${runrateTableId}\``;
+  const runrateFqn = readableTableSql(config.projectId, datasetId, runrateTableId);
   const includeHierarchy = options.includeHierarchy === true;
   const { windowStartSql, exactStartHitSql } = legacyRunrateWindowStartSql(runrateTableId);
 
@@ -4542,7 +4564,7 @@ async function fetchLocumsRunrateIdentityForDealRows(rows, options = {}) {
     typeof options.runrateTableId === "string" && options.runrateTableId.trim() !== ""
       ? options.runrateTableId.trim()
       : config.runrateLocumsTableId;
-  const runrateFqn = `\`${config.projectId}.${datasetId}.${runrateTableId}\``;
+  const runrateFqn = readableTableSql(config.projectId, datasetId, runrateTableId);
   const includeHierarchy = options.includeHierarchy === true;
 
   const keyed = [];
@@ -5671,7 +5693,7 @@ async function fetchExtensionRunrateBackfillByPlacementId(rows, options = {}) {
     typeof options.runrateTableId === "string" && options.runrateTableId.trim() !== ""
       ? options.runrateTableId.trim()
       : resolveRunrateTableIdForDealSheetTable(options.tableId);
-  const runrateFqn = `\`${config.projectId}.${datasetId}.${runrateTableId}\``;
+  const runrateFqn = readableTableSql(config.projectId, datasetId, runrateTableId);
   const runrateHierarchyColumns = resolveExtensionRunrateHierarchyColumns(runrateTableId);
 
   // Pull each hierarchy name AND its *_EMP_NO straight from the run-rate table (both columns exist
@@ -7476,7 +7498,7 @@ async function fetchCsmHierarchyDivergenceCandidates(options = {}, deps = {}) {
       : config.datasetId;
 
   const unionParts = ACTIVE_DEAL_SHEET_TABLE_IDS.map((tableId) => {
-    const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
+    const fqn = readableTableSql(config.projectId, datasetId, tableId);
     return `SELECT DEAL_SHEET_ID, PLACEMENT_ID, PLACEMENT_STATUS, CANDIDATE_NAME, CANDIDATE_ID,
                    ONSITE_AM_EMAIL, LEVEL_2_CSM, LEVEL_3_CSM, LEVEL_4_CSM, LAST_UPDATED
             FROM ${fqn}
@@ -7815,7 +7837,7 @@ async function applyRecruiterHierarchyMovesToDealSheet(reconResults, options = {
       .filter(Boolean);
     if (keyPairs.length === 0) continue;
 
-    const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
+    const fqn = readableTableSql(config.projectId, datasetId, tableId);
     const sql = `SELECT * EXCEPT(rn) FROM (
                    SELECT *, ROW_NUMBER() OVER (
                      PARTITION BY CAST(DEAL_SHEET_ID AS STRING), CAST(PLACEMENT_ID AS STRING)
@@ -7904,7 +7926,7 @@ async function applyLiveRecruiterHierarchyToDealSheet(options = {}, deps = {}) {
     "RECRUITER_EMP_NO",
     ...fields,
   ];
-  const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
+  const fqn = readableTableSql(config.projectId, datasetId, tableId);
   // Latest row per placement FIRST, then the frozen-status filter — filtering first would pick an
   // older, not-yet-ended version of a placement that has since ended.
   const sql = `SELECT * EXCEPT(rn) FROM (
@@ -8249,8 +8271,8 @@ async function fetchContractOrganicOwnersForInorganicRows(logRows, options = {},
       : config.datasetId;
   const activeTableId = resolveActiveDealSheetTableIdForDomain(options.domain ?? "health");
   const runrateTableId = resolveRunrateTableIdForDealSheetTable(activeTableId);
-  const activeFqn = `\`${config.projectId}.${datasetId}.${activeTableId}\``;
-  const runrateFqn = `\`${config.projectId}.${datasetId}.${runrateTableId}\``;
+  const activeFqn = readableTableSql(config.projectId, datasetId, activeTableId);
+  const runrateFqn = readableTableSql(config.projectId, datasetId, runrateTableId);
   const queryFn = deps.queryFn ?? queryObjects;
 
   const pairs = new Map();
@@ -8499,7 +8521,7 @@ async function fetchExistingInorganicHierarchyLogKeysSet(candidates, options = {
     const sql = `SELECT DEAL_SHEET_ID, PLACEMENT_ID, RECRUITER_EMAIL_ID,
                         INORGANIC_LEVEL_2_CSM, INORGANIC_LEVEL_3_CSM, INORGANIC_LEVEL_4_CSM,
                         ${INORGANIC_HIERARCHY_DEDUPE_COLUMNS.join(", ")}
-                 FROM \`${config.projectId}.${datasetId}.${tableId}\`
+                 FROM ${readableTableSql(config.projectId, datasetId, tableId)}
                  WHERE CAST(PLACEMENT_ID AS STRING) IN (${inList})`;
     const rows = await (deps.queryFn ?? queryObjects)(sql, chunk.length * 5);
     for (const row of rows) {
@@ -8674,7 +8696,7 @@ async function fetchActiveExtensionRowsForInorganic(options = {}, deps = {}) {
   ];
   const columnList = cols.join(", ");
   const unionParts = tableIds.map((tableId) => {
-    const fqn = `\`${config.projectId}.${datasetId}.${tableId}\``;
+    const fqn = readableTableSql(config.projectId, datasetId, tableId);
     return `SELECT ${columnList} FROM ${fqn}
             WHERE DEAL_SHEET_ID IS NOT NULL AND PLACEMENT_ID IS NOT NULL
               AND UPPER(TRIM(IFNULL(DEAL_TYPE, ''))) = 'EXTENSION'`;
@@ -8756,7 +8778,7 @@ async function fetchRunrateInorganicForExtensions(extRows, options = {}, deps = 
     typeof options.runrateTableId === "string" && options.runrateTableId.trim() !== ""
       ? options.runrateTableId.trim()
       : resolveRunrateTableIdForDealSheetTable(options.tableId);
-  const runrateFqn = `\`${config.projectId}.${datasetId}.${runrateTableId}\``;
+  const runrateFqn = readableTableSql(config.projectId, datasetId, runrateTableId);
   const queryFn = deps.queryFn ?? queryObjects;
 
   const nameCols = RUNRATE_INORGANIC_SOURCE_COLUMNS.map((c) => c.runrateCol);
@@ -9908,13 +9930,13 @@ function buildOwnershipLogDateMergeSql(target, changes) {
   const date = (v) => (v == null ? "CAST(NULL AS DATE)" : `DATE '${escapeSqlString(String(v))}'`);
   const tuples = changes.map(
     (c) =>
-      `(${str(c.ID)}, ${date(c.START_DATE)}, ${date(c.INITIAL_START_DATE)}, ${date(c.OWNERSHIP_EFFECTIVE_DATE)}, ` +
+      `(${str(c.ID)}, ${date(c.START_DATE)}, ${date(c.EXTENSION_START_DATE)}, ${date(c.INITIAL_START_DATE)}, ${date(c.OWNERSHIP_EFFECTIVE_DATE)}, ` +
       `${date(c.END_DATE_PREVIOUS_OWNER)}, ${str(c.EFFECTIVE_DATE_SOURCE)}, ${str(c.EFFECTIVE_DATE_PLACEMENT_ID)})`
   );
   const setClause = SYNCED_DATE_COLUMNS.map((col) => `${col} = u.${col}`).join(", ");
   return `MERGE \`${config.projectId}.${target.datasetId}.${target.tableId}\` o
 USING (
-  SELECT * FROM UNNEST(ARRAY<STRUCT<ID STRING, START_DATE DATE, INITIAL_START_DATE DATE,
+  SELECT * FROM UNNEST(ARRAY<STRUCT<ID STRING, START_DATE DATE, EXTENSION_START_DATE DATE, INITIAL_START_DATE DATE,
     OWNERSHIP_EFFECTIVE_DATE DATE, END_DATE_PREVIOUS_OWNER DATE, EFFECTIVE_DATE_SOURCE STRING,
     EFFECTIVE_DATE_PLACEMENT_ID STRING>>[
     ${tuples.join(",\n    ")}
@@ -9962,7 +9984,7 @@ async function syncStoredOwnershipChangeLogDates(options = {}, deps = {}) {
 
   const target = resolveOwnershipLogTable(options);
   const stored = await queryFn(
-    `SELECT ID, CONTRACT_ID, PLACEMENT_ID, EDITED_BY, START_DATE, INITIAL_START_DATE,
+    `SELECT ID, CONTRACT_ID, PLACEMENT_ID, EDITED_BY, START_DATE, EXTENSION_START_DATE, INITIAL_START_DATE,
             OWNERSHIP_EFFECTIVE_DATE, END_DATE_PREVIOUS_OWNER, EFFECTIVE_DATE_SOURCE,
             EFFECTIVE_DATE_PLACEMENT_ID
      FROM \`${config.projectId}.${target.datasetId}.${target.tableId}\`

@@ -42,6 +42,12 @@
  */
 
 const config = require("./config");
+const {
+  readableTableSql,
+  isStartDateSwapTable,
+  isStartDateSwapWriteEnabled,
+  storedStartSetSqlForNewInitial,
+} = require("./startDateSwap");
 const { EXTENSION_PARENT_DEAL_INHERIT_COLUMNS } = require("./bigQueryClient");
 
 /** Tables this pass repairs. */
@@ -161,6 +167,9 @@ function buildExtensionParentBackfillSqlForTable(tableId, options = {}) {
   const projectId = String(options.projectId || config.projectId || "").trim();
   const datasetId = String(options.datasetId || config.datasetId || "").trim();
   const dealFqn = `\`${projectId}.${datasetId}.${tableId}\``;
+  // Reads go through the START_DATE swap shim so START_DATE below is each placement's own start;
+  // the UPDATE target stays the raw table.
+  const dealReadSql = readableTableSql(projectId, datasetId, tableId);
 
   const cols = parentBackfillColumns();
   // INITIAL_START_DATE comes from the parent's COALESCE, so it is projected under its own name.
@@ -171,7 +180,17 @@ function buildExtensionParentBackfillSqlForTable(tableId, options = {}) {
         : `         ${col}`
     )
     .join(",\n");
-  const setClause = cols.map(fillIfEmptySql).join(",\n");
+  const setParts = cols.map(fillIfEmptySql);
+  // Swap table: a newly filled INITIAL_START_DATE also moves START_DATE to it (stored format), with
+  // the placement's own start kept in EXTENSION_START_DATE. Idempotent on rows already in that shape.
+  if (isStartDateSwapTable(tableId) && isStartDateSwapWriteEnabled()) {
+    setParts.push(
+      ...storedStartSetSqlForNewInitial("IFNULL(d.INITIAL_START_DATE, s.INITIAL_START_DATE)", "d").map(
+        (part) => `  ${part}`
+      )
+    );
+  }
+  const setClause = setParts.join(",\n");
   const eligible = buildEligibilityPredicate();
 
   return `
@@ -184,7 +203,7 @@ WITH latest AS (
       PARTITION BY DEAL_SHEET_ID
       ORDER BY LAST_UPDATED DESC NULLS LAST, EDIT_DATE DESC NULLS LAST
     ) AS rn
-    FROM ${dealFqn}
+    FROM ${dealReadSql}
     WHERE DEAL_SHEET_ID IS NOT NULL
   ) WHERE rn = 1
 ),

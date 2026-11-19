@@ -40,6 +40,7 @@
 const crypto = require("node:crypto");
 const axios = require("axios");
 const config = require("./config");
+const { readableTableSql } = require("./startDateSwap");
 const { queryObjects, runDml, escapeSqlString } = require("./bigQueryClient");
 const { logLine, logError } = require("./logger");
 
@@ -288,7 +289,7 @@ function latestInScopeSql(settings) {
       SELECT t.*, ROW_NUMBER() OVER (
         PARTITION BY t.DEAL_SHEET_ID, t.PLACEMENT_ID ORDER BY t.LAST_UPDATED DESC
       ) AS rn
-      FROM ${fqn(settings, settings.sourceTableId)} t
+      FROM ${readableTableSql(config.projectId, settings.datasetId, settings.sourceTableId)} t
       WHERE t.PLACEMENT_ID IS NOT NULL
     )
     WHERE rn = 1 AND UPPER(TRIM(PLACEMENT_STATUS)) IN (${statuses})`;
