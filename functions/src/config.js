@@ -26,6 +26,36 @@ const config = {
   runrateCanadaTableId:
     process.env.RUNRATE_CANADA_TABLE_ID || "all_Health_Canada_data_Runrate",
   runrateLocumsTableId: process.env.RUNRATE_LOCUMS_TABLE_ID || "all_locums_runrate",
+
+  /**
+   * Cynet Systems runrate (IT / US, ENTITY = SYSTEMS), sourced from CEIPAL instead of Nexus.
+   * dealSheetTableId is what systemsDealSheetSync writes; runrateTableId is the history copied from
+   * cynetdatabase.cynet_Data.CS_TABLE_RUNRATE (sql/create_systems_deal_sheet_and_runrate_tables.sql).
+   */
+  systems: {
+    dealSheetTableId: process.env.SYSTEMS_DEAL_SHEET_TABLE_ID || "cynet_systems_deal_sheet",
+    runrateTableId: process.env.SYSTEMS_RUNRATE_TABLE_ID || "all_CS_data_runrate",
+    /**
+     * A scheduled run stops itself after this long and saves its page checkpoint, so the 30-minute
+     * function timeout never kills it mid-page. CEIPAL pages take ~15-18 s each on the full report.
+     */
+    timeBudgetMs: parseInt(process.env.SYSTEMS_SYNC_TIME_BUDGET_MS || String(25 * 60 * 1000), 10),
+  },
+
+  /** CEIPAL API (ceipalClient.js). Credentials are set in functions/.env only. */
+  ceipal: {
+    authUrl: process.env.CEIPAL_AUTH_URL || "https://api.ceipal.com/v2/createAuthtoken/",
+    email: process.env.CEIPAL_EMAIL || "",
+    password: process.env.CEIPAL_PASSWORD || "",
+    apiKey: process.env.CEIPAL_API_KEY || "",
+    /** Full get-report-data URL of the "Runrate Tool" report, without query string. */
+    reportUrl: process.env.CEIPAL_RUNRATE_REPORT_URL || "",
+    reportPageLimit: parseInt(process.env.CEIPAL_REPORT_PAGE_LIMIT || "100", 10),
+    reportMaxPages: parseInt(process.env.CEIPAL_REPORT_MAX_PAGES || "200", 10),
+    requestTimeoutMs: parseInt(process.env.CEIPAL_REQUEST_TIMEOUT_MS || "60000", 10),
+    maxRetries: parseInt(process.env.CEIPAL_MAX_RETRIES || "3", 10),
+    pageDelayMs: parseInt(process.env.CEIPAL_PAGE_DELAY_MS || "250", 10),
+  },
   rateChangeLogDatasetId: process.env.BQ_RATE_CHANGE_LOG_DATASET || "rr_project_data",
   rateChangeLogTableId: process.env.BQ_RATE_CHANGE_LOG_TABLE || "ch_rate_change_logs",
   additionalCostLogDatasetId: process.env.BQ_ADDITIONAL_COST_LOG_DATASET || "rr_project_data",
@@ -227,6 +257,8 @@ const config = {
     cynet_health_deal_sheet: { prefix: "CHC", startValue: 23000 },
     cynet_health_canada_deal_sheet: { prefix: "CAC", startValue: 1000 },
     cynet_locums_deal_sheet: { prefix: "LOC", startValue: 1000 },
+    /** Cynet Systems (CEIPAL): one CONTRACT_ID per PLACEMENT_ID, minted on first insert. */
+    cynet_systems_deal_sheet: { prefix: "CSC", startValue: 1000 },
   },
 
   /** Firestore collection for per-table CONTRACT_ID sequences (doc id = table id) */

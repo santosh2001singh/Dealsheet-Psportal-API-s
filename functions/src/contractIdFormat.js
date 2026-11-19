@@ -1,10 +1,10 @@
 /**
- * Prefixed CONTRACT_ID formatting and validation (CHC/CAC/LOC + sequence).
+ * Prefixed CONTRACT_ID formatting and validation (CHC/CAC/LOC/CSC + sequence).
  */
 
 const config = require("./config");
 
-const CONTRACT_ID_PATTERN = /^(CHC|CAC|LOC)(\d+)$/;
+const CONTRACT_ID_PATTERN = /^(CHC|CAC|LOC|CSC)(\d+)$/;
 
 const DEFAULT_START_VALUE = parseInt(process.env.CONTRACT_ID_START_VALUE || "1000", 10);
 

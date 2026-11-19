@@ -40,6 +40,7 @@ const { startDateOnOrAfterUtcMin, effectiveMinFilterDate } = require("./columnMa
 const { transformOfferRejectedEndedRowsForBigQuery } = require("./offerRejectedRowTransform");
 const { assignNewContractIdForPlacement } = require("./contractIdOverride");
 const { runAitaWebhookSyncHealth } = require("./aitaWebhook");
+const { runSystemsDealSheetSync } = require("./systemsDealSheetSync");
 const config = require("./config");
 
 admin.initializeApp();
@@ -1411,6 +1412,98 @@ exports.aitaWebhookSyncHealth = onRequest(
       res.status(200).json({ success: true, result });
     } catch (error) {
       logError("[aitaWebhookSyncHealth] FAILED", error);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+// ---------------------------------------------------------------- Cynet Systems (CEIPAL)
+
+/**
+ * Cynet Systems runrate: CEIPAL "Runrate Tool" report -> rr_project_data.cynet_systems_deal_sheet
+ * (systemsDealSheetSync.js). Same pair as the Nexus domains: the insert trigger adds placements not
+ * yet in the table, the update trigger appends a row when a placement's CEIPAL columns change.
+ * CEIPAL is a different API from Nexus, so these run at :15 / :45 without sharing a budget with it.
+ */
+function buildSystemsDealSheetTrigger(mode, label, schedule) {
+  return onSchedule(
+    {
+      schedule,
+      timeZone: "America/New_York",
+      region: REGION,
+      timeoutSeconds: SCHEDULE_TIMEOUT_SEC,
+      memory: SCHEDULE_MEMORY,
+    },
+    async (event) => {
+      logLine(
+        `[${label}] Gen2 onSchedule domain=systems mode=${mode} scheduleTime=${event.scheduleTime || "n/a"} jobName=${event.jobName || "n/a"}`
+      );
+      return withTimingAsync(label, async () => {
+        const { ran, result } = await withRunLock(`systems-${mode}`, { label }, () =>
+          runSystemsDealSheetSync({ mode, label })
+        );
+        if (!ran) {
+          logLine(`[${label}] SKIPPED: another systems ${mode} run is still in progress.`);
+          return { skipped: true, reason: "run already in progress" };
+        }
+        return result;
+      });
+    }
+  );
+}
+
+exports.dealSheetSyncTriggerSystems = buildSystemsDealSheetTrigger(
+  "insert",
+  "dealSheetSyncTriggerSystems",
+  "15 8-19 * * 1-5"
+);
+exports.dealSheetSyncUpdateTriggerSystems = buildSystemsDealSheetTrigger(
+  "update",
+  "dealSheetSyncUpdateTriggerSystems",
+  "45 8-19 * * 1-5"
+);
+
+/**
+ * HTTP: manual Systems run. ?mode=insert|update|all (default all), ?dry_run=true returns the counts
+ * and three sample rows without writing to BigQuery. ?max_pages=N stops after N report pages
+ * (handy for a quick dry run), ?resume=false ignores the page checkpoint and starts at page 1.
+ * Shares the page checkpoint and run lock of the scheduled trigger for the same mode, and gets a
+ * 55-minute time budget (the function timeout is 60).
+ */
+exports.systemsDealSheetSync = onRequest(
+  {
+    region: REGION,
+    timeoutSeconds: HTTP_TIMEOUT_SEC,
+    memory: HTTP_MEMORY,
+  },
+  async (req, res) => {
+    const q = req.query || {};
+    const mode = ["insert", "update", "all"].includes(String(q.mode)) ? String(q.mode) : "all";
+    const dryRun = String(q.dry_run || "").trim().toLowerCase() === "true";
+    const maxPagesRaw = parseInt(String(q.max_pages || ""), 10);
+    const runOpts = {
+      mode,
+      dryRun,
+      label: "systemsDealSheetSync",
+      timeBudgetMs: 55 * 60 * 1000,
+      maxPages: Number.isFinite(maxPagesRaw) && maxPagesRaw > 0 ? maxPagesRaw : undefined,
+      resume: String(q.resume || "").trim().toLowerCase() !== "false",
+    };
+    try {
+      if (dryRun) {
+        res.status(200).json({ success: true, result: await runSystemsDealSheetSync(runOpts) });
+        return;
+      }
+      const { ran, result } = await withRunLock(`systems-${mode}`, { label: "systemsDealSheetSync" }, () =>
+        runSystemsDealSheetSync(runOpts)
+      );
+      if (!ran) {
+        res.status(409).json({ success: false, error: "run already in progress" });
+        return;
+      }
+      res.status(200).json({ success: true, result });
+    } catch (error) {
+      logError("[systemsDealSheetSync] FAILED", error);
       res.status(500).json({ success: false, error: error.message });
     }
   }
