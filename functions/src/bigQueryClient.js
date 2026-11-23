@@ -10123,6 +10123,7 @@ module.exports = {
   revalidateDealContractIdAgainstRunrate,
   repairStoredContractIdForPlacement,
   fetchRunrateWindowForContractId,
+  allocateContractIdForRepair,
   buildRunrateWindowForContractIdSql,
   legacyInheritedColumnsForDealRow,
   vacateSelfReferencedHierarchyRoles,

@@ -1249,7 +1249,12 @@ async function buildEnrichedRowsFromDealSheetCandidates(candidates, preloadedSub
     await resolveContractIdsForRows(combined, {
       skipAllocation: true,
       allocateContractIdsFn: allocateContractIds,
-      fetchContractIdsByDealSheetIdsFn: fetchContractIdsByDealSheetIds,
+      // The scheduled update loop passes its read-ahead cache here (updateLoopPrefetch.js); every
+      // other caller gets the live lookup exactly as before.
+      fetchContractIdsByDealSheetIdsFn:
+        typeof options.fetchContractIdsByDealSheetIdsFn === "function"
+          ? options.fetchContractIdsByDealSheetIdsFn
+          : fetchContractIdsByDealSheetIds,
       fetchContractIdsForExtensionsFn: fetchContractIdsForExtensions,
       resolveTableIdFn: (row) => resolveActiveDealSheetTableId(row?.ASSIGNMENT_RECRUITER_EMAIL),
     });

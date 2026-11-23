@@ -66,6 +66,8 @@ const {
   hasLiveTentativeEndDateChange,
   applyDidNotAcceptDateOverridesForRow,
   revalidateDealContractIdAgainstRunrate,
+  allocateContractIdForRepair,
+  fetchContractIdsByDealSheetIds,
   repairStoredContractIdForPlacement,
   normalizeForCompare,
   resolveFirstInsertPlacementAllowlist,
@@ -86,6 +88,7 @@ const {
   applyEndedPlacementStatusByInitialStart,
 } = require("./columnMappings");
 const { buildEnrichedRowsFromDealSheetCandidates } = require("./api/dealSheetEnricher");
+const { createUpdateLoopPrefetcher, resolveUpdatePrefetchChunk } = require("./updateLoopPrefetch");
 const { normalizeContractIdOrNull } = require("./contractIdFormat");
 const { getCheckpointRef } = require("./firestoreWorkspace");
 const {
@@ -1014,6 +1017,21 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   const applyUpdateToggle = parseBooleanLike(params.apply_update);
   const applyUpdate = applyUpdateToggle == null ? true : applyUpdateToggle;
 
+  // Scheduled update loop only: read the stored CONTRACT_ID and baseline row from the loop's
+  // read-ahead cache instead of one BigQuery job each (see updateLoopPrefetch.js). Anything served
+  // from cache is re-checked live before this refresh writes; if it changed, the whole refresh is
+  // redone live, so writes never rest on cached data. Absent for every other caller.
+  const prefetchScope =
+    params.update_loop_prefetcher && typeof params.update_loop_prefetcher.scope === "function"
+      ? params.update_loop_prefetcher.scope()
+      : null;
+  const redoRefreshLive = (why) => {
+    logLine(
+      `[refreshDealSheetByPlacementId] prefetched data changed before ${why} (placement_id=${params.placement_id || "none"} deal_sheet_id=${params.deal_sheet_id || "none"}) — redoing this refresh with live reads`
+    );
+    return refreshPlacementRecordToBigQuery({ ...params, update_loop_prefetcher: null });
+  };
+
   const accessToken = await getNexusAccessToken();
   const seed = await resolveRefreshSeed(accessToken, params);
 
@@ -1067,6 +1085,9 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
         allowedSubmittalCodes: params.organization_submittal_status_code || config.submittalStatusCodes,
         persistDealSheetStatusFromCandidate: true,
         fetchTerminationDetails: true,
+        ...(prefetchScope
+          ? { fetchContractIdsByDealSheetIdsFn: prefetchScope.fetchContractIdsByDealSheetIds }
+          : {}),
       }
     );
   const row = enrichedRows[0] || null;
@@ -1133,7 +1154,10 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   if (baselineScope === "deal_sheet_id") {
     const dsid = row?.DEAL_SHEET_ID == null ? "" : String(row.DEAL_SHEET_ID).trim();
     if (dsid) {
-      const byDs = await fetchLatestRowsByDealSheetIds([dsid], {
+      const fetchLatestFn = prefetchScope
+        ? prefetchScope.fetchLatestRowsByDealSheetIds
+        : fetchLatestRowsByDealSheetIds;
+      const byDs = await fetchLatestFn([dsid], {
         datasetId: effectiveDatasetId,
         tableId: effectiveTableId,
       });
@@ -1195,12 +1219,33 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   if (approverContractId != null) {
     contractRevalidation = { repaired: false, skipped: "approver_assigned", contract_id: approverContractId };
   }
+  // Set when a repair was about to mint but the prefetched inputs no longer match BigQuery.
+  let prefetchStaleBeforeRepair = false;
   if (approverContractId == null) {
   try {
-    const verdict = await revalidateDealContractIdAgainstRunrate(compareRow, baseline, {
-      datasetId: effectiveDatasetId,
-      tableId: effectiveTableId,
-    });
+    // With the loop's cache in play, re-check the cached inputs live BEFORE a replacement id is
+    // minted (allocateFn is only reached when a repair is actually needed). A throw here is caught
+    // inside revalidate as "keep the id", and the refresh is then redone live below.
+    const revalidateDeps = prefetchScope
+      ? {
+          allocateFn: async (allocOptions) => {
+            if (!(await prefetchScope.verify())) {
+              prefetchStaleBeforeRepair = true;
+              throw new Error("prefetched data changed; refresh will be redone live");
+            }
+            return allocateContractIdForRepair(allocOptions);
+          },
+        }
+      : {};
+    const verdict = await revalidateDealContractIdAgainstRunrate(
+      compareRow,
+      baseline,
+      {
+        datasetId: effectiveDatasetId,
+        tableId: effectiveTableId,
+      },
+      revalidateDeps
+    );
     if (verdict.needsRepair) {
       if (applyUpdate) {
         const repaired = await repairStoredContractIdForPlacement(
@@ -1247,6 +1292,7 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     );
   }
   }
+  if (prefetchStaleBeforeRepair) return redoRefreshLive("contract-id repair");
 
 
   // ENDED vs ENDED<30 against the INITIAL_START_DATE the row will carry (baseline's, a manual
@@ -1274,6 +1320,9 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
     action = "NO_CHANGE";
     reason = "First insert blocked by placement status allowlist";
   } else if (applyUpdate && updateOnlyExisting && baseline && changed) {
+    // Writes never rest on cached reads: confirm the prefetched baseline / contract id are still
+    // what BigQuery holds, or redo this refresh live.
+    if (prefetchScope && !(await prefetchScope.verify())) return redoRefreshLive("append");
     insertResult = await insertEnrichedDealSheetBatch([compareRow], 0, {
       appendOnChangeByDealSheet: true,
       compareIgnoreFields,
@@ -1290,6 +1339,7 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
       reason = "Insert pipeline filtered row";
     }
   } else if (applyUpdate && !updateOnlyExisting && (changed || !baseline)) {
+    if (prefetchScope && !(await prefetchScope.verify())) return redoRefreshLive("append");
     insertResult = await insertEnrichedDealSheetBatch([compareRow], 0, {
       appendOnChangeByDealSheet: true,
       compareIgnoreFields,
@@ -1334,6 +1384,10 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   try {
     if (action === "INSERTED" && Array.isArray(insertResult.finalRows) && insertResult.finalRows.length > 0) {
       responseData = insertResult.finalRows[0];
+    } else if (params.skip_response_finalize === true) {
+      // Scheduled update loop: it only reads `action`, never `data`, and finalize is read-only
+      // derivation (several BigQuery lookups per placement) done purely for an HTTP response.
+      responseData = row;
     } else {
       responseData = await finalizeDealSheetRowForResponse(row, baseline, {
         datasetId: effectiveDatasetId,
@@ -3614,6 +3668,24 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
   let skipped_not_selected = 0;
   let errors = 0;
 
+  // Read-ahead cache for the two per-placement BigQuery lookups (stored CONTRACT_ID + baseline row).
+  // One query per chunk of placements instead of two per placement; see updateLoopPrefetch.js for
+  // the safety rules. null when UPDATE_PREFETCH_TTL_MS=0 — the loop then runs exactly as before.
+  const prefetcher = createUpdateLoopPrefetcher({
+    datasetId: effectiveDatasetId,
+    contractDatasetId: config.datasetId,
+    fetchLatestRowsFn: fetchLatestRowsByDealSheetIds,
+    fetchContractIdsFn: fetchContractIdsByDealSheetIds,
+    isPlacementKeyedTable: isPlacementKeyedDealSheetTable,
+    log: logLine,
+  });
+  const prefetchChunk = Math.max(resolveUpdatePrefetchChunk(), concurrency);
+  logLine(
+    prefetcher
+      ? `[update sync] read-ahead cache ON ttl=${formatDuration(prefetcher.ttlMs)} chunk=${prefetchChunk}`
+      : "[update sync] read-ahead cache OFF (UPDATE_PREFETCH_TTL_MS=0)"
+  );
+
   async function processTarget(target) {
     try {
       const baseParams = {
@@ -3624,6 +3696,10 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
         update_only_existing: true,
         generated_uuid_field: generatedUuidField,
         compare_ignore_fields: compareIgnoreFields,
+        // The loop only reads `action`; skip the read-only response derivation (several BigQuery
+        // lookups per placement) that exists purely for the HTTP endpoint's `data`.
+        skip_response_finalize: true,
+        ...(prefetcher ? { update_loop_prefetcher: prefetcher } : {}),
         // The inorganic-hierarchy scan is table-WIDE and identical for every placement — running it
         // per-target here would re-scan ~1300 rows hundreds of times and the trigger would never
         // finish. The trigger runs that scan exactly once at the end (see dealSheetSyncUpdateTrigger),
@@ -3721,6 +3797,14 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
       // even at a low concurrency.
       if (i > 0 && config.batchDelayMs > 0) await sleep(config.batchDelayMs);
       const batch = slice.slice(i, i + concurrency);
+      if (prefetcher) {
+        try {
+          await prefetcher.ensure(batch, slice.slice(i, i + prefetchChunk));
+        } catch (prefetchErr) {
+          // Never fatal: the refreshes below just read live, as they always did.
+          logLine(`[update sync] read-ahead failed (non-fatal, reading live): ${String(prefetchErr?.message || prefetchErr).slice(0, 200)}`);
+        }
+      }
       const results = await Promise.all(batch.map(processTarget));
       processedFromSlice += batch.length;
       for (const r of results) {
@@ -3742,6 +3826,12 @@ async function syncExistingActiveDealSheetUpdatesFromBigQuery(params = {}) {
     }
   } finally {
     setPipelineDetailQuiet(false);
+    if (prefetcher) {
+      const s = prefetcher.stats;
+      logLine(
+        `[update sync] read-ahead stats prefetchQueries=${s.prefetchQueries} prefetchFailures=${s.prefetchFailures} baselineHits=${s.baselineHits} baselineMisses=${s.baselineMisses} contractHits=${s.contractHits} contractMisses=${s.contractMisses} verifyRuns=${s.verifyRuns} verifyStale=${s.verifyStale}`
+      );
+    }
   }
 
   // How far into the BATCH tier this run actually got.
