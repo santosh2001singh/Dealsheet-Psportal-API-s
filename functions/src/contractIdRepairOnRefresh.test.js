@@ -208,3 +208,64 @@ test("a DEAL whose own dates still fall inside the window is untouched", async (
   );
   assert.equal(verdict.needsRepair, false);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Own run-rate rows excluded from the window (Nov 2026). Jacob Mauro Dominguez, PLACEMENT_ID
+// 1469558: a DID NOT ACCEPT DEAL whose job start moved 11-16 -> 11-30 -> 12-14. Its only run-rate
+// row was its own approved copy (11-16..11-16), so every move minted a new id.
+// ---------------------------------------------------------------------------------------------
+const { buildRunrateWindowForContractIdSql } = require("./bigQueryClient");
+
+test("revalidate passes the placement id so its own run-rate rows are left out of the window", async () => {
+  const windowSpy = [];
+  await revalidateDealContractIdAgainstRunrate(
+    juanDeal(),
+    { CONTRACT_ID: "CHC19805" },
+    { tableId: "cynet_health_deal_sheet" },
+    deps({ window: windowAfterEnd, windowSpy })
+  );
+  assert.equal(windowSpy.length, 1);
+  assert.equal(String(windowSpy[0].opts.excludePlacementId), "1464679");
+  assert.equal(windowSpy[0].opts.tableId, "cynet_health_deal_sheet");
+});
+
+test("DNA DEAL whose only run-rate rows are its own: no window -> id kept", async () => {
+  // With its own rows excluded the contract has no other rows, so the fetch returns null.
+  const allocSpy = [];
+  const verdict = await revalidateDealContractIdAgainstRunrate(
+    {
+      DEAL_TYPE: "DEAL",
+      DEAL_SHEET_ID: 5270166,
+      PLACEMENT_ID: 1469558,
+      PLACEMENT_STATUS: "DID NOT ACCEPT",
+      START_DATE: "2026-12-14",
+      END_DATE: "2026-12-14",
+      TENTATIVE_END_DATE: null,
+      CONTRACT_ID: "CHC23736",
+    },
+    { CONTRACT_ID: "CHC23736", PLACEMENT_ID: 1469558 },
+    { tableId: "cynet_health_deal_sheet" },
+    deps({ window: null, allocSpy })
+  );
+  assert.equal(verdict.needsRepair, false);
+  assert.equal(allocSpy.length, 0);
+});
+
+test("window SQL: own placement excluded, legacy rows (PLACEMENT_ID NULL) always kept", () => {
+  const sql = buildRunrateWindowForContractIdSql("CHC23736", {
+    datasetId: "rr_project_data",
+    runrateTableId: "all_CH_data_runrate",
+    excludePlacementId: 1469558,
+  });
+  assert.match(sql, /AND \(PLACEMENT_ID IS NULL OR CAST\(PLACEMENT_ID AS STRING\) != '1469558'\)/);
+  assert.match(sql, /'CHC23736'/);
+});
+
+test("window SQL without a placement id is the old query (no placement filter)", () => {
+  const sql = buildRunrateWindowForContractIdSql("CHC19805", {
+    datasetId: "rr_project_data",
+    runrateTableId: "all_CH_data_runrate",
+  });
+  assert.doesNotMatch(sql.slice(sql.indexOf("WHERE")), /PLACEMENT_ID/);
+  assert.match(sql, /COALESCE\(END_DATE, TENTATIVE_END_DATE\) IS NOT NULL\s*$/);
+});

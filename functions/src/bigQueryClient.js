@@ -1219,9 +1219,19 @@ async function revalidateDealContractIdAgainstRunrate(incomingRow, baselineRow, 
   if (!spanKey.startDate && !spanKey.endDate && !spanKey.tentativeEndDate) return none;
 
   const fetchWindowFn = deps.fetchWindowFn ?? fetchRunrateWindowForContractId;
+  // The placement's OWN approved run-rate rows are left out of the window (Nov 2026). They only ever
+  // echo this placement's dates, so when its start moves (a DID NOT ACCEPT job re-dated, a pushback,
+  // a typo fix) the old copy made the row look "outside its own contract" and a new id was minted on
+  // every move — 23 placements ended up with 2-3 ids in all_CH_data_runrate. Rows of other placements
+  // and legacy rows without a PLACEMENT_ID still count exactly as before.
+  const windowOptions = {
+    ...options,
+    excludePlacementId:
+      incomingRow.PLACEMENT_ID ?? baselineRow?.PLACEMENT_ID ?? options.excludePlacementId ?? null,
+  };
   let window = null;
   try {
-    window = await fetchWindowFn(currentId, options);
+    window = await fetchWindowFn(currentId, windowOptions);
   } catch (err) {
     // Advisory: a lookup failure must never disturb a stored id.
     logDetail(
@@ -1307,6 +1317,25 @@ async function allocateContractIdForRepair(options = {}) {
  *
  * @returns {Promise<{__WINDOW_START_DATE: string, __WINDOW_END_DATE: string}|null>}
  */
+function buildRunrateWindowForContractIdSql(contractId, { datasetId, runrateTableId, excludePlacementId } = {}) {
+  // Same window start as the insert-time match, so a DEAL matched there is not re-minted here.
+  const { windowStartSql } = legacyRunrateWindowStartSql(runrateTableId);
+  const excludePid = excludePlacementId == null ? "" : String(excludePlacementId).trim();
+  // PLACEMENT_ID NULL rows (legacy / data team) are always kept; only this placement's own rows go.
+  const ownPlacementFilter = excludePid
+    ? `\n      AND (PLACEMENT_ID IS NULL OR CAST(PLACEMENT_ID AS STRING) != '${escapeSqlString(excludePid)}')`
+    : "";
+  return `
+    SELECT
+      MIN(${windowStartSql}) AS window_start_date,
+      MAX(COALESCE(END_DATE, TENTATIVE_END_DATE)) AS window_end_date
+    FROM ${readableTableSql(config.projectId, datasetId, runrateTableId)} r
+    WHERE UPPER(TRIM(CAST(CONTRACT_ID AS STRING))) = '${escapeSqlString(String(contractId).toUpperCase())}'
+      AND START_DATE IS NOT NULL
+      AND COALESCE(END_DATE, TENTATIVE_END_DATE) IS NOT NULL${ownPlacementFilter}
+  `;
+}
+
 async function fetchRunrateWindowForContractId(contractId, options = {}) {
   const normalized = normalizeContractIdOrNull(contractId);
   if (normalized == null) return null;
@@ -1316,17 +1345,11 @@ async function fetchRunrateWindowForContractId(contractId, options = {}) {
       ? options.datasetId.trim()
       : config.datasetId;
   const runrateTableId = resolveRunrateTableIdForDealSheetTable(options.tableId);
-  // Same window start as the insert-time match, so a DEAL matched there is not re-minted here.
-  const { windowStartSql } = legacyRunrateWindowStartSql(runrateTableId);
-  const sql = `
-    SELECT
-      MIN(${windowStartSql}) AS window_start_date,
-      MAX(COALESCE(END_DATE, TENTATIVE_END_DATE)) AS window_end_date
-    FROM ${readableTableSql(config.projectId, datasetId, runrateTableId)} r
-    WHERE UPPER(TRIM(CAST(CONTRACT_ID AS STRING))) = '${escapeSqlString(normalized.toUpperCase())}'
-      AND START_DATE IS NOT NULL
-      AND COALESCE(END_DATE, TENTATIVE_END_DATE) IS NOT NULL
-  `;
+  const sql = buildRunrateWindowForContractIdSql(normalized, {
+    datasetId,
+    runrateTableId,
+    excludePlacementId: options.excludePlacementId,
+  });
   const rows = await queryObjects(sql, 1);
   const start = normalizeLegacyDateOnlyOrNull(rows?.[0]?.window_start_date);
   const end = normalizeLegacyDateOnlyOrNull(rows?.[0]?.window_end_date);
@@ -10100,6 +10123,7 @@ module.exports = {
   revalidateDealContractIdAgainstRunrate,
   repairStoredContractIdForPlacement,
   fetchRunrateWindowForContractId,
+  buildRunrateWindowForContractIdSql,
   legacyInheritedColumnsForDealRow,
   vacateSelfReferencedHierarchyRoles,
   normalizeHierarchyPersonName,
