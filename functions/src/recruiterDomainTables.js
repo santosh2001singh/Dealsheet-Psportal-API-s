@@ -271,7 +271,28 @@ function rowMatchesSyncDomain(domain, email) {
 function rowMatchesSyncDomainForRow(domain, row) {
   const wanted = resolveActiveDealSheetTableIdForDomain(domain);
   if (!wanted) return true;
-  return resolveActiveDealSheetTableIdForRow(row) === wanted;
+  const tableId = resolveActiveDealSheetTableIdForRow(row);
+  return tableId === wanted && rowAllowedInActiveTable(tableId, row);
+}
+
+/**
+ * May this row be WRITTEN to this active table?
+ *
+ * cynet_locums_deal_sheet holds OFFERING=LOCUMS business only (decision 2026-11-24). A
+ * @cynetlocums.com recruiter also places NURSING / ALLIED / NONCLINICAL work; the email still routes
+ * those rows to the locums table, but none of them is on the locums run-rate
+ * (cynet_locum.lo_run_rate matched 0 of 406 NURSING placements), so they are not written anywhere —
+ * not to locums, and not to health either (health never claimed them).
+ *
+ * Every other table accepts every row it is routed.
+ *
+ * @param {unknown} tableId
+ * @param {Record<string, *>|null|undefined} row
+ * @returns {boolean}
+ */
+function rowAllowedInActiveTable(tableId, row) {
+  if (String(tableId ?? "").trim() !== TABLE_CYNET_LOCUMS) return true;
+  return isLocumsOffering(row);
 }
 
 /**
@@ -313,6 +334,7 @@ module.exports = {
   resolveActiveDealSheetTableIdForRow,
   resolveEndedDealSheetTableIdForRow,
   rowMatchesSyncDomainForRow,
+  rowAllowedInActiveTable,
   isLocumsOffering,
   OFFERING_LOCUMS,
   SYNC_DOMAINS,

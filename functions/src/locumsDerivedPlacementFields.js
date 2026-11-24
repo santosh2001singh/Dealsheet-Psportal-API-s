@@ -476,7 +476,46 @@ function sanitizeLocumsDealSheetRow(row) {
   return out;
 }
 
+/**
+ * True when a raw job-submittal should be enriched for the LOCUMS domain.
+ *
+ * The locums table takes OFFERING=LOCUMS only, and OFFERING comes from the Nexus JOB, which the
+ * submittal list does not embed (job is a bare id). The submittal DOES embed its client's offerings
+ * (client.client_offerings[].offering_id), and a job can only carry an offering its client has. So a
+ * submittal whose client has no LOCUMS offering can never produce a locums row — skip it before the
+ * ~12 enrich calls it would otherwise cost.
+ *
+ * Why this matters: with no START_DATE floor, a locums run walks every submittal page; only ~1-10 of
+ * each 300 belong to a client with a LOCUMS offering, yet all 300 were enriched (~3,500 Nexus calls,
+ * ~13 min per page) and then thrown away, so every hourly run hit the 1800s timeout (Nov 2026).
+ *
+ * Checked 2026-11-24: all 326 clients of the OFFERING=LOCUMS rows in cynet_locums_deal_sheet carry a
+ * LOCUMS client offering in Nexus, so this drops no real locums row.
+ *
+ * A submittal with no client offerings at all is KEPT, so a missing field never silently drops a
+ * row; the post-enrich OFFERING filter (rowMatchesSyncDomainForRow) still decides.
+ *
+ * @param {Record<string, *>|null|undefined} submittal
+ * @returns {boolean}
+ */
+function submittalMayBeLocums(submittal) {
+  const offerings = submittal?.client?.client_offerings;
+  if (!Array.isArray(offerings) || offerings.length === 0) return true;
+  let sawAnyOffering = false;
+  for (const o of offerings) {
+    const raw = o?.offering_id ?? o?.offering;
+    const value = raw != null && typeof raw === "object" ? raw.id ?? raw.code ?? raw.name : raw;
+    const norm = String(value ?? "").trim().toUpperCase();
+    if (norm === "") continue;
+    sawAnyOffering = true;
+    if (norm === OFFERING_LOCUMS) return true;
+  }
+  // Offerings present but none readable -> keep, same rule as a missing list.
+  return !sawAnyOffering;
+}
+
 module.exports = {
+  submittalMayBeLocums,
   isCynetLocumsRecruiter,
   isLocumsDealSheetRow,
   mapLocumsTypeFromTenNintyNine,

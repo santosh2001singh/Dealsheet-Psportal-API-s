@@ -98,7 +98,7 @@ const {
   applyCanadaNlPerDiemCarryForward,
 } = require("./canadaDerivedPlacementFields");
 const {
-  isLocumsDealSheetRow, LOCUMS_EXCLUDED_API_OWNED_COLUMNS,
+  isLocumsDealSheetRow, LOCUMS_EXCLUDED_API_OWNED_COLUMNS, submittalMayBeLocums,
 } = require("./locumsDerivedPlacementFields");
 const { computeNewMargin } = require("./w2PayRateNew");
 const {
@@ -114,6 +114,7 @@ const {
   resolveActiveDealSheetTableIdForRow,
   resolveEndedDealSheetTableIdForRow,
   rowMatchesSyncDomainForRow,
+  rowAllowedInActiveTable,
   buildEndedDealSheetRoutingSentinel,
 } = require("./recruiterDomainTables");
 const {
@@ -1135,6 +1136,23 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   const effectiveTableId = explicitBqTable
     ? params.bq_table.trim()
     : resolveActiveDealSheetTableIdForRow(row);
+  // cynet_locums_deal_sheet takes OFFERING=LOCUMS only (see rowAllowedInActiveTable): a placement
+  // whose Nexus offering is not (or is no longer) LOCUMS is never written to it.
+  if (!rowAllowedInActiveTable(effectiveTableId, row)) {
+    logLine(
+      `[refresh] SKIPPED_OFFERING table=${effectiveTableId} placement_id=${seed.placementId || normalizeNexusResourceId(row?.PLACEMENT_ID) || "n/a"} OFFERING=${row?.OFFERING ?? "null"} (locums table takes OFFERING=LOCUMS only)`
+    );
+    return {
+      placement_id: seed.placementId || normalizeNexusResourceId(row?.PLACEMENT_ID) || null,
+      action: "SKIPPED_OFFERING",
+      inserted: 0,
+      attempted: 0,
+      diff_fields: [],
+      reason: "OFFERING is not LOCUMS; the locums table takes OFFERING=LOCUMS only",
+      data: null,
+      elapsed: formatDuration(Date.now() - startMs),
+    };
+  }
   // Log writes follow the ROW's domain (the table it lands in), not the caller's params: the manual
   // HTTP endpoint passes no sync_domain, which the log gates read as "no domain -> write", so a
   // canada placement refreshed by hand used to write canada log rows. Falls back to the caller's
@@ -1580,6 +1598,23 @@ async function backfillPlacementRecordFromNexus(params = {}) {
   const effectiveTableId = explicitBqTable
     ? params.bq_table.trim()
     : resolveActiveDealSheetTableIdForRow(row);
+  // cynet_locums_deal_sheet takes OFFERING=LOCUMS only (see rowAllowedInActiveTable): a placement
+  // whose Nexus offering is not (or is no longer) LOCUMS is never written to it.
+  if (!rowAllowedInActiveTable(effectiveTableId, row)) {
+    logLine(
+      `[refresh] SKIPPED_OFFERING table=${effectiveTableId} placement_id=${seed.placementId || normalizeNexusResourceId(row?.PLACEMENT_ID) || "n/a"} OFFERING=${row?.OFFERING ?? "null"} (locums table takes OFFERING=LOCUMS only)`
+    );
+    return {
+      placement_id: seed.placementId || normalizeNexusResourceId(row?.PLACEMENT_ID) || null,
+      action: "SKIPPED_OFFERING",
+      inserted: 0,
+      attempted: 0,
+      diff_fields: [],
+      reason: "OFFERING is not LOCUMS; the locums table takes OFFERING=LOCUMS only",
+      data: null,
+      elapsed: formatDuration(Date.now() - startMs),
+    };
+  }
   // Log writes follow the ROW's domain (the table it lands in), not the caller's params: the manual
   // HTTP endpoint passes no sync_domain, which the log gates read as "no domain -> write", so a
   // canada placement refreshed by hand used to write canada log rows. Falls back to the caller's
@@ -2052,6 +2087,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
   let totalRowsSkippedOtherDomain = 0;
   /** CANADA only: submittals dropped before enrich because their client is not in a canadian province. */
   let totalSubmittalsSkippedNonCanada = 0;
+  let totalSubmittalsSkippedNonLocums = 0;
   let errorBatches = 0;
   let hasMore = false;
 
@@ -2367,15 +2403,30 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
       // the edge rate limit into HTML 403s. The province is already on the submittal
       // (client.zipcode_data.state_code), which is the very field CLIENT_STATE is derived from.
       //
-      // health and locums are untouched: they need US states, so no filter is applied for them.
+      // LOCUMS ONLY: the same idea on the client's offerings — a submittal whose client has no
+      // LOCUMS offering cannot produce an OFFERING=LOCUMS row, the only kind the locums table takes
+      // (see submittalMayBeLocums). Without it every locums run hit the 1800s timeout.
+      //
+      // health is untouched: no filter is applied for it.
       // rowMatchesSyncDomainForRow still runs after enrich for every domain, as the safety net.
       const submittalsForDomain =
-        syncDomain === "canada" ? submittalItems.filter(submittalMayBeCanada) : submittalItems;
+        syncDomain === "canada"
+          ? submittalItems.filter(submittalMayBeCanada)
+          : syncDomain === "locums"
+            ? submittalItems.filter(submittalMayBeLocums)
+            : submittalItems;
       if (syncDomain === "canada" && submittalsForDomain.length !== submittalItems.length) {
         const dropped = submittalItems.length - submittalsForDomain.length;
         totalSubmittalsSkippedNonCanada += dropped;
         logLine(
           `[enriched sync] STEP 2/5 canada pre-filter: kept=${submittalsForDomain.length} droppedNonCanada=${dropped} (no enrich calls made for those)`
+        );
+      }
+      if (syncDomain === "locums" && submittalsForDomain.length !== submittalItems.length) {
+        const dropped = submittalItems.length - submittalsForDomain.length;
+        totalSubmittalsSkippedNonLocums += dropped;
+        logLine(
+          `[enriched sync] STEP 2/5 locums pre-filter: kept=${submittalsForDomain.length} droppedNoLocumsClientOffering=${dropped} (no enrich calls made for those)`
         );
       }
 
@@ -2758,6 +2809,11 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
       `[enriched sync] canada pre-filter total: droppedNonCanada=${totalSubmittalsSkippedNonCanada} submittal(s) never enriched`
     );
   }
+  if (totalSubmittalsSkippedNonLocums > 0) {
+    logLine(
+      `[enriched sync] locums pre-filter total: droppedNoLocumsClientOffering=${totalSubmittalsSkippedNonLocums} submittal(s) never enriched`
+    );
+  }
   logLine(`TIMING syncEnrichedDealSheetCandidatesToBigQuery elapsed=${elapsedStr}`);
 
   return {
@@ -2767,6 +2823,7 @@ async function syncEnrichedDealSheetCandidatesToBigQuery(params = {}) {
     syncDomain: syncDomain,
     rowsSkippedOtherDomain: totalRowsSkippedOtherDomain,
     submittalsSkippedNonCanada: totalSubmittalsSkippedNonCanada,
+    submittalsSkippedNonLocums: totalSubmittalsSkippedNonLocums,
     errorBatches,
     bigQueryTarget: tableFqn,
     submittalStatusCodes: allowedSubmittalCodes,

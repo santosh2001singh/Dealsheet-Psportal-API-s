@@ -94,10 +94,13 @@ test("a submittal with no resolvable state is KEPT", () => {
 
 const SRC = fs.readFileSync(path.join(__dirname, "syncService.js"), "utf8");
 
-test("the pre-filter applies to canada only", () => {
+test("the canada pre-filter applies to canada only (locums has its own; health is unfiltered)", () => {
+  const compact = SRC.replace(/\s+/g, " ");
   assert.ok(
-    SRC.includes('syncDomain === "canada" ? submittalItems.filter(submittalMayBeCanada) : submittalItems'),
-    "health and locums must receive the unfiltered submittal list"
+    compact.includes(
+      'syncDomain === "canada" ? submittalItems.filter(submittalMayBeCanada) : syncDomain === "locums" ? submittalItems.filter(submittalMayBeLocums) : submittalItems'
+    ),
+    "canada -> submittalMayBeCanada, locums -> submittalMayBeLocums, health -> unfiltered"
   );
 });
 

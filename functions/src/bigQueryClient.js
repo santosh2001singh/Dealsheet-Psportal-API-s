@@ -6,7 +6,7 @@
 const { BigQuery } = require("@google-cloud/bigquery");
 const { randomUUID } = require("crypto");
 const config = require("./config");
-const { logDetail, logError } = require("./logger");
+const { logDetail, logError, logLine } = require("./logger");
 const { shouldExcludeRowFromBigQuery } = require("./bqRowExclusions");
 const {
   readableTableSql,
@@ -22,6 +22,7 @@ const {
   resolveActiveDealSheetTableId,
   resolveActiveDealSheetTableIdForRow,
   resolveActiveDealSheetTableIdForDomain,
+  rowAllowedInActiveTable,
   TABLE_CYNET_HEALTH,
   resolvePairedActiveTableId,
   resolvePairedEndedTableId,
@@ -2815,10 +2816,22 @@ async function insertEnrichedDealSheetBatchRouted(combinedRows, insertIdBase, op
     typeof options.resolveTableId === "function"
       ? options.resolveTableId
       : (row) => resolveActiveDealSheetTableIdForRow(row);
+  let skippedNotAllowed = 0;
   for (const row of combinedRows) {
     const tid = resolveTableId(row);
+    // cynet_locums_deal_sheet takes OFFERING=LOCUMS only — see rowAllowedInActiveTable. Guarded here
+    // too (not just in the domain filter) so a manual run with no sync_domain cannot write one.
+    if (!rowAllowedInActiveTable(tid, row)) {
+      skippedNotAllowed++;
+      continue;
+    }
     if (!groups.has(tid)) groups.set(tid, []);
     groups.get(tid).push(row);
+  }
+  if (skippedNotAllowed > 0) {
+    logLine(
+      `[enriched sync] [BigQuery insertAll] routed: skipped ${skippedNotAllowed} row(s) not allowed in their table (locums table takes OFFERING=LOCUMS only)`
+    );
   }
 
   let inserted = 0;
