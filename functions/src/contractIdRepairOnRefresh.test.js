@@ -269,3 +269,118 @@ test("window SQL without a placement id is the old query (no placement filter)",
   assert.doesNotMatch(sql.slice(sql.indexOf("WHERE")), /PLACEMENT_ID/);
   assert.match(sql, /COALESCE\(END_DATE, TENTATIVE_END_DATE\) IS NOT NULL\s*$/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Chain overwrite / DNA-DNS / preview (Nov 2026). Christina Leifried: DEAL 1451239 (04-20..10-17)
+// on CHC21832; extension 1470918 was approved on the same id and RR overwrote the run-rate row, so
+// the window became the extension's. The DEAL was re-minted to CHC24281 (21 DEALs like this).
+// ---------------------------------------------------------------------------------------------
+const { isEarlierLinkOfSameChain } = require("./bigQueryClient");
+
+function chainDeal(overrides = {}) {
+  return {
+    DEAL_TYPE: "DEAL",
+    DEAL_SHEET_ID: 5185994,
+    PLACEMENT_ID: 1451239,
+    PLACEMENT_STATUS: "ENDED",
+    START_DATE: "2026-04-20",
+    END_DATE: "2026-10-17",
+    TENTATIVE_END_DATE: "2026-10-17",
+    CONTRACT_ID: "CHC21832",
+    ...overrides,
+  };
+}
+
+test("chain: DEAL before a window built from a later placement's row keeps its id", async () => {
+  const allocSpy = [];
+  const verdict = await revalidateDealContractIdAgainstRunrate(
+    chainDeal(),
+    { CONTRACT_ID: "CHC21832" },
+    { tableId: "cynet_health_deal_sheet" },
+    deps({
+      window: { __WINDOW_START_DATE: "2026-10-18", __WINDOW_END_DATE: "2026-12-12", __HAS_PLACEMENT_ROWS: true },
+      allocSpy,
+    })
+  );
+  assert.equal(verdict.needsRepair, false);
+  assert.equal(allocSpy.length, 0);
+});
+
+test("chain: back-to-back continuation (starts the day after the window ends) keeps its id", async () => {
+  // Darcia Tooafoo-Cruickshank 1452502: Apr-1 rebook after CHC20946 ended 03-31.
+  const verdict = await revalidateDealContractIdAgainstRunrate(
+    chainDeal({ PLACEMENT_ID: 1452502, START_DATE: "2026-04-01", END_DATE: "2026-04-04", TENTATIVE_END_DATE: "2026-04-04", CONTRACT_ID: "CHC20946" }),
+    null,
+    { tableId: "cynet_health_deal_sheet" },
+    deps({ window: { __WINDOW_START_DATE: "2026-01-05", __WINDOW_END_DATE: "2026-03-31", __HAS_PLACEMENT_ROWS: true } })
+  );
+  assert.equal(verdict.needsRepair, false);
+});
+
+test("Juan M Silva is still re-minted: a booking weeks after the window ends is a new contract", async () => {
+  const verdict = await revalidateDealContractIdAgainstRunrate(
+    juanDeal(),
+    { CONTRACT_ID: "CHC19805" },
+    { tableId: "cynet_health_deal_sheet" },
+    deps({ window: { ...windowAfterEnd, __HAS_PLACEMENT_ROWS: true } })
+  );
+  assert.equal(verdict.needsRepair, true);
+  assert.equal(verdict.newContractId, "CHC23516");
+});
+
+test("data-team-only window keeps the old rule (no chain exemption)", async () => {
+  const verdict = await revalidateDealContractIdAgainstRunrate(
+    chainDeal(),
+    { CONTRACT_ID: "CHC21832" },
+    { tableId: "cynet_health_deal_sheet" },
+    deps({ window: { __WINDOW_START_DATE: "2026-10-18", __WINDOW_END_DATE: "2026-12-12", __HAS_PLACEMENT_ROWS: false } })
+  );
+  assert.equal(verdict.needsRepair, true);
+});
+
+for (const status of ["DID NOT ACCEPT", "DID NOT START"]) {
+  test(`${status} DEAL is never revalidated`, async () => {
+    const windowSpy = [];
+    const allocSpy = [];
+    const verdict = await revalidateDealContractIdAgainstRunrate(
+      chainDeal({ PLACEMENT_STATUS: status, START_DATE: "2026-03-30", END_DATE: "2026-03-30" }),
+      null,
+      { tableId: "cynet_health_deal_sheet" },
+      deps({ window: { __WINDOW_START_DATE: "2026-03-16", __WINDOW_END_DATE: "2026-03-16" }, windowSpy, allocSpy })
+    );
+    assert.equal(verdict.needsRepair, false);
+    assert.equal(windowSpy.length, 0);
+    assert.equal(allocSpy.length, 0);
+  });
+}
+
+test("preview reports the repair without minting an id", async () => {
+  const allocSpy = [];
+  const verdict = await revalidateDealContractIdAgainstRunrate(
+    juanDeal(),
+    { CONTRACT_ID: "CHC19805" },
+    { tableId: "cynet_health_deal_sheet" },
+    { ...deps({ window: windowAfterEnd, allocSpy }), previewOnly: true }
+  );
+  assert.equal(verdict.needsRepair, true);
+  assert.equal(verdict.newContractId, null);
+  assert.equal(allocSpy.length, 0);
+});
+
+test("isEarlierLinkOfSameChain edges", () => {
+  const w = { __WINDOW_START_DATE: "2026-05-01", __WINDOW_END_DATE: "2026-08-31" };
+  assert.equal(isEarlierLinkOfSameChain({ startDate: "2026-01-01", endDate: "2026-04-30" }, w), true);
+  assert.equal(isEarlierLinkOfSameChain({ startDate: "2026-09-01" }, w), true);
+  assert.equal(isEarlierLinkOfSameChain({ startDate: "2026-09-02" }, w), false);
+  assert.equal(isEarlierLinkOfSameChain({ startDate: "2026-04-01", endDate: "2026-09-10" }, w), false);
+  assert.equal(isEarlierLinkOfSameChain({}, w), false);
+});
+
+test("window SQL reports whether system (placement) rows are in the window", () => {
+  const sql = buildRunrateWindowForContractIdSql("CHC21832", {
+    datasetId: "rr_project_data",
+    runrateTableId: "all_CH_data_runrate",
+    excludePlacementId: 1451239,
+  });
+  assert.match(sql, /COUNTIF\(PLACEMENT_ID IS NOT NULL\) AS placement_row_count/);
+});

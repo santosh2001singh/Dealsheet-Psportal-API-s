@@ -1201,10 +1201,51 @@ function legacyInheritedColumnsForDealRow(runrateTableId) {
  * @param {object} [deps] - { fetchWindowFn, allocateFn }
  * @returns {Promise<{needsRepair: boolean, previousContractId: string|null, newContractId: string|null, clearedColumns: string[]}>}
  */
+const REVALIDATE_SKIP_PLACEMENT_STATUSES = new Set(["DID NOT ACCEPT", "DID NOT START"]);
+
+/**
+ * True when the DEAL is an EARLIER link of the chain the window describes, so it keeps its id.
+ *
+ * Run-rate keeps one row per contract, and RR overwrites it by CONTRACT_ID. Once a later extension
+ * or rebook of the same contract is approved, that row carries the later placement's id and dates,
+ * so the window no longer reaches back to the DEAL that started the contract. That proves nothing
+ * about the DEAL's id (Nov 2026: 21 ENDED DEALs re-minted this way, e.g. 1451239 CHC21832 -> CHC24281).
+ *
+ * Earlier link: every own date is before the window start, OR the DEAL starts the day right after
+ * the window ends (back-to-back continuation, e.g. an Apr-1 rebook after a 03-31 end).
+ * A DEAL that starts later than that (Juan M Silva: five weeks after the end) is still re-minted.
+ * Only applied when the window contains this system's own rows; data-team-only windows keep the
+ * old rule.
+ */
+function isEarlierLinkOfSameChain(spanKey, window) {
+  const winStart = window?.__WINDOW_START_DATE;
+  const winEnd = window?.__WINDOW_END_DATE;
+  if (!winStart || !winEnd) return false;
+  const own = [spanKey?.startDate, spanKey?.endDate, spanKey?.tentativeEndDate].filter(
+    (d) => typeof d === "string" && d !== ""
+  );
+  if (own.length === 0) return false;
+  if (own.every((d) => d < winStart)) return true;
+  const start = spanKey?.startDate;
+  if (typeof start === "string" && start !== "") {
+    const dayAfterEnd = new Date(`${winEnd}T00:00:00Z`);
+    dayAfterEnd.setUTCDate(dayAfterEnd.getUTCDate() + 1);
+    if (start > winEnd && start <= dayAfterEnd.toISOString().slice(0, 10)) return true;
+  }
+  return false;
+}
+
 async function revalidateDealContractIdAgainstRunrate(incomingRow, baselineRow, options = {}, deps = {}) {
   const none = { needsRepair: false, previousContractId: null, newContractId: null, clearedColumns: [] };
   if (!incomingRow || typeof incomingRow !== "object") return none;
   if (normalizeDealTypeKey(incomingRow.DEAL_TYPE) !== "DEAL") return none;
+  // DID NOT ACCEPT / DID NOT START never started, and their start date is read live from the job
+  // (it moves when the job is re-dated). Re-minting one only produced a second id that the next
+  // approve copied into run-rate as a duplicate row (Nov 2026: 42 DNA + 29 DNS were at risk).
+  const placementStatus = String(incomingRow.PLACEMENT_STATUS ?? baselineRow?.PLACEMENT_STATUS ?? "")
+    .trim()
+    .toUpperCase();
+  if (REVALIDATE_SKIP_PLACEMENT_STATUSES.has(placementStatus)) return none;
 
   const currentId =
     normalizeContractIdOrNull(incomingRow.CONTRACT_ID) ??
@@ -1241,6 +1282,19 @@ async function revalidateDealContractIdAgainstRunrate(incomingRow, baselineRow, 
   }
   if (!window) return none;
   if (legacyWindowCoversAnyOwnDate(spanKey, window)) return none;
+  if (window.__HAS_PLACEMENT_ROWS && isEarlierLinkOfSameChain(spanKey, window)) return none;
+
+  // Preview (apply_update=false) must not consume a number from the shared sequence.
+  if (deps.previewOnly === true) {
+    return {
+      needsRepair: true,
+      previousContractId: currentId,
+      newContractId: null,
+      clearedColumns: legacyInheritedColumnsForDealRow(
+        resolveRunrateTableIdForDealSheetTable(options.tableId)
+      ),
+    };
+  }
 
   // Mint the replacement BEFORE anything is written, so the row moves old id -> new id in a single
   // step and is never left holding null. A null in between is not a harmless intermediate state:
@@ -1328,7 +1382,8 @@ function buildRunrateWindowForContractIdSql(contractId, { datasetId, runrateTabl
   return `
     SELECT
       MIN(${windowStartSql}) AS window_start_date,
-      MAX(COALESCE(END_DATE, TENTATIVE_END_DATE)) AS window_end_date
+      MAX(COALESCE(END_DATE, TENTATIVE_END_DATE)) AS window_end_date,
+      COUNTIF(PLACEMENT_ID IS NOT NULL) AS placement_row_count
     FROM ${readableTableSql(config.projectId, datasetId, runrateTableId)} r
     WHERE UPPER(TRIM(CAST(CONTRACT_ID AS STRING))) = '${escapeSqlString(String(contractId).toUpperCase())}'
       AND START_DATE IS NOT NULL
@@ -1354,7 +1409,12 @@ async function fetchRunrateWindowForContractId(contractId, options = {}) {
   const start = normalizeLegacyDateOnlyOrNull(rows?.[0]?.window_start_date);
   const end = normalizeLegacyDateOnlyOrNull(rows?.[0]?.window_end_date);
   if (!start || !end) return null;
-  return { __WINDOW_START_DATE: start, __WINDOW_END_DATE: end };
+  return {
+    __WINDOW_START_DATE: start,
+    __WINDOW_END_DATE: end,
+    // Rows written by this system (approved deal sheet rows) vs legacy / data-team rows only.
+    __HAS_PLACEMENT_ROWS: Number(rows?.[0]?.placement_row_count ?? 0) > 0,
+  };
 }
 
 /**
@@ -10121,6 +10181,7 @@ module.exports = {
   applyIsRejectedResetForChangedUpdate,
   applyContractIdCarryForward,
   revalidateDealContractIdAgainstRunrate,
+  isEarlierLinkOfSameChain,
   repairStoredContractIdForPlacement,
   fetchRunrateWindowForContractId,
   allocateContractIdForRepair,

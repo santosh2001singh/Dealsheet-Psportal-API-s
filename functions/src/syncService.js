@@ -1237,6 +1237,8 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
           },
         }
       : {};
+    // Preview never mints: the sequence is shared, so a preview used to burn a real number.
+    if (!applyUpdate) revalidateDeps.previewOnly = true;
     const verdict = await revalidateDealContractIdAgainstRunrate(
       compareRow,
       baseline,
