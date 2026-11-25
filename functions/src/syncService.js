@@ -65,6 +65,7 @@ const {
   hasBusinessColumnChanges,
   hasLiveTentativeEndDateChange,
   applyDidNotAcceptDateOverridesForRow,
+  applyDidNotAcceptStartEndFreeze,
   revalidateDealContractIdAgainstRunrate,
   allocateContractIdForRepair,
   fetchContractIdsByDealSheetIds,
@@ -1197,7 +1198,10 @@ async function refreshPlacementRecordToBigQuery(params = {}) {
   // corrected. We compare and insert this same row so the gate decision and the stored row stay
   // consistent. EXTENSION rows are NOT date-overridden from a prior ended placement any more, so
   // there is nothing further to pre-apply here.
-  const didNotAcceptRow = applyDidNotAcceptDateOverridesForRow(row);
+  // DID NOT ACCEPT dates are frozen once the stored row is already DNA (applyDidNotAcceptStartEndFreeze).
+  const didNotAcceptRow = applyDidNotAcceptDateOverridesForRow(
+    applyDidNotAcceptStartEndFreeze(row, baseline).row
+  );
   let compareRow = didNotAcceptRow || row;
 
   // Contract-identity repair (DEAL rows only).

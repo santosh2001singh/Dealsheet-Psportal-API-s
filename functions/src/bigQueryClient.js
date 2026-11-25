@@ -1844,6 +1844,30 @@ function applyDidNotAcceptDateOverridesForRow(row) {
   return next;
 }
 
+/**
+ * DID NOT ACCEPT date freeze (business rule, Nov 2026 — replaces the Oct 2026 "read the job date
+ * live on every sync"). Jobs are reused after a rejection, so the live job start kept moving a DNA
+ * row's dates. Now the dates are taken ONCE, on the sync where the row turns DID NOT ACCEPT (offer
+ * rejected), and frozen after that: while the stored baseline is already DID NOT ACCEPT with a
+ * START_DATE, the incoming row keeps the baseline START_DATE and END_DATE = that START_DATE.
+ *
+ * Must run BEFORE the change gate (hasBusinessColumnChanges) so a moved job date is not seen as a
+ * change. Any other status, or a baseline that was not DNA yet / has no START_DATE, is left as-is.
+ */
+function applyDidNotAcceptStartEndFreeze(incomingRow, baselineRow) {
+  if (!incomingRow || typeof incomingRow !== "object") return { row: incomingRow, frozen: false };
+  if (!baselineRow || typeof baselineRow !== "object") return { row: incomingRow, frozen: false };
+  if (String(incomingRow.PLACEMENT_STATUS ?? "").trim().toUpperCase() !== "DID NOT ACCEPT") {
+    return { row: incomingRow, frozen: false };
+  }
+  if (String(baselineRow.PLACEMENT_STATUS ?? "").trim().toUpperCase() !== "DID NOT ACCEPT") {
+    return { row: incomingRow, frozen: false };
+  }
+  if (isEmptyDateFieldValue(baselineRow.START_DATE)) return { row: incomingRow, frozen: false };
+  const start = baselineRow.START_DATE;
+  return { row: { ...incomingRow, START_DATE: start, END_DATE: start }, frozen: true };
+}
+
 function applyDidNotAcceptDateOverrides(rows) {
   if (!rows || rows.length === 0) return rows;
   return rows.map((row) => applyDidNotAcceptDateOverridesForRow(row));
@@ -2540,7 +2564,12 @@ async function insertEnrichedDealSheetBatch(combinedRows, insertIdBase, options 
       // ENDED vs ENDED<30 against the INITIAL_START_DATE this row will carry (the baseline's — it is
       // a manual column), so the gate compares the FINAL status. Without this an API row that maps
       // to plain ENDED would differ from a stored ENDED<30 on every run and append a 0-diff row.
-      const endedStatusRow = applyEndedPlacementStatusByInitialStart(row, existing.INITIAL_START_DATE);
+      // DID NOT ACCEPT: dates frozen from the baseline BEFORE the gate, so a reused job's moved
+      // start date neither appends a row nor changes the stored dates.
+      const dnaFrozenRow = applyDidNotAcceptDateOverridesForRow(
+        applyDidNotAcceptStartEndFreeze(row, existing).row
+      );
+      const endedStatusRow = applyEndedPlacementStatusByInitialStart(dnaFrozenRow, existing.INITIAL_START_DATE);
       // An approver-assigned id (contractIdOverride.js) IS this placement's id, whatever the stored
       // latest row says. A latest row that disagrees was appended by a run that read its baseline
       // before the approve rewrote it, so it is re-appended even with no other change.
@@ -10114,6 +10143,7 @@ async function finalizeDealSheetRowForResponse(row, baseline, options = {}) {
   if (!row || typeof row !== "object") return row;
   let current = row;
   if (baseline && typeof baseline === "object") {
+    current = applyDidNotAcceptStartEndFreeze(current, baseline).row;
     current = applyManualColumnsCarryForward(current, baseline).row;
     current = applyPreviousRecruiterOnRecruiterChange(current, baseline).row;
     current = applyTentativeDateFreeze(current, baseline).row;
@@ -10217,6 +10247,7 @@ module.exports = {
   applyOriginalStartDateForDealRows,
   applyDidNotAcceptDateOverrides,
   applyDidNotAcceptDateOverridesForRow,
+  applyDidNotAcceptStartEndFreeze,
   rowNeedsOfferRejectedExtensionEndedDates,
   fetchOfferRejectedExtensionEndedDatesByPlacementId,
   applyOfferRejectedExtensionEndedDatesForInsertRows,
